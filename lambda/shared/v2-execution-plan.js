@@ -33,6 +33,7 @@ import {
 import { compileStageGraph, compileRules } from './compile.js';
 import { isLoopBackRecommenderStage, loopBackApplies } from './stage-loopback.js';
 import { stageSkipBlockReason } from './stage-skip.js';
+import { FILE_PATH_FLAG, sensorKind, sensorPathFlag } from './v2-sensor-contract.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
 // this module implements. Checked against the registry by a test, so a
@@ -228,6 +229,10 @@ const resolveSensors = (stage, stageId, sensorsById, errors, { policyEnabled = f
           err('sensor_missing_command', `sensor "${sid}" has no command`, { stageId, ref: sid }),
         );
       }
+      const pathFlag =
+        sensorKind({ sensorId: sid, runtime: sensor.runtime }) === 'script'
+          ? sensorPathFlag(sensor.inputSchema)
+          : FILE_PATH_FLAG;
       return {
         sensorId: sid,
         severity: sensor.severity ?? 'advisory',
@@ -237,6 +242,12 @@ const resolveSensors = (stage, stageId, sensorsById, errors, { policyEnabled = f
         category: sensor.category ?? null,
         matches: sensor.matches ?? null,
         scriptRef: sensor.scriptRef ?? null,
+        // The path flag a script sensor's `input_schema` asks for, resolved here
+        // so the runtime never has to guess it from the sensor's id. Emitted
+        // ONLY when the authored contract moves the flag off the default, so a
+        // catalog that authors no contract — and a graph sensor, which takes no
+        // path at all — keeps its plan byte-identical.
+        ...(pathFlag === FILE_PATH_FLAG ? {} : { pathFlag }),
         // `fire_on` (≥2.7.0) decides which candidate set the runner sweeps, so it
         // has to reach the runtime on the plan — without it the whole plane was
         // inert. Emitted ONLY when authored AND in release mode: an unpinned run

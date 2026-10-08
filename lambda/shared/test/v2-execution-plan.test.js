@@ -349,6 +349,64 @@ describe('buildExecutionPlan — plan shape', () => {
     expect(plan.stages[0].sensors[0].scriptRef).toBeNull();
   });
 
+  // A document sensor declares `output_path`, so it must not be spawned with
+  // the code sensors' `--file-path`. The flag is resolved on the plan, and only
+  // when the authored contract moves it — a catalog that authors none, and a
+  // graph sensor, keep a byte-identical plan.
+  describe('a script sensor path flag', () => {
+    const planSensor = (sensorsById) =>
+      buildExecutionPlan({
+        workflow: workflow([placement('a')]),
+        scope: 'feature',
+        library: baseLibrary({
+          stagesById: { a: stage('a', { sensors: [Object.keys(sensorsById)[0]] }) },
+          sensorsById,
+        }),
+      }).plan.stages[0].sensors[0];
+
+    it('is carried when the sensor declares an output path', () => {
+      expect(
+        planSensor({
+          traceability: {
+            command: 'aidlc-sensor-traceability.ts',
+            runtime: 'bun',
+            inputSchema: { output_path: 'string', stage_slug: 'string' },
+          },
+        }).pathFlag,
+      ).toBe('--output-path');
+    });
+
+    it('is absent when the sensor declares a file path', () => {
+      expect(
+        planSensor({
+          linter: {
+            command: 'aidlc-sensor-linter.ts',
+            runtime: 'bun',
+            inputSchema: { file_path: 'string' },
+          },
+        }),
+      ).not.toHaveProperty('pathFlag');
+    });
+
+    it('is absent when the sensor declares no contract', () => {
+      expect(
+        planSensor({ linter: { command: 'aidlc-sensor-linter.ts', runtime: 'bun' } }),
+      ).not.toHaveProperty('pathFlag');
+    });
+
+    it('is absent on a graph sensor, which takes no path', () => {
+      expect(
+        planSensor({
+          'required-sections': {
+            command: 'aidlc-sensor-required-sections.ts',
+            runtime: 'bun',
+            inputSchema: { output_path: 'string', stage_slug: 'string' },
+          },
+        }),
+      ).not.toHaveProperty('pathFlag');
+    });
+  });
+
   it('flags agent-team as not implemented without crashing', () => {
     const lib = baseLibrary({ stagesById: { a: stage('a', { mode: 'agent-team' }) } });
     const { plan } = buildExecutionPlan({

@@ -6715,6 +6715,91 @@ describe('postAgentSensorPass', () => {
   });
 });
 
+// The stage deadline reaches the sensor pass in RELEASE MODE ONLY, like the
+// write/gate plane split. An unpinned run reads no deadline, so its sensor
+// verdicts are what they have always been even when the stage is already over
+// its wall clock — the classic path must not change here.
+describe('runStage — the stage budget at the post-agent sensor pass', () => {
+  const okSpawn = () => ({
+    on: (ev, cb) => ev === 'close' && setImmediate(() => cb(0)),
+    stdin: { end() {} },
+  });
+  const libWithScriptSensor = () => {
+    const lib = library();
+    lib.stagesById['requirements-analysis'].sensors = ['type-check'];
+    lib.sensorsById = {
+      'type-check': {
+        id: 'type-check',
+        command: 'bun <runtime-managed>/tools/aidlc-sensor-type-check.ts',
+        runtime: 'bun',
+        severity: 'advisory',
+        matches: '**/*.ts',
+        timeoutSeconds: 600,
+        scriptRef: { s3Key: 'blocks/scripts/sha256/type-check' },
+      },
+    };
+    return lib;
+  };
+
+  const budgetedSensorRun = async ({ methodologyRelease = null, stageBudgetMs }) => {
+    const workspaceDir = await mkdtemp(nodePath.join(tmpdir(), 'run-stage-sensor-budget-'));
+    await writeFile(nodePath.join(workspaceDir, 'a.ts'), 'export const value = 1;');
+    const lib = libWithScriptSensor();
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+      loadBlockScript: async () => 'export default 1;',
+      stageBudgetMs,
+    });
+    try {
+      const res = await runStage(
+        { ...baseArgs, workspaceDir, ...(methodologyRelease ? { methodologyRelease } : {}) },
+        deps,
+      );
+      expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+      const run = deps.store.calls.find(
+        ([name, args]) => name === 'recordSensorRun' && args.sensorId === 'type-check',
+      );
+      return run?.[1] ?? null;
+    } finally {
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
+  };
+
+  it('reads no stage deadline for an unpinned run, whatever is left of the wall clock', async () => {
+    // 60 s left against a 600 s authored budget is exactly the case the
+    // release-mode bound would shorten; -1 ms is an already-expired stage.
+    for (const stageBudgetMs of [60_000, -1]) {
+      const run = await budgetedSensorRun({ stageBudgetMs });
+      expect(run, `stageBudgetMs=${stageBudgetMs}`).toMatchObject({
+        result: 'PASS',
+        held: false,
+      });
+      expect(run.detail).not.toHaveProperty('boundedBy');
+      expect(run.detail).not.toHaveProperty('timeoutMs');
+      expect(run.detail).not.toHaveProperty('stageBudgetExhausted');
+    }
+  });
+
+  it('shortens a pinned sensor to what is left of the stage', async () => {
+    const run = await budgetedSensorRun({
+      methodologyRelease: { releaseId: 'release-a' },
+      stageBudgetMs: 60_000,
+    });
+    expect(run.detail).toMatchObject({ boundedBy: 'stage-deadline' });
+    expect(run.detail.timeoutMs).toBeLessThanOrEqual(60_000);
+  });
+
+  it('launches no pinned sensor child once the stage budget is gone', async () => {
+    const run = await budgetedSensorRun({
+      methodologyRelease: { releaseId: 'release-a' },
+      stageBudgetMs: -1,
+    });
+    expect(run).toMatchObject({ result: 'BLOCKED', held: false });
+    expect(run.detail).toMatchObject({ stageBudgetExhausted: true });
+  });
+});
+
 // The artifact-head observation the orchestrator turns into
 // `required_artifact_missing`. "Observed nothing" and "could not observe" are
 // different facts, and the stage result must say which one happened: an empty

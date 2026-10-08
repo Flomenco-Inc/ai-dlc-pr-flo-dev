@@ -654,6 +654,7 @@ const runStageSensors = async ({
   publish,
   changedFiles = null,
   planes = null,
+  remainingStageMs = null,
 }) => {
   let graph = null;
   let gConn = null;
@@ -681,6 +682,7 @@ const runStageSensors = async ({
       publish,
       changedFiles,
       planes,
+      remainingStageMs,
     });
   } finally {
     await closeGraphSource(gConn);
@@ -723,6 +725,7 @@ const runSensorsWithGraph = async ({
   publish,
   changedFiles = null,
   planes = null,
+  remainingStageMs = null,
 }) => {
   const runner = createSensorRunner({
     graph,
@@ -735,6 +738,7 @@ const runSensorsWithGraph = async ({
     substitutions: {},
     spawnFn,
     childEnv: env,
+    remainingStageMs,
   });
 
   const verdicts = await runner.runStageSensors({
@@ -4606,6 +4610,9 @@ const runStageAttempt = async (
       spawnFn,
       store,
       publish,
+      // Release mode only, like the plane split below: an unpinned run reads no
+      // stage deadline, so its sensor argv and timeouts stay what they were.
+      ...(methodologyRelease ? { remainingStageMs: () => stageDeadlineMs - nowMs() } : {}),
       ...postAgentSensorPass({ methodologyRelease, attemptChangedFiles }),
     }).catch(() => null);
     if (writePlane?.held) {
@@ -4858,6 +4865,7 @@ const runStageAttempt = async (
         store,
         publish,
         planes: ['gate'],
+        remainingStageMs: () => stageDeadlineMs - nowMs(),
       });
     } catch (error) {
       gatePlaneError = error?.message ?? String(error);

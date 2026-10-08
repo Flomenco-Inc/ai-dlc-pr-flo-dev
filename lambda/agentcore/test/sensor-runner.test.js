@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { createSensorRunner, __test } from '../sensor-runner.js';
+import { createSensorRunner, isReleaseDependencyError, __test } from '../sensor-runner.js';
 
 const { globToRegExp, resultFromScript } = __test;
 
@@ -698,5 +698,34 @@ describe('runStageSensors — the stage budget bounds every child', () => {
     expect(verdict.result).toBe('PASS');
     expect(verdict.detail).not.toHaveProperty('boundedBy');
     expect(verdict.detail).not.toHaveProperty('stageBudgetExhausted');
+  });
+});
+
+// A release failure the runner must hold the stage on, whatever the sensor's
+// severity: the pinned check could not be run at all. `runtime_file_missing`
+// is the resolver's code for a manifest-listed object that is absent from
+// storage, and it carries no `release_` prefix — an incompletely published
+// closure used to be classified as a best-effort loader error, which let an
+// advisory sensor continue on a release that cannot be run.
+describe('isReleaseDependencyError', () => {
+  const resolverError = (code) => ({ name: 'ReleaseResolverError', code });
+
+  it('holds on an unreadable, mismatched, or incompletely published closure', () => {
+    for (const code of [
+      'release_closure_mismatch',
+      'release_object_unreadable',
+      'release_script_dependency_missing',
+      'runtime_file_missing',
+      'unpinned_user_block',
+      'user_block_missing',
+    ]) {
+      expect(isReleaseDependencyError(resolverError(code)), code).toBe(true);
+    }
+  });
+
+  it('leaves an ordinary loader failure best-effort', () => {
+    expect(isReleaseDependencyError(new Error('NoSuchKey'))).toBe(false);
+    expect(isReleaseDependencyError({ name: 'Error', code: 'runtime_file_missing' })).toBe(false);
+    expect(isReleaseDependencyError(null)).toBe(false);
   });
 });

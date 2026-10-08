@@ -225,10 +225,16 @@ const STAGE_BUDGET_EXHAUSTED = 'the stage budget was exhausted before this file 
 // verdict at all, so its severity does not apply — the check is missing, which is
 // the drift the release pin exists to prevent. run-stage applies the same test to
 // the persona and knowledge bodies its ensemble sessions read.
+//
+// `runtime_file_missing` is listed explicitly because it does not carry the
+// `release_` prefix: the resolver raises it when a release manifest lists an
+// object that is absent from storage. An incompletely published closure is a
+// release integrity failure exactly like a digest mismatch, so it must hold the
+// stage rather than degrade to a best-effort advisory note.
 export const isReleaseDependencyError = (error) =>
   ['ReleaseResolverError', 'AidlcReleaseError'].includes(error?.name) &&
   (String(error.code ?? '').startsWith('release_') ||
-    ['unpinned_user_block', 'user_block_missing'].includes(error.code));
+    ['runtime_file_missing', 'unpinned_user_block', 'user_block_missing'].includes(error.code));
 
 // Create the sensor runner. `graph` is the graph-writer (for reading produced
 // artifact content); `loadBlockScript` fetches a sensor's `.ts` from S3;

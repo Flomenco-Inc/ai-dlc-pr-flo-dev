@@ -41,6 +41,8 @@ import { SYSTEM_TENANT } from './tenant.js';
 // this module implements. Checked against the registry by a test, so a
 // capability cannot be declared handled without the code that handles it.
 export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze([
+  'policy.guard-policy.off@v1',
+  'policy.plan-approval.switch@v1',
   'policy.review-cap@v1',
   'policy.sensors@v1',
   'policy.summary-confirmation.off@v1',
@@ -430,6 +432,19 @@ const resolveStagePolicy = ({ scopeBlock, stage, stageId, errors, capabilities =
   const stageHas = hasAnyKey(stage, STAGE_RUNTIME_POLICY_KEYS);
   if (!scopeHas && !stageHas) return null;
 
+  // ONE effective Guard Policy, resolved new-name-first. `guard_policy` is
+  // 2.11's rename of `change_control`, and the two can disagree on a block the
+  // mapper never saw: a user SCOPE overlay is stored verbatim
+  // (`release-resolver.js` `loadUserOverlay`) and the building-block API keeps
+  // both intrinsic attributes, so a forked scope may carry the new name alone or
+  // both with different values. Resolving it here, once, is what stops a caller
+  // from having to know and synchronize an internal alias. `off` is translated
+  // to "no change control" at the single place that consumes it.
+  const effectiveGuardPolicy =
+    scopeBlock?.guardPolicy ??
+    scopeBlock?.changeControl ??
+    defaultWhenAbsent('SCOPE:change_control', capabilities);
+
   const declaredClass = stage?.reviewClass ?? (stage?.reviewer ? 'adversarial' : 'none');
   const cap = scopeBlock?.reviewCap ?? 'adversarial';
   const reviewClass =
@@ -449,14 +464,25 @@ const resolveStagePolicy = ({ scopeBlock, stage, stageId, errors, capabilities =
     // authored one. It stays null unless the scope declares it — OR the catalog
     // proves it has change control at all (some SCOPE authors the field), which
     // is upstream's "absent means strict" rule made version-agnostic.
-    changeControl:
-      scopeBlock?.changeControl ?? defaultWhenAbsent('SCOPE:change_control', capabilities),
+    // The AUTHORED new-name value, kept so a scope that chose `off` stays
+    // distinguishable from one that never had the switch.
+    guardPolicy: scopeBlock?.guardPolicy ?? null,
+    changeControl: effectiveGuardPolicy === 'off' ? null : (effectiveGuardPolicy ?? null),
     learnings: scopeBlock?.learnings ?? defaultWhenAbsent('SCOPE:learnings', capabilities),
     skeleton: scopeBlock?.skeleton ?? null,
     // Plan Approval is protocol prose plus a PreToolUse guard upstream, not a
     // frontmatter field, so it is keyed on the CATALOG's runtime files and the
     // stage's own declaration instead of on a (field, value) pair.
-    planApproval: planApprovalApplies({ stage, capabilities }) ? 'required' : null,
+    // 2.11 lets a scope turn the plan gate off. It withdraws THIS key and
+    // nothing else: `humanValidation` is untouched, which is the invariant the
+    // plan suite asserts for every scope and stage.
+    planApproval:
+      scopeBlock?.planApproval !== 'off' && planApprovalApplies({ stage, capabilities })
+        ? 'required'
+        : null,
+    // The project type the scope authors. A human's choice and the workspace
+    // scan are layered on top of it elsewhere; here it is the authored default.
+    existingCode: scopeBlock?.existingCode ?? null,
     // The Build-and-Test loop-back is construction-protocol prose upstream, so
     // like Plan Approval it is keyed on the CATALOG rather than on a (field,
     // value) pair. The catalog key says only "this release has a loop-back to

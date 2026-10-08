@@ -456,26 +456,28 @@ describe('Per-release adapters: the plan boundary judges the authored type', () 
 // Otherwise the unrelated defaults (change control, loop-back) and every policy
 // gate downstream switch on for a release whose setting the platform drops.
 describe('Per-release adapters: an unsupported-only field activates no policy', () => {
-  it.each(['plan_approval', 'collaborators'])(
-    'resolves no policy for a scope authoring only %s',
-    (field) => {
-      const result = planFor({ scopeFm: { [field]: 'off' } });
-      expect(result.valid).toBe(true);
-      expect(result.errors).toEqual([]);
-      expect(result.plan.stages[0].policy).toBeUndefined();
-    },
-  );
-
-  it('resolves no policy for a scope authoring only the project type', () => {
-    const result = planFor({ scopeFm: { existing_code: true } });
+  it('resolves no policy for a scope authoring only collaborators', () => {
+    const result = planFor({ scopeFm: { collaborators: 'off' } });
     expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
     expect(result.plan.stages[0].policy).toBeUndefined();
   });
 
-  // `guard_policy` is the exception, and deliberately so: the mapper resolves
-  // `changeControl` from it first, so authoring it IS authoring change control —
-  // a field that has had a consumer since 2.6.18. The guard still holds
-  // promotion for the value itself.
+  // The counterpart of the rule: a field becomes an activator in the very change
+  // that gives it a consumer, which is what this PR does for Plan Approval and
+  // the project type. `collaborators` above is the one still waiting.
+  it.each([
+    ['plan approval', { plan_approval: 'off' }, { planApproval: null }],
+    ['project type', { existing_code: true }, { existingCode: true }],
+  ])('activates the policy for a scope authoring only the %s', (_label, scopeFm, expected) => {
+    const result = planFor({ scopeFm });
+    expect(result.valid).toBe(true);
+    expect(result.plan.stages[0].policy).toMatchObject(expected);
+  });
+
+  // `guard_policy` has been an activator since before its own entry existed: the
+  // mapper resolves `changeControl` from it first, and change control has had a
+  // consumer since 2.6.18.
   it('treats the guard policy as the change-control field it renames', () => {
     const { plan } = planFor({ scopeFm: { guard_policy: 'strict' } });
     expect(plan.stages[0].policy).toMatchObject({ changeControl: 'strict' });
@@ -487,39 +489,29 @@ describe('Per-release adapters: an unsupported-only field activates no policy', 
   });
 });
 
-// A field with a consumer can still carry a VALUE that consumer does not
-// implement, and the entry-level handling check cannot see it. `change_control`
-// has run since 2.6.18, so authoring it activates the policy — but its third
-// value `off` asks for a removal no runtime branch performs yet. A release
-// authoring it is held by the promotion guard, so it stays importable and
-// inspectable; a user SCOPE overlay row is stored verbatim and meets no guard at
-// all, so the plan is the only judge it ever meets and must fail it closed.
-describe('Per-release adapters: an uninterpreted VALUE from a user overlay fails closed', () => {
+// The previous commit refused `change_control: off` from a user overlay because
+// the value was legal, activating and uninterpreted. This commit ships its
+// interpretation, so the same overlay is now accepted and resolved — and the
+// registry-derived refusal, which exists for exactly that combination, has
+// nothing left to refuse. Both halves are asserted here so the transition is
+// visible rather than inferred from a deleted test.
+describe('Per-release adapters: the overlay value this commit learns to interpret', () => {
   const OVERLAY = { scopeTenant: 'default' };
 
-  const refused = (scopeFm, field) => {
-    const result = planFor({ ...OVERLAY, scopeFm });
-    expect(result.valid).toBe(false);
-    expect(result.errors).toContainEqual(
-      expect.objectContaining({ code: 'policy_value_uninterpreted', ref: field }),
-    );
-    expect(result.plan.stages[0].policy).toBeUndefined();
-  };
-
-  it('refuses a change control the runtime cannot interpret, authored alone', () => {
-    refused({ change_control: 'off' }, 'change_control');
+  it('accepts the change control it can now interpret from a user overlay', () => {
+    for (const scopeFm of [
+      { change_control: 'off' },
+      { change_control: 'off', review_cap: 'advisory' },
+      { guard_policy: 'off' },
+    ]) {
+      const result = planFor({ ...OVERLAY, scopeFm });
+      expect(result.valid).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.plan.stages[0].policy).toMatchObject({ changeControl: null });
+    }
   });
 
-  it('refuses it alongside another policy activator too', () => {
-    refused({ change_control: 'off', review_cap: 'advisory' }, 'change_control');
-    refused({ change_control: 'off', sensors: 'off' }, 'change_control');
-  });
-
-  it('refuses it through the renamed field the mapper reads first', () => {
-    refused({ guard_policy: 'off' }, 'change_control');
-  });
-
-  it('keeps the two interpreted controls resolvable from the same overlay', () => {
+  it('keeps the two older controls resolvable from the same overlay', () => {
     for (const [scopeFm, expected] of [
       [{ change_control: 'strict' }, 'strict'],
       [{ change_control: 'relaxed' }, 'relaxed'],
@@ -533,26 +525,16 @@ describe('Per-release adapters: an uninterpreted VALUE from a user overlay fails
     }
   });
 
-  // The guard is the OVERLAY boundary, not the adapter vocabulary: a release
-  // closure's own scope still imports and still plans, and the promotion guard
-  // that named the value is what keeps it from being selected. Refusing it here
-  // as well would stop the 2.11 body being importable at all.
-  it('leaves the same value from a release closure block planned as before', () => {
-    const result = planFor({ scopeFm: { guard_policy: 'off' } });
-    expect(result.valid).toBe(true);
-    expect(result.errors).toEqual([]);
-    expect(result.plan.stages[0].policy).toMatchObject({ changeControl: 'off' });
-  });
-
-  // Derived from the registry, not from a second list naming the field: every
-  // legal value of a handled policy field whose own handling is `unsupported`
-  // is refused, and nothing else is.
-  it('derives the refused values from the registry alone', () => {
+  // The refusal is derived from the registry, so it retires with the
+  // classification rather than needing its own edit: no handled policy field
+  // carries an uninterpreted value any more. A future entry that does gets the
+  // same fail-closed treatment with no further change here.
+  it('leaves no handled policy field carrying an uninterpreted value', () => {
     expect(
       POLICY_ENUMS.filter(([, , , , , uninterpreted]) => uninterpreted.length > 0).map(
         ([, , field, , , uninterpreted]) => [field, uninterpreted],
       ),
-    ).toEqual([['change_control', ['off']]]);
+    ).toEqual([]);
   });
 });
 

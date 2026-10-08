@@ -53,7 +53,10 @@ const RUNTIME_HANDLERS = Object.freeze(
     'policy.review-cap@v1',
     'policy.sensors@v1',
     'policy.change-control@v1',
+    'policy.guard-policy.off@v1',
     'policy.learnings.off@v1',
+    'policy.plan-approval.switch@v1',
+    'policy.project-type.default@v1',
     'policy.learnings.ritual@v1',
     'policy.skeleton.switch@v1',
     'policy.summary-confirmation.off@v1',
@@ -103,8 +106,9 @@ const isEngineCommandGap = (gap) =>
 // authors one would run with a setting silently dropped. The analyzer already
 // withholds certification for it (`certificationGaps`); promotion reads the same
 // names off the closure (`compatibility.executionRelevantUnmappedFields`) through
-// this constructor, so one list produces both answers. `unhonouredValues` needs
-// no special case: no registry entry matches the pair, which is already a block.
+// this constructor, so one list produces both answers. `unhonouredValues` treats
+// this value as unconditionally unhonoured: it is a statement about what the
+// importer DROPPED, which no later handler can recover.
 const UNMAPPED_FIELD_GAP_VALUE = 'unmapped';
 const unmappedFieldGaps = (executionRelevantUnmappedFields = []) =>
   executionRelevantUnmappedFields.map((key) => {
@@ -346,11 +350,9 @@ const AIDLC_CAPABILITIES = Object.freeze([
     values: Object.freeze({
       strict: Object.freeze({ handling: 'approximated', handler: 'policy.change-control@v1' }),
       relaxed: Object.freeze({ handling: 'approximated', handler: 'policy.change-control@v1' }),
-      // 2.11's third value, reaching this key through `guard_policy`. Legal, so
-      // the plan resolver no longer rejects a 2.11 scope outright, but not yet
-      // honoured: the removal it asks for is a separate change, and until then
-      // the value holds promotion.
-      off: Object.freeze({ handling: 'unsupported', handler: null }),
+      // 2.11's third value, reaching this key through `guard_policy`: no reopen
+      // and no change-control prose, which is exactly "no change control".
+      off: Object.freeze({ handling: 'approximated', handler: 'policy.guard-policy.off@v1' }),
     }),
     // Upstream treats an omitted `change_control` as `strict`. Defaulting it
     // unconditionally would inject a change-control ritual into 2.6.18/2.7.0,
@@ -376,16 +378,16 @@ const AIDLC_CAPABILITIES = Object.freeze([
     field: 'guard_policy',
     planKey: 'guardPolicy',
     policy: 'scope',
-    handling: 'unsupported',
-    handler: null,
+    handling: 'approximated',
+    handler: 'policy.change-control@v1',
     values: Object.freeze({
-      strict: Object.freeze({ handling: 'unsupported', handler: null }),
-      relaxed: Object.freeze({ handling: 'unsupported', handler: null }),
-      off: Object.freeze({ handling: 'unsupported', handler: null }),
+      strict: Object.freeze({ handling: 'approximated', handler: 'policy.change-control@v1' }),
+      relaxed: Object.freeze({ handling: 'approximated', handler: 'policy.change-control@v1' }),
+      off: Object.freeze({ handling: 'approximated', handler: 'policy.guard-policy.off@v1' }),
     }),
     defaultWhenAbsent: null,
     capabilityPresentIf: null,
-    note: 'Upstream\u2019s rename of `change_control`, with a third value `off`. The mapper resolves `SCOPE:change_control` from this field first, so an existing closure maps exactly as before. No value is honoured yet: resolving it onto the per-stage policy is a separate change, and until then a release authoring it keeps holding promotion rather than running with a guard setting the platform dropped.',
+    note: 'Upstream\u2019s rename of `change_control`, with a third value `off`. The plan resolves ONE effective guard value from this field first and the legacy name second, so a scope carrying only the new name \u2014 which a user SCOPE overlay can, because an overlay never passes through the mapper \u2014 is honoured, and a 2.8.2/2.9.0 closure resolves exactly as before. `strict` and `relaxed` are the change-control gate unchanged. `off` is a removal the platform performs natively \u2014 no reopen and no change-control prose \u2014 but stays `approximated` because upstream\u2019s `off` ALSO lowers execution fences (pre-write guards, hook trust) this platform never had, and supports per-fence `Guards Off`/`Guards On` overrides with a provenance and kill-switch chain that have no surface here. The platform sentence is exact: Guard Policy off means no change-control reopen; it never removes a human approval gate.',
   }),
   Object.freeze({
     key: 'SCOPE:plan_approval',
@@ -393,15 +395,18 @@ const AIDLC_CAPABILITIES = Object.freeze([
     field: 'plan_approval',
     planKey: 'planApproval',
     policy: 'scope',
-    handling: 'unsupported',
-    handler: null,
+    handling: 'approximated',
+    handler: 'protocol.plan-approval.outcome-gate@v1',
     values: Object.freeze({
-      on: Object.freeze({ handling: 'unsupported', handler: null }),
-      off: Object.freeze({ handling: 'unsupported', handler: null }),
+      on: Object.freeze({
+        handling: 'approximated',
+        handler: 'protocol.plan-approval.outcome-gate@v1',
+      }),
+      off: Object.freeze({ handling: 'approximated', handler: 'policy.plan-approval.switch@v1' }),
     }),
     defaultWhenAbsent: null,
     capabilityPresentIf: null,
-    note: 'Upstream\u2019s Plan Approval scope switch. Mapped onto the SCOPE block, not yet resolved onto the per-stage policy, so a release authoring it keeps holding promotion.',
+    note: '`off` sets `policy.planApproval` to null: `request_plan_approval` is not registered for the stage and the completion ladder requires no plan receipt. It changes NOTHING else \u2014 the stage\u2019s `humanValidation` is untouched, which the plan suite asserts for every scope and stage. `on` keeps the existing approximation (A07): the platform checks the outcome rather than guarding each write. Refused and named in the annex: upstream\u2019s engine-owned three-choice ask, its fingerprint/receipt minting, `--units` subsets, edit-while-waiting protection and strict-reopen-on-change.',
   }),
   Object.freeze({
     key: 'SCOPE:collaborators',
@@ -431,15 +436,15 @@ const AIDLC_CAPABILITIES = Object.freeze([
     planKey: 'existingCode',
     policy: 'scope',
     authoredType: 'boolean',
-    handling: 'unsupported',
-    handler: null,
+    handling: 'approximated',
+    handler: 'policy.project-type.default@v1',
     values: Object.freeze({
-      true: Object.freeze({ handling: 'unsupported', handler: null }),
-      false: Object.freeze({ handling: 'unsupported', handler: null }),
+      true: Object.freeze({ handling: 'approximated', handler: 'policy.project-type.default@v1' }),
+      false: Object.freeze({ handling: 'approximated', handler: 'policy.project-type.default@v1' }),
     }),
     defaultWhenAbsent: null,
     capabilityPresentIf: null,
-    note: 'The project type the scope authors. Mapped onto the SCOPE block, not yet resolved onto the per-stage policy, so a release authoring it keeps holding promotion.',
+    note: 'The authored value reaches `policy.existingCode` and the stage prompt states the project type it implies, so the scope\u2019s own classification steers the run instead of being dropped. `approximated`, not native: upstream additionally rescans, reintroduces Reverse Engineering behind the cursor and returns to the interrupted stage when the type changes mid-run. That transaction is refused by name in the annex (`engine orchestrate next`) \u2014 a human rewinds and recomposes.',
   }),
   Object.freeze({
     key: 'SCOPE:learnings',
@@ -814,6 +819,14 @@ const unhonouredValues = ({
     if (isEngineCommandGap(gap)) {
       return !(gap.annexed === true && annexedEngineCommands.has(gap.value));
     }
+    // An `unmapped` gap records that the IMPORTER of that closure stored no
+    // value for the field — the information is gone from the catalog, not merely
+    // unhandled by this build. A later build adding a handler cannot recover it,
+    // so the gap can only be cleared by re-importing the source under the newer
+    // revision (`upgradeReleaseClosure`). Were it matched against the registry
+    // like an authored value, adding an entry would clear an old closure's
+    // blocker and promote it as though it carried the setting.
+    if (gap.value === UNMAPPED_FIELD_GAP_VALUE) return true;
     const entry = registry.find(
       (candidate) => candidate.blockType === gap.blockType && candidate.field === gap.field,
     );

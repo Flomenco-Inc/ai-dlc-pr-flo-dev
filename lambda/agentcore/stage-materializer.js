@@ -29,6 +29,7 @@ import { DEFAULT_CODEX_HOME_ROOT } from './cli/codex-store.js';
 // capability cannot be declared handled without the code that handles it.
 export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze([
   'agent.max-turns@v1',
+  'policy.project-type.default@v1',
   'prompt.learnings@v1',
 ]);
 
@@ -259,6 +260,13 @@ export const renderScopePolicy = (policy) => {
       '- **Change control is STRICT.** If an already-approved input appears to',
       '  have changed, do NOT silently build on it: say so in your summary so the',
       '  human can reopen the affected checkpoint.',
+    );
+  }
+  if (policy.existingCode === true) {
+    lines.push(
+      '- **Project type: BROWNFIELD.** This scope is authored for an existing',
+      '  codebase: read what is already there before proposing anything new, and',
+      '  keep the conventions you find.',
     );
   }
   if (policy.skeleton === 'on') {

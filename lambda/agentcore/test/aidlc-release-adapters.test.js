@@ -221,6 +221,28 @@ describe('scope policy in the stage prompt', () => {
     expect(rendered).toContain('request_plan_approval');
   });
 
+  // The registry declares `SCOPE:existing_code` handled by a seam in this
+  // module, so the prompt must actually state the project type. Without this,
+  // removing the whole block leaves the plan and registry suites green and the
+  // "handled" claim is a comment.
+  it('states the brownfield project type an existing-code scope authors', () => {
+    const rendered = renderScopePolicy({ ...POLICY, existingCode: true });
+
+    expect(rendered).toContain('Project type: BROWNFIELD');
+    expect(
+      buildStagePrompt({
+        stage: { ...STAGE, policy: { ...POLICY, existingCode: true } },
+        stageBody: 'x',
+      }),
+    ).toContain('Project type: BROWNFIELD');
+  });
+
+  it('says nothing about the project type when the scope does not author it', () => {
+    for (const existingCode of [null, false]) {
+      expect(renderScopePolicy({ ...POLICY, existingCode })).not.toContain('Project type');
+    }
+  });
+
   it('says nothing about learnings when the scope turns them off', () => {
     // `learnings: off` is enforced by WITHDRAWING the two tools in mcp/server.js,
     // so the prompt must not describe tools the agent cannot see.

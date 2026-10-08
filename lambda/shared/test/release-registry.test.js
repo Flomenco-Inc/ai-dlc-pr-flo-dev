@@ -2438,21 +2438,85 @@ describe('promotion of a record whose evidence read the engine sources', () => {
   });
 });
 
+// An `unmapped` gap says the importer of that closure stored NO value for the
+// field. Adding a runtime handler later cannot recover what was dropped, so the
+// blocker must survive a build that can handle the field — only a re-import
+// under the newer revision may clear it.
+describe('promotion of a closure whose importer never stored the field', () => {
+  const UNMAPPED_GAPS = Object.freeze([
+    { blockType: 'SCOPE', field: 'guard_policy', value: UNMAPPED_FIELD_GAP_VALUE },
+    { blockType: 'SCOPE', field: 'plan_approval', value: UNMAPPED_FIELD_GAP_VALUE },
+  ]);
+
+  // The row an earlier importer revision left behind: its catalog has no value
+  // for either field, and its gap list is current evidence for THAT closure.
+  const atTheOlderImporterRevision = async () => {
+    installFakes();
+    const bundle = buildReleaseBundle({
+      profileId: CANDIDATE_PROFILE,
+      files: filesWithInvokeLines(CANDIDATE_PROFILE),
+    });
+    await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+    await registerRelease(registerArgs(CANDIDATE_PROFILE));
+    const key = keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META');
+    // The evidence revision stays the one this build just wrote, so the stored
+    // list is current evidence and the guard reads it rather than recomputing:
+    // the question under test is what the registry does with an `unmapped`
+    // value it now has an entry for.
+    const row = {
+      ...rows.get(key),
+      importerRevision: 2,
+      fidelityGaps: [...UNMAPPED_GAPS],
+    };
+    rows.set(key, row);
+    return row;
+  };
+
+  it.each(['selectable', 'certified'])('refuses %s promotion', async (state) => {
+    const row = await atTheOlderImporterRevision();
+
+    await expect(
+      updateRelease({
+        ...registryArgs(),
+        s3,
+        bucket: BUCKET,
+        releaseId: CANDIDATE_RELEASE_ID,
+        expectedRevision: row.revision,
+        patch: { supportState: state },
+        actor: 'admin-1',
+      }),
+    ).rejects.toMatchObject({ code: 'release_capability_unhandled' });
+  });
+
+  it('keeps naming both fields when an admin lists it', async () => {
+    await atTheOlderImporterRevision();
+
+    const releases = await listReleases({ ...registryArgs(), s3, bucket: BUCKET });
+
+    const listed = releases.find((release) => release.releaseId === CANDIDATE_RELEASE_ID);
+    for (const gap of UNMAPPED_GAPS) {
+      expect(listed.unhonouredValues).toContainEqual(gap);
+    }
+    expect(listed.importerRevision).toBe(2);
+  });
+});
+
 // Mapping a new authored field removes its `unmapped` blocker. Nothing else
 // makes the setting work, so the field must have a classification the moment it
 // becomes mapped, and a release authoring a value whose handler has not shipped
 // must keep holding promotion — including a fork, which is the shape a customer
 // reaches this branch with.
-describe('a release authoring a 2.11 scope setting whose handler has not shipped', () => {
+describe('fork promotion of a release authoring the 2.11 scope settings', () => {
   const SCOPE_PATH = 'core/scopes/aidlc-classic.md';
   // [authored line, the gap promotion must name]. A row moves out of here in the
   // PR that resolves that setting onto the runtime, never before.
   const UNHANDLED = [
-    ['guard_policy: strict', { blockType: 'SCOPE', field: 'guard_policy', value: 'strict' }],
-    ['plan_approval: off', { blockType: 'SCOPE', field: 'plan_approval', value: 'off' }],
     ['collaborators: off', { blockType: 'SCOPE', field: 'collaborators', value: 'off' }],
-    ['existing_code: true', { blockType: 'SCOPE', field: 'existing_code', value: 'true' }],
   ];
+  // Resolved onto the per-stage policy by this PR, so they no longer hold
+  // promotion on their own — asserted, because "handled" must be the reason the
+  // blocker is gone rather than a mapping that dropped it.
+  const HANDLED = ['guard_policy: strict', 'plan_approval: off', 'existing_code: true'];
 
   const withSettings = (files, lines) => {
     expect(files.has(SCOPE_PATH), SCOPE_PATH).toBe(true);
@@ -2512,7 +2576,7 @@ describe('a release authoring a 2.11 scope setting whose handler has not shipped
   it.each(['selectable', 'certified'])(
     'refuses %s promotion of a fork authoring all of them',
     async (state) => {
-      const { release } = await registerFork(UNHANDLED.map(([line]) => line));
+      const { release } = await registerFork([...HANDLED, ...UNHANDLED.map(([line]) => line)]);
 
       for (const [, gap] of UNHANDLED) {
         expect(release.unhonouredValues).toContainEqual(gap);
@@ -2522,6 +2586,15 @@ describe('a release authoring a 2.11 scope setting whose handler has not shipped
       });
     },
   );
+
+  it.each(HANDLED)('no longer holds a fork authoring only %s', async (line) => {
+    const { release } = await registerFork([line]);
+
+    expect(release.unhonouredValues).toEqual([]);
+    await expect(promoteFork(release, 'selectable')).resolves.toMatchObject({
+      supportState: 'selectable',
+    });
+  });
 });
 
 // A stored list carrying a NUMERIC revision this build has moved past is the

@@ -2240,6 +2240,85 @@ describe('a 2.9.0 whose developer persona carries the engine command', () => {
   });
 });
 
+// An execution-relevant authored field no adapter consumes is how a future
+// release would silently lose a setting: the closure already records its name,
+// so promotion must name it as a blocker rather than leave it to certification.
+describe('a release authoring an execution-relevant field no adapter consumes', () => {
+  const SCOPE_PATH = 'core/scopes/aidlc-bugfix.md';
+  const FUTURE_FIELD = { blockType: 'SCOPE', field: 'future_switch', value: 'unmapped' };
+
+  const withFutureField = (files) => {
+    expect(files.has(SCOPE_PATH), SCOPE_PATH).toBe(true);
+    files.set(SCOPE_PATH, files.get(SCOPE_PATH).replace('---\n', '---\nfuture_switch: later\n'));
+    return files;
+  };
+
+  it.each(['selectable', 'certified'])(
+    'refuses %s promotion and names the field',
+    async (state) => {
+      installFakes();
+      const bundle = buildReleaseBundle({
+        profileId: CANDIDATE_PROFILE,
+        files: withFutureField(filesWithInvokeLines(CANDIDATE_PROFILE)),
+      });
+      await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+      const { release } = await registerRelease(registerArgs(CANDIDATE_PROFILE));
+
+      expect(release.unhonouredValues).toContainEqual(FUTURE_FIELD);
+      await expect(
+        updateRelease({
+          ...registryArgs(),
+          s3,
+          bucket: BUCKET,
+          releaseId: release.releaseId,
+          expectedRevision: release.revision,
+          patch: { supportState: state },
+          actor: 'admin-1',
+        }),
+      ).rejects.toMatchObject({ code: 'release_capability_unhandled' });
+    },
+  );
+
+  // Fork promotion goes through the same guard, so a fork that authors an
+  // unknown field is held exactly as an official release would be.
+  it('holds a fork authoring the same field', async () => {
+    installFakes();
+    const FORK_SHA = 'abcdef0123456789abcdef0123456789abcdef01';
+    const profile = customProfile({
+      repository: 'acme/aidlc-own',
+      sha: FORK_SHA,
+      baseProfileId: CANDIDATE_PROFILE,
+    });
+    const bundle = buildReleaseBundle({
+      profile,
+      files: withFutureField(filesWithInvokeLines(CANDIDATE_PROFILE)),
+    });
+    await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+    const { release } = await registerCustomRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      repository: 'acme/aidlc-own',
+      sha: FORK_SHA,
+      baseProfileId: CANDIDATE_PROFILE,
+      actor: 'admin-1',
+    });
+
+    expect(release.unhonouredValues).toContainEqual(FUTURE_FIELD);
+    await expect(
+      updateRelease({
+        ...registryArgs(),
+        s3,
+        bucket: BUCKET,
+        releaseId: release.releaseId,
+        expectedRevision: release.revision,
+        patch: { supportState: 'selectable' },
+        actor: 'admin-1',
+      }),
+    ).rejects.toMatchObject({ code: 'release_capability_unhandled' });
+  });
+});
+
 describe('promotion of a record registered before protocol evidence existed', () => {
   // A record imported by an earlier build stored only its frontmatter gaps; the
   // build-and-test loop-back is a protocol the closure ships, not an authored
@@ -2274,7 +2353,7 @@ describe('promotion of a record registered before protocol evidence existed', ()
 
     expect(promoted).toMatchObject({ supportState: 'selectable', unhonouredValues: [] });
     expect(rows.get(keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META'))).toMatchObject({
-      fidelityEvidenceRevision: 4,
+      fidelityEvidenceRevision: 5,
     });
   });
 
@@ -2282,7 +2361,7 @@ describe('promotion of a record registered before protocol evidence existed', ()
     await registerRelease(registerArgs(CANDIDATE_PROFILE));
 
     expect(rows.get(keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META'))).toMatchObject({
-      fidelityEvidenceRevision: 4,
+      fidelityEvidenceRevision: 5,
     });
   });
 
@@ -2338,6 +2417,58 @@ describe('promotion of a record whose evidence read the engine sources', () => {
 
     expect(promoted).toMatchObject({ supportState: 'selectable', unhonouredValues: [] });
     expect(rows.get(key).fidelityGaps).not.toContainEqual(row.fidelityGaps[0]);
+  });
+});
+
+// A stored list carrying a NUMERIC revision this build has moved past is the
+// other stale shape, and the one an upgrade actually produces: the previous
+// build wrote `fidelityEvidenceRevision: 4` with evidence that never judged an
+// unmapped execution-relevant field, so the row looks complete while holding a
+// verdict this build would not reach. The revision — not the presence of a list
+// — is what has to decide whether the closure is re-read.
+describe('promotion of a record whose evidence predates the unmapped-field blocker', () => {
+  const STALE_GAP = Object.freeze({
+    blockType: 'BODY',
+    field: '{{INVOKE}}',
+    value: 'engine state practices-event',
+    annexed: false,
+  });
+
+  const registeredAtTheOlderRevision = async () => {
+    await registerRelease(registerArgs(CANDIDATE_PROFILE));
+    const key = keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META');
+    const row = { ...rows.get(key), fidelityGaps: [STALE_GAP], fidelityEvidenceRevision: 4 };
+    rows.set(key, row);
+    return { key, row };
+  };
+
+  it('re-evaluates the closure instead of trusting that list', async () => {
+    const { key, row } = await registeredAtTheOlderRevision();
+
+    const promoted = await updateRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      releaseId: CANDIDATE_RELEASE_ID,
+      expectedRevision: row.revision,
+      patch: { supportState: 'selectable' },
+      actor: 'admin-1',
+    });
+
+    expect(promoted).toMatchObject({ supportState: 'selectable', unhonouredValues: [] });
+    expect(rows.get(key).fidelityGaps).not.toContainEqual(STALE_GAP);
+    expect(rows.get(key)).toMatchObject({ fidelityEvidenceRevision: 5 });
+  });
+
+  it('reports the recomputed answer when an admin lists it', async () => {
+    const { key } = await registeredAtTheOlderRevision();
+
+    const releases = await listReleases({ ...registryArgs(), s3, bucket: BUCKET });
+
+    const listed = releases.find((release) => release.releaseId === CANDIDATE_RELEASE_ID);
+    expect(listed.unhonouredValues).toEqual([]);
+    expect(listed.fidelityGaps).not.toContainEqual(STALE_GAP);
+    expect(rows.get(key)).toMatchObject({ fidelityEvidenceRevision: 5 });
   });
 });
 
@@ -2481,7 +2612,7 @@ describe('admin listing of a record registered before protocol evidence existed'
     const second = await listReleases({ ...registryArgs(), s3, bucket: BUCKET });
 
     const listed = first.find((release) => release.releaseId === CANDIDATE_RELEASE_ID);
-    expect(cached.fidelityEvidenceRevision).toBe(4);
+    expect(cached.fidelityEvidenceRevision).toBe(5);
     expect(cached.fidelityGaps).toEqual(listed.fidelityGaps);
     expect(cached.fidelityGaps).not.toEqual(legacy.fidelityGaps);
     // Evidence is derived from an immutable closure, never a decision, so the

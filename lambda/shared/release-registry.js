@@ -652,12 +652,18 @@ const registerCustomRelease = async ({
 // annex coverage per CONSUMING BLOCK instead of per content-addressed body key,
 // and judges an approximated command by the same reach: a revision-3 list can
 // therefore hold `annexed: true` for a body a stage and a rule share, and omit
-// an approximated command whose answer never reached its prompt. Promotion
-// therefore re-evaluates such a list from the immutable closure, exactly like a
-// record with no list at all. Other readers (the intent-creation eligibility
-// check) keep using the stored list: a record can only be selected after a
-// promotion has written current evidence.
-const FIDELITY_EVIDENCE_REVISION = 4;
+// an approximated command whose answer never reached its prompt. Revision 5 adds
+// the execution-relevant fields no mapper consumed, which an earlier build
+// recorded on the closure but never turned into a blocker. Promotion therefore
+// re-evaluates such a list from the immutable closure, exactly like a record
+// with no list at all. Other readers (the intent-creation eligibility check) keep
+// using the stored list: a record can only be selected after a promotion has
+// written current evidence.
+//
+// Bump this with EVERY change to what the evidence collector decides. Without
+// it, eligibility would depend on when a record was registered or last
+// refreshed rather than on its immutable closure and this runtime.
+const FIDELITY_EVIDENCE_REVISION = 5;
 
 const hasCurrentFidelityEvidence = (release) =>
   Array.isArray(release.fidelityGaps) &&

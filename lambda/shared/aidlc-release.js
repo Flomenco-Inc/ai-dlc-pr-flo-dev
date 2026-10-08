@@ -23,6 +23,7 @@ import {
   normalizeAidlcFrontmatter,
   profileFor,
 } from './aidlc-compatibility.js';
+import { unmappedFieldGaps } from './aidlc-capabilities.js';
 import { parseRepositorySlug } from './aidlc-custom-source.js';
 import { annexReachingBlocks } from './annex-reach.js';
 import { buildFromFiles, CONDUCTOR_REPO_PATH } from './block-mappers.js';
@@ -507,7 +508,10 @@ const bodyKeys = (blocks) => blocks.map((block) => block?.bodyRef?.s3Key).filter
 // Preserve the published manifest bytes while recovering the analyzer's
 // promotion evidence from its immutable closure. The catalog holds mapped
 // frontmatter values; content-addressed objects hold the source bodies that
-// may include unsupported engine commands.
+// may include unsupported engine commands. The manifest's own compatibility
+// record holds the third kind of evidence: the execution-relevant fields no
+// mapper consumed, which no catalog or body can show because nothing mapped
+// them.
 const readReleaseFidelityGaps = async ({ s3, bucket, manifest }) => {
   let catalog;
   try {
@@ -632,11 +636,18 @@ const readReleaseFidelityGaps = async ({ s3, bucket, manifest }) => {
     },
   );
 
-  return fidelityGapsFromCatalog({
-    catalog,
-    invokeCommands: invokes.commands(),
-    runtimeFilePaths: (manifest.runtimeFiles ?? []).map(({ path }) => path),
-  });
+  return [
+    ...unmappedFieldGaps(manifest.compatibility?.executionRelevantUnmappedFields ?? []),
+    ...fidelityGapsFromCatalog({
+      catalog,
+      invokeCommands: invokes.commands(),
+      runtimeFilePaths: (manifest.runtimeFiles ?? []).map(({ path }) => path),
+    }),
+  ].toSorted((left, right) =>
+    `${left.blockType}:${left.field}:${left.value}`.localeCompare(
+      `${right.blockType}:${right.field}:${right.value}`,
+    ),
+  );
 };
 
 const putJsonIfAbsent = async ({ s3, bucket, key, value }) => {

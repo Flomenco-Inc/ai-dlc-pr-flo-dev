@@ -93,6 +93,24 @@ const ENGINE_COMMAND_GAP_FIELD = '{{INVOKE}}';
 const isEngineCommandGap = (gap) =>
   gap?.blockType === 'BODY' && gap?.field === ENGINE_COMMAND_GAP_FIELD;
 
+// An authored field no entry below covers has no legal values, no handler and no
+// absent-default — the platform does not know what it means, so a release that
+// authors one would run with a setting silently dropped. The analyzer already
+// withholds certification for it (`certificationGaps`); promotion reads the same
+// names off the closure (`compatibility.executionRelevantUnmappedFields`) through
+// this constructor, so one list produces both answers. `unhonouredValues` needs
+// no special case: no registry entry matches the pair, which is already a block.
+const UNMAPPED_FIELD_GAP_VALUE = 'unmapped';
+const unmappedFieldGaps = (executionRelevantUnmappedFields = []) =>
+  executionRelevantUnmappedFields.map((key) => {
+    const separator = String(key).indexOf(':');
+    return {
+      blockType: String(key).slice(0, separator),
+      field: String(key).slice(separator + 1),
+      value: UNMAPPED_FIELD_GAP_VALUE,
+    };
+  });
+
 // The version-agnostic marker for the stages Plan Approval governs — see
 // `planApprovalApplies`.
 const PLAN_APPROVAL_ARTIFACT = 'code-generation-plan';
@@ -676,6 +694,7 @@ export {
   RUNTIME_HANDLERS,
   SCOPE_POLICY_KEYS,
   STAGE_POLICY_KEYS,
+  UNMAPPED_FIELD_GAP_VALUE,
   capabilityFor,
   defaultWhenAbsent,
   isQuestionChannelOutput,
@@ -683,6 +702,7 @@ export {
   resolveCapabilities,
   unhandledCapabilities,
   unhonouredValues,
+  unmappedFieldGaps,
 };
 
 export default {
@@ -697,6 +717,7 @@ export default {
   RUNTIME_HANDLERS,
   SCOPE_POLICY_KEYS,
   STAGE_POLICY_KEYS,
+  UNMAPPED_FIELD_GAP_VALUE,
   capabilityFor,
   defaultWhenAbsent,
   isQuestionChannelOutput,
@@ -704,4 +725,5 @@ export default {
   resolveCapabilities,
   unhandledCapabilities,
   unhonouredValues,
+  unmappedFieldGaps,
 };

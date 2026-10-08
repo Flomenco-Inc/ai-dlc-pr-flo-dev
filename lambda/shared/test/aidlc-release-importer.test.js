@@ -122,6 +122,23 @@ describe('importer revision and mapper fingerprint', () => {
     }
   });
 
+  // A mapper that learned the 2.11 scope settings must not reinterpret a
+  // closure that authors none of them. Mapping happens at import
+  // and an existing pin keeps its own revision's bytes — but if the new mappers
+  // produced a DIFFERENT catalog for the same source, a re-import under the new
+  // revision would hand an unchanged release different semantics.
+  it('reproduces every previous revision’s catalog for every vendored release', () => {
+    const revisions = Object.keys(CATALOG_GOLDENS).map(Number).toSorted();
+    expect(revisions.at(-1)).toBe(AIDLC_RELEASE_IMPORTER_REVISION);
+    for (const revision of revisions) {
+      for (const profileId of PROFILES) {
+        expect({ revision, profileId, sha256: bundles[profileId].manifest.catalog.sha256 }).toEqual(
+          { revision, profileId, sha256: CATALOG_GOLDENS[revision][profileId] },
+        );
+      }
+    }
+  });
+
   it('carries the mapped policy fields into the 2.9.0 catalog, like 2.8.2', () => {
     for (const profileId of ['v2.8.2', 'v2.9.0']) {
       const { catalog } = bundles[profileId];

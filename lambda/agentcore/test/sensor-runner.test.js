@@ -502,3 +502,189 @@ describe('runStageSensors — script kind', () => {
     });
   });
 });
+
+// The flag a script sensor is spawned with comes from the plan, which resolved
+// it from the sensor's declared contract. A document sensor spawned with the
+// code sensors' --file-path exits before it runs its check.
+describe('runStageSensors — script argv', () => {
+  let ws;
+  beforeEach(async () => {
+    ws = await mkdtemp(path.join(tmpdir(), 'sensor-argv-'));
+    await mkdir(path.join(ws, 'aidlc-docs'), { recursive: true });
+    await writeFile(path.join(ws, 'aidlc-docs', 'traceability.json'), '{}');
+  });
+  afterEach(async () => {
+    await rm(ws, { recursive: true, force: true });
+  });
+
+  const spawnRecording = (calls) => (file, args) => {
+    calls.push({ file, args });
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    setTimeout(() => {
+      child.stdout.emit('data', Buffer.from('{"pass":true}'));
+      child.emit('close', 0);
+    }, 0);
+    return child;
+  };
+
+  const runWith = async (sensor, runnerOptions = {}) => {
+    const calls = [];
+    const runner = createSensorRunner({
+      graph: null,
+      loadBlockScript: async () => 'SENSOR_SCRIPT_BODY',
+      workspaceDir: ws,
+      spawnFn: spawnRecording(calls),
+      ...runnerOptions,
+    });
+    const verdicts = await runner.runStageSensors({
+      sensors: [sensor],
+      stageId: 'intent-capture',
+    });
+    return { calls, verdicts };
+  };
+
+  const traceability = {
+    sensorId: 'traceability',
+    severity: 'advisory',
+    runtime: 'bun',
+    command: 'bun aidlc-sensor-traceability.ts',
+    matches: '**/traceability.json',
+    timeoutSeconds: 5,
+  };
+
+  it('spawns a document sensor on the output path its plan entry carries', async () => {
+    const { calls, verdicts } = await runWith({ ...traceability, pathFlag: '--output-path' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toEqual([
+      path.join(ws, '.aidlc', 'sensors', 'traceability.ts'),
+      '--stage',
+      'intent-capture',
+      '--output-path',
+      'aidlc-docs/traceability.json',
+    ]);
+    expect(verdicts[0].result).toBe('PASS');
+  });
+
+  it('spawns a sensor with no resolved flag on the file path, as before', async () => {
+    const { calls } = await runWith(traceability);
+    expect(calls[0].args.slice(-2)).toEqual(['--file-path', 'aidlc-docs/traceability.json']);
+  });
+
+  it('shortens a long budget to the stage deadline and says so in the verdict', async () => {
+    const { calls, verdicts } = await runWith(
+      { ...traceability, timeoutSeconds: 1200 },
+      { remainingStageMs: () => 90000 },
+    );
+    expect(calls).toHaveLength(1);
+    expect(verdicts[0].detail).toMatchObject({ timeoutMs: 90000, boundedBy: 'stage-deadline' });
+  });
+
+  it('reports no bound when the authored budget is the one that runs', async () => {
+    const { verdicts } = await runWith(traceability, { remainingStageMs: () => 90000 });
+    expect(verdicts[0].detail).not.toHaveProperty('boundedBy');
+  });
+});
+
+// What is left of the stage's wall-clock budget bounds EVERY child, not just the
+// first. A sensor matching several files handed each of them the allowance the
+// first one found, and an already-expired budget restored the whole authored
+// allowance instead of stopping the pass — so the bound protected nothing.
+describe('runStageSensors — the stage budget bounds every child', () => {
+  let ws;
+  beforeEach(async () => {
+    ws = await mkdtemp(path.join(tmpdir(), 'sensor-budget-'));
+    await writeFile(path.join(ws, 'a.ts'), 'export const a = 1;');
+    await writeFile(path.join(ws, 'b.ts'), 'export const b = 2;');
+  });
+  afterEach(async () => {
+    await rm(ws, { recursive: true, force: true });
+  });
+
+  const typeCheck = {
+    sensorId: 'type-check',
+    severity: 'advisory',
+    runtime: 'bun',
+    command: 'bun aidlc-sensor-type-check.ts',
+    matches: '**/*.ts',
+    timeoutSeconds: 600,
+  };
+
+  // Returns each value in turn, then repeats the last one — so a test can say
+  // "there was time for the first file and none for the second".
+  const remainingSequence = (values, reads) => () => {
+    const value = values[Math.min(reads.length, values.length - 1)];
+    reads.push(value);
+    return value;
+  };
+
+  const runWith = async ({ sensor = typeCheck, remaining = null } = {}) => {
+    const calls = [];
+    const reads = [];
+    const runner = createSensorRunner({
+      graph: null,
+      loadBlockScript: async () => 'SENSOR_SCRIPT_BODY',
+      workspaceDir: ws,
+      spawnFn: (file, args) => {
+        calls.push({ file, args });
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = () => {};
+        setTimeout(() => {
+          child.stdout.emit('data', Buffer.from('{"pass":true}'));
+          child.emit('close', 0);
+        }, 0);
+        return child;
+      },
+      ...(remaining ? { remainingStageMs: remainingSequence(remaining, reads) } : {}),
+    });
+    const verdicts = await runner.runStageSensors({ sensors: [sensor], stageId: 'construction' });
+    return { calls, reads, verdict: verdicts[0] };
+  };
+
+  it('re-reads what is left of the stage before each file, not once for the pass', async () => {
+    const { calls, reads, verdict } = await runWith({ remaining: [300000, 120000] });
+    expect(calls).toHaveLength(2);
+    expect(reads).toEqual([300000, 120000]);
+    expect(verdict.detail).toMatchObject({ timeoutMs: 120000, boundedBy: 'stage-deadline' });
+  });
+
+  it('stops the sweep when the budget runs out part-way, and says which file it never read', async () => {
+    const { calls, verdict } = await runWith({ remaining: [300000, -1] });
+    expect(calls).toHaveLength(1);
+    expect(verdict.result).toBe('BLOCKED');
+    expect(verdict.detail.stageBudgetExhausted).toBe(true);
+    expect(verdict.detail.files).toHaveLength(2);
+    expect(verdict.detail.files[1]).toMatchObject({
+      result: 'BLOCKED',
+      detail: { error: expect.stringContaining('stage budget was exhausted') },
+    });
+  });
+
+  it('launches nothing at all once the stage deadline has already passed', async () => {
+    const { calls, verdict } = await runWith({ remaining: [-1] });
+    expect(calls).toEqual([]);
+    expect(verdict.result).toBe('BLOCKED');
+    expect(verdict.detail).toMatchObject({ stageBudgetExhausted: true });
+    expect(verdict.detail.files.map((f) => f.result)).toEqual(['BLOCKED', 'BLOCKED']);
+  });
+
+  it('holds the stage on an exhausted budget when the sensor is blocking', async () => {
+    const { verdict } = await runWith({
+      sensor: { ...typeCheck, severity: 'blocking' },
+      remaining: [0],
+    });
+    expect(verdict.held).toBe(true);
+  });
+
+  it('leaves the authored budget alone when no deadline is available', async () => {
+    const { calls, verdict } = await runWith();
+    expect(calls).toHaveLength(2);
+    expect(verdict.result).toBe('PASS');
+    expect(verdict.detail).not.toHaveProperty('boundedBy');
+    expect(verdict.detail).not.toHaveProperty('stageBudgetExhausted');
+  });
+});

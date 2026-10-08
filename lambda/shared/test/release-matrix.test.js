@@ -23,6 +23,12 @@ import {
 import { evaluateGatePreconditions } from '../gate-preconditions.js';
 import { LOOP_BACK_OPTION, resolveLoopBackOffer } from '../stage-loopback.js';
 import { resolveMethodologyLibrary } from '../release-resolver.js';
+import {
+  SENSOR_RESULT,
+  sensorKind,
+  severityGate,
+  validateScriptSpec,
+} from '../v2-sensor-contract.js';
 import { canonicalJson } from '../workflow-checkpoint.js';
 import { buildGateOptions } from '../../v2-orchestrator/index.js';
 
@@ -569,5 +575,60 @@ describe('release coexistence matrix', () => {
 
     expect(inherited).toEqual([]);
     expect(declaredWithoutPolicy).toEqual([]);
+  });
+
+  // Every script sensor every allowlisted release runs, with the flag it is
+  // spawned on and the budget it gets. A release that authors no input contract
+  // keeps `--file-path`, and every authored budget is honoured as authored — no
+  // release at or below 2.9.0 reaches the ceiling.
+  it('spawns every release script sensor on its declared flag within its authored budget', async () => {
+    const specsByProfile = {};
+
+    for (const profileId of PROFILE_IDS) {
+      const { workflow, releaseLibrary } = await fixtureContext(profileId);
+      const scopes = [
+        ...new Set(
+          workflow.placements.flatMap((placement) => Object.keys(placement.scopeMembership ?? {})),
+        ),
+      ].toSorted();
+      const specs = new Set();
+
+      for (const scope of scopes) {
+        const { plan } = buildExecutionPlan({ workflow, scope, library: releaseLibrary });
+        for (const stage of plan?.stages ?? []) {
+          for (const sensor of stage.sensors ?? []) {
+            if (sensorKind(sensor) !== 'script') continue;
+            const { ok, spec } = validateScriptSpec(sensor);
+            expect(ok, `${profileId}/${scope}/${sensor.sensorId}`).toBe(true);
+            specs.add(`${sensor.sensorId} ${spec.pathFlag} ${spec.timeoutMs} ${spec.boundedBy}`);
+            // A sensor whose flag this change moves must be advisory, or the
+            // verdict it can now reach would move a gate outcome.
+            if (spec.pathFlag !== '--file-path') {
+              expect(
+                severityGate(SENSOR_RESULT.FAIL, sensor.severity),
+                `${profileId}/${scope}/${sensor.sensorId}`,
+              ).toEqual({ continues: true, held: false });
+            }
+          }
+        }
+      }
+      specsByProfile[profileId] = [...specs].toSorted();
+    }
+
+    const documentSensors = [
+      'claim-sources --output-path 5000 authored',
+      'traceability --output-path 5000 authored',
+    ];
+    const codeSensors = [
+      'linter --file-path 30000 authored',
+      'type-check --file-path 60000 authored',
+    ];
+    expect(specsByProfile).toEqual({
+      'current-stable': codeSensors,
+      'v2.6.18': [...documentSensors, ...codeSensors].toSorted(),
+      'v2.7.0': [...documentSensors, ...codeSensors].toSorted(),
+      'v2.8.2': [...documentSensors, ...codeSensors].toSorted(),
+      'v2.9.0': [...documentSensors, ...codeSensors].toSorted(),
+    });
   });
 });

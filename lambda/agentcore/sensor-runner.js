@@ -29,6 +29,7 @@ import path from 'node:path';
 import {
   SENSOR_RESULT,
   sensorKind,
+  scriptTimeoutBound,
   severityGate,
   validateScriptSpec,
   resultFromExit,
@@ -218,6 +219,8 @@ const resultFromScript = ({ exitCode, stdout }) => {
   return { result: resultFromExit(exitCode), detail: null };
 };
 
+const STAGE_BUDGET_EXHAUSTED = 'the stage budget was exhausted before this file was examined';
+
 // A pinned sensor whose script could not be verified or read has not produced a
 // verdict at all, so its severity does not apply — the check is missing, which is
 // the drift the release pin exists to prevent. run-stage applies the same test to
@@ -238,7 +241,14 @@ export const createSensorRunner = ({
   substitutions = {},
   spawnFn = spawn,
   childEnv = process.env,
+  // Milliseconds left of the stage's wall-clock budget, read per sensor. The
+  // stage deadline — not the contract's ceiling — is what keeps a long sensor
+  // from outliving the container. Absent (unpinned, or a caller with no
+  // deadline) leaves the authored budget alone.
+  remainingStageMs = null,
 } = {}) => {
+  const readRemainingStageMs = () =>
+    typeof remainingStageMs === 'function' ? remainingStageMs() : remainingStageMs;
   // Evaluate one `graph` sensor against the artifacts this stage produced. Each
   // produced artifact's content is read from Neptune and fed to the in-process
   // evaluator. The worst result across the produced artifacts wins (a single
@@ -397,14 +407,28 @@ export const createSensorRunner = ({
     await writeFile(scriptPath, script, 'utf8');
     const { file, args } = buildScriptArgv(spec, { scriptPath, substitutions });
 
-    // One run per matching file (the upstream scripts take a single --file-path).
+    // One run per matching file (each upstream script takes a single path, on
+    // the flag its own manifest declares). The stage budget is re-read
+    // immediately before EVERY launch — after materialization, which itself
+    // costs time — because the sampled allowance of the first file is not the
+    // allowance the tenth one has left. An exhausted budget stops the pass: the
+    // files it never reached are recorded non-PASS, so an expired stage never
+    // reads as a clean sweep.
     const fileResults = [];
     let worst = SENSOR_RESULT.PASS;
+    let tightest = null;
+    let exhausted = false;
     for (const rel of matched) {
+      const bound = scriptTimeoutBound(spec.timeoutSeconds, readRemainingStageMs());
+      if (tightest === null || bound.timeoutMs < tightest.timeoutMs) tightest = bound;
+      if (bound.exhausted) {
+        exhausted = true;
+        break;
+      }
       const run = await runChild({
         file,
-        args: [...args, '--stage', stageId ?? '', '--file-path', rel],
-        timeoutMs: spec.timeoutMs,
+        args: [...args, '--stage', stageId ?? '', spec.pathFlag, rel],
+        timeoutMs: bound.timeoutMs,
         cwd: workspaceDir,
         env: childEnv,
         spawnFn,
@@ -415,7 +439,31 @@ export const createSensorRunner = ({
       else if (result === SENSOR_RESULT.BLOCKED && worst !== SENSOR_RESULT.FAIL)
         worst = SENSOR_RESULT.BLOCKED;
     }
-    return { result: worst, detail: { files: fileResults } };
+    if (exhausted) {
+      for (const rel of matched.slice(fileResults.length)) {
+        fileResults.push({
+          file: rel,
+          result: SENSOR_RESULT.BLOCKED,
+          timedOut: false,
+          detail: { error: STAGE_BUDGET_EXHAUSTED },
+        });
+      }
+      if (worst !== SENSOR_RESULT.FAIL) worst = SENSOR_RESULT.BLOCKED;
+    }
+    return {
+      result: worst,
+      detail: {
+        files: fileResults,
+        // A budget the stage deadline shortened is reported, so a run cut short
+        // does not read as the sensor's own timeout. The narrowest bound any
+        // launch got is the one reported. Absent outside release mode, where no
+        // deadline is read at all.
+        ...(tightest?.boundedBy === 'stage-deadline'
+          ? { timeoutMs: tightest.timeoutMs, boundedBy: tightest.boundedBy }
+          : {}),
+        ...(exhausted ? { stageBudgetExhausted: true } : {}),
+      },
+    };
   };
 
   // Run every sensor declared on a stage and return the verdicts. Each verdict:

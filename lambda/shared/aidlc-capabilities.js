@@ -53,6 +53,7 @@ const RUNTIME_HANDLERS = Object.freeze(
     'policy.review-cap@v1',
     'policy.sensors@v1',
     'policy.change-control@v1',
+    'policy.collaborators.off@v1',
     'policy.guard-policy.off@v1',
     'policy.learnings.off@v1',
     'policy.plan-approval.switch@v1',
@@ -408,21 +409,27 @@ const AIDLC_CAPABILITIES = Object.freeze([
     capabilityPresentIf: null,
     note: '`off` sets `policy.planApproval` to null: `request_plan_approval` is not registered for the stage and the completion ladder requires no plan receipt. It changes NOTHING else \u2014 the stage\u2019s `humanValidation` is untouched, which the plan suite asserts for every scope and stage. `on` keeps the existing approximation (A07): the platform checks the outcome rather than guarding each write. Refused and named in the annex: upstream\u2019s engine-owned three-choice ask, its fingerprint/receipt minting, `--units` subsets, edit-while-waiting protection and strict-reopen-on-change.',
   }),
+  // Upstream's collaborator switch, resolved onto the ensemble topology by this
+  // PR. `on` is the platform's existing per-persona session approximation; `off`
+  // withdraws the support roster so the lead alone produces the declared outputs.
   Object.freeze({
     key: 'SCOPE:collaborators',
     blockType: 'SCOPE',
     field: 'collaborators',
     planKey: 'collaborators',
     policy: 'scope',
-    handling: 'unsupported',
-    handler: null,
+    handling: 'approximated',
+    handler: 'stage.mode.ensemble-sessions@v1',
     values: Object.freeze({
-      on: Object.freeze({ handling: 'unsupported', handler: null }),
-      off: Object.freeze({ handling: 'unsupported', handler: null }),
+      on: Object.freeze({
+        handling: 'approximated',
+        handler: 'stage.mode.ensemble-sessions@v1',
+      }),
+      off: Object.freeze({ handling: 'native', handler: 'policy.collaborators.off@v1' }),
     }),
     defaultWhenAbsent: null,
     capabilityPresentIf: null,
-    note: 'Upstream\u2019s collaborator switch. Mapped onto the SCOPE block, not yet resolved onto the ensemble topology, so a release authoring it keeps holding promotion.',
+    note: '`off` resolves no ensemble topology at all, which is this runtime\u2019s existing single-session contract: the lead agent produces every declared stage output itself, with no pipeline link, no mob round and no support brief. That is upstream\u2019s own lead-only contract, so `off` is honoured natively. Each withdrawn persona is named on the plan\u2019s policy effects, so the downgrade reaches the timeline instead of being a silently shorter roster. `on` keeps the existing approximation (A02): the support personas get real separate blind sessions and their contributions are graph artifacts, not an engine-owned collaboration ledger.',
   }),
   // The one authored setting that is a YAML BOOLEAN rather than a string, which
   // is why the entry declares its authored type: the enum check at the analyzer

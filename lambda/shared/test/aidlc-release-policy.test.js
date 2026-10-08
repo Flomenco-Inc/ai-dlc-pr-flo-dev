@@ -9,7 +9,15 @@ import { describe, expect, it } from 'vitest';
 import { filesFromCompatibilityFixture } from '../aidlc-compatibility.js';
 import { buildFromFiles, mapAgent, mapScope, mapSensor, mapStage } from '../block-mappers.js';
 import { buildExecutionPlan, resolveStagePolicy } from '../v2-execution-plan.js';
-import { POLICY_ENUMS, resolveCapabilities } from '../aidlc-capabilities.js';
+import {
+  AIDLC_CAPABILITIES,
+  POLICY_ENUMS,
+  SCOPE_POLICY_KEYS,
+  SCOPE_RUNTIME_POLICY_KEYS,
+  STAGE_POLICY_KEYS,
+  STAGE_RUNTIME_POLICY_KEYS,
+  resolveCapabilities,
+} from '../aidlc-capabilities.js';
 import { canonicalJson } from '../workflow-checkpoint.js';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
@@ -455,20 +463,40 @@ describe('Per-release adapters: the plan boundary judges the authored type', () 
 // resolve exactly the policy-free plan it resolved before the entry existed.
 // Otherwise the unrelated defaults (change control, loop-back) and every policy
 // gate downstream switch on for a release whose setting the platform drops.
+//
+// This PR gives the last of the four 2.11 settings its consumer, so there is no
+// `unsupported` policy entry left to drive the behavioural case with. The rule
+// is kept as the invariant that governs the NEXT one: the activation vocabulary
+// is the handled subset, never the full one.
 describe('Per-release adapters: an unsupported-only field activates no policy', () => {
-  it('resolves no policy for a scope authoring only collaborators', () => {
-    const result = planFor({ scopeFm: { collaborators: 'off' } });
-    expect(result.valid).toBe(true);
-    expect(result.errors).toEqual([]);
-    expect(result.plan.stages[0].policy).toBeUndefined();
+  it('keeps every unsupported policy field out of the activation vocabulary', () => {
+    const unsupported = (owner) =>
+      AIDLC_CAPABILITIES.filter(
+        (entry) => entry.policy === owner && entry.planKey && entry.handling === 'unsupported',
+      ).map((entry) => entry.planKey);
+    const handled = (owner) =>
+      AIDLC_CAPABILITIES.filter(
+        (entry) => entry.policy === owner && entry.planKey && entry.handling !== 'unsupported',
+      ).map((entry) => entry.planKey);
+
+    expect(SCOPE_RUNTIME_POLICY_KEYS).toEqual(handled('scope'));
+    expect(STAGE_RUNTIME_POLICY_KEYS).toEqual(handled('stage'));
+    for (const key of unsupported('scope')) {
+      expect(SCOPE_POLICY_KEYS, key).toContain(key);
+      expect(SCOPE_RUNTIME_POLICY_KEYS, key).not.toContain(key);
+    }
+    for (const key of unsupported('stage')) {
+      expect(STAGE_POLICY_KEYS, key).toContain(key);
+      expect(STAGE_RUNTIME_POLICY_KEYS, key).not.toContain(key);
+    }
   });
 
   // The counterpart of the rule: a field becomes an activator in the very change
-  // that gives it a consumer, which is what this PR does for Plan Approval and
-  // the project type. `collaborators` above is the one still waiting.
+  // that gives it a consumer. Collaborators is this PR's.
   it.each([
     ['plan approval', { plan_approval: 'off' }, { planApproval: null }],
     ['project type', { existing_code: true }, { existingCode: true }],
+    ['collaborators', { collaborators: 'off' }, { collaborators: 'off' }],
   ])('activates the policy for a scope authoring only the %s', (_label, scopeFm, expected) => {
     const result = planFor({ scopeFm });
     expect(result.valid).toBe(true);

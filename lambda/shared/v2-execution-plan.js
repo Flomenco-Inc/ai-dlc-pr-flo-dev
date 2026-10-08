@@ -483,6 +483,12 @@ const resolveStagePolicy = ({ scopeBlock, stage, stageId, errors, capabilities =
     // The project type the scope authors. A human's choice and the workspace
     // scan are layered on top of it elsewhere; here it is the authored default.
     existingCode: scopeBlock?.existingCode ?? null,
+    // The collaborator switch. `off` withdraws the support roster: the runtime
+    // resolves NO ensemble topology, which is its existing single-session
+    // contract, so the lead produces every declared output itself. The authored
+    // `mode` and `supportAgentRefs` stay on the stage — the filter is a policy
+    // effect, not a topology rewrite.
+    collaborators: scopeBlock?.collaborators ?? null,
     // The Build-and-Test loop-back is construction-protocol prose upstream, so
     // like Plan Approval it is keyed on the CATALOG rather than on a (field,
     // value) pair. The catalog key says only "this release has a loop-back to

@@ -2501,22 +2501,22 @@ describe('promotion of a closure whose importer never stored the field', () => {
   });
 });
 
-// Mapping a new authored field removes its `unmapped` blocker. Nothing else
-// makes the setting work, so the field must have a classification the moment it
-// becomes mapped, and a release authoring a value whose handler has not shipped
-// must keep holding promotion — including a fork, which is the shape a customer
-// reaches this branch with.
+// Mapping a new authored field removes its `unmapped` blocker, and nothing else
+// makes the setting work, so each of the four carries a classification from the
+// moment it becomes mapped and holds promotion until its handler ships. This PR
+// resolves the last of them, so the whole set promotes — and an illegal value is
+// still refused, which is what keeps these promotions a statement about the
+// VALUES rather than about the field names.
 describe('fork promotion of a release authoring the 2.11 scope settings', () => {
   const SCOPE_PATH = 'core/scopes/aidlc-classic.md';
-  // [authored line, the gap promotion must name]. A row moves out of here in the
-  // PR that resolves that setting onto the runtime, never before.
-  const UNHANDLED = [
-    ['collaborators: off', { blockType: 'SCOPE', field: 'collaborators', value: 'off' }],
+  const SETTINGS = [
+    'guard_policy: strict',
+    'plan_approval: off',
+    'collaborators: off',
+    'existing_code: true',
   ];
-  // Resolved onto the per-stage policy by this PR, so they no longer hold
-  // promotion on their own — asserted, because "handled" must be the reason the
-  // blocker is gone rather than a mapping that dropped it.
-  const HANDLED = ['guard_policy: strict', 'plan_approval: off', 'existing_code: true'];
+  const FORK_REPOSITORY = 'acme/aidlc-settings';
+  const FORK_SHA = 'bcdef0123456789abcdef0123456789abcdef012';
 
   const withSettings = (files, lines) => {
     expect(files.has(SCOPE_PATH), SCOPE_PATH).toBe(true);
@@ -2524,24 +2524,24 @@ describe('fork promotion of a release authoring the 2.11 scope settings', () => 
     return files;
   };
 
-  const registerFork = async (lines) => {
-    installFakes();
-    const FORK_SHA = 'bcdef0123456789abcdef0123456789abcdef012';
-    const profile = customProfile({
-      repository: 'acme/aidlc-settings',
-      sha: FORK_SHA,
-      baseProfileId: CANDIDATE_PROFILE,
-    });
-    const bundle = buildReleaseBundle({
-      profile,
+  const forkBundle = (lines) =>
+    buildReleaseBundle({
+      profile: customProfile({
+        repository: FORK_REPOSITORY,
+        sha: FORK_SHA,
+        baseProfileId: CANDIDATE_PROFILE,
+      }),
       files: withSettings(filesWithInvokeLines(CANDIDATE_PROFILE), lines),
     });
-    await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+
+  const registerFork = async (lines) => {
+    installFakes();
+    await publishReleaseBundle({ s3, bucket: BUCKET, bundle: forkBundle(lines) });
     return registerCustomRelease({
       ...registryArgs(),
       s3,
       bucket: BUCKET,
-      repository: 'acme/aidlc-settings',
+      repository: FORK_REPOSITORY,
       sha: FORK_SHA,
       baseProfileId: CANDIDATE_PROFILE,
       actor: 'admin-1',
@@ -2559,42 +2559,37 @@ describe('fork promotion of a release authoring the 2.11 scope settings', () => 
       actor: 'admin-1',
     });
 
-  it.each(UNHANDLED)('holds a fork authoring %s alone', async (line, gap) => {
+  it.each(SETTINGS)('promotes a fork authoring %s alone', async (line) => {
     const { release } = await registerFork([line]);
 
-    expect(release.unhonouredValues).toContainEqual(gap);
-    // The field is mapped now, so its old blocker is gone — the classification
-    // is the only thing still holding it.
-    expect(
-      release.unhonouredValues.filter((entry) => entry.value === UNMAPPED_FIELD_GAP_VALUE),
-    ).toEqual([]);
-    await expect(promoteFork(release, 'selectable')).rejects.toMatchObject({
-      code: 'release_capability_unhandled',
-    });
-  });
-
-  it.each(['selectable', 'certified'])(
-    'refuses %s promotion of a fork authoring all of them',
-    async (state) => {
-      const { release } = await registerFork([...HANDLED, ...UNHANDLED.map(([line]) => line)]);
-
-      for (const [, gap] of UNHANDLED) {
-        expect(release.unhonouredValues).toContainEqual(gap);
-      }
-      await expect(promoteFork(release, state)).rejects.toMatchObject({
-        code: 'release_capability_unhandled',
-      });
-    },
-  );
-
-  it.each(HANDLED)('no longer holds a fork authoring only %s', async (line) => {
-    const { release } = await registerFork([line]);
-
+    // The field is mapped, so its `unmapped` blocker is gone — and it is
+    // handled, which is why nothing replaced it.
     expect(release.unhonouredValues).toEqual([]);
     await expect(promoteFork(release, 'selectable')).resolves.toMatchObject({
       supportState: 'selectable',
     });
   });
+
+  it.each(['selectable', 'certified'])(
+    'promotes a fork authoring all of them to %s',
+    async (state) => {
+      const { release } = await registerFork(SETTINGS);
+
+      expect(release.unhonouredValues).toEqual([]);
+      await expect(promoteFork(release, state)).resolves.toMatchObject({ supportState: state });
+    },
+  );
+
+  it.each(['guard_policy: paranoid', 'plan_approval: maybe', 'existing_code: "true"'])(
+    'refuses to import a fork authoring %s',
+    (line) => {
+      installFakes();
+
+      expect(() => forkBundle([line])).toThrow(
+        expect.objectContaining({ code: 'release_import_rejected' }),
+      );
+    },
+  );
 });
 
 // A stored list carrying a NUMERIC revision this build has moved past is the

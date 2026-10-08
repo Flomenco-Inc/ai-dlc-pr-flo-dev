@@ -47,7 +47,10 @@ import { contributionArtifactId } from '../shared/ensemble-contribution.js';
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
 // this module implements. Checked against the registry by a test, so a
 // capability cannot be declared handled without the code that handles it.
-export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze(['stage.mode.ensemble-sessions@v1']);
+export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze([
+  'policy.collaborators.off@v1',
+  'stage.mode.ensemble-sessions@v1',
+]);
 
 export { contributionArtifactId };
 
@@ -472,6 +475,11 @@ export const resolveEnsembleTopology = async ({
 }) => {
   if (!methodologyRelease) return null;
   if (!stage?.policy) return null;
+  // The scope withdrew the collaborators: no topology at all, which is this
+  // runtime's single-session contract and upstream's own lead-only contract —
+  // the lead performs the synthesis and produces every declared output. A
+  // shortened roster would instead leave some declared outputs unowned.
+  if (stage.policy.collaborators === 'off') return null;
   if (!SESSION_ENSEMBLE_MODES.includes(stage?.mode)) return null;
   if (stage.mode === 'subagent' && !subagentIsHubAndSpoke(library)) return null;
   const refs = (stage.supportAgentRefs ?? []).filter(

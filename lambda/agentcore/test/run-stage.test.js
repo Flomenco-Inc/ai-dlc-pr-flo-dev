@@ -6998,3 +6998,74 @@ describe('runStage — produced-head observation', () => {
     expect(res).not.toHaveProperty('producedHeadsUnavailable');
   });
 });
+
+// Which sensors the intent's release is asked for a script closure. The
+// reader is bound to the resolved library's provenance, so an immutable user
+// SENSOR overlay — whose script may legitimately import the project's own
+// checked-out code — keeps the existing user-script path instead of being
+// reported as corruption of a release that never owned it.
+describe('runStage — the release closure a pinned sensor is read for', () => {
+  const okSpawn = () => ({
+    on: (ev, cb) => ev === 'close' && setImmediate(() => cb(0)),
+    stdin: { end() {} },
+  });
+  const libWithScriptSensor = () => {
+    const lib = library();
+    lib.stagesById['requirements-analysis'].sensors = ['type-check'];
+    lib.sensorsById = {
+      'type-check': {
+        id: 'type-check',
+        command: 'bun <runtime-managed>/tools/aidlc-sensor-type-check.ts',
+        runtime: 'bun',
+        severity: 'advisory',
+        matches: '**/*.ts',
+        scriptRef: { s3Key: 'blocks/scripts/sha256/type-check' },
+      },
+    };
+    return lib;
+  };
+
+  const PROJECT_IMPORT = 'import { ok } from "../../src/helper.ts";\nconsole.log(ok);\n';
+  const PIN = {
+    releaseId: 'release-a',
+    sourceSha: 'a'.repeat(40),
+    closureDigest: 'b'.repeat(64),
+  };
+
+  const pinnedSensorRun = async ({ tenantId = null }) => {
+    const workspaceDir = await mkdtemp(nodePath.join(tmpdir(), 'run-stage-sensor-closure-'));
+    await writeFile(nodePath.join(workspaceDir, 'a.ts'), 'export const value = 1;');
+    const lib = libWithScriptSensor();
+    if (tenantId) lib.sensorsById['type-check'].tenantId = tenantId;
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+      loadBlockScript: async () => PROJECT_IMPORT,
+    });
+    try {
+      const res = await runStage({ ...baseArgs, workspaceDir, methodologyRelease: PIN }, deps);
+      const run = deps.store.calls.find(
+        ([name, args]) => name === 'recordSensorRun' && args.sensorId === 'type-check',
+      );
+      return { res, run: run?.[1] ?? null };
+    } finally {
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
+  };
+
+  it('is not read for a user overlay, whose script runs as it did before', async () => {
+    const { res, run } = await pinnedSensorRun({ tenantId: 'default' });
+    expect(res).toMatchObject({ ok: true, state: 'SUCCEEDED' });
+    expect(run).toMatchObject({ result: 'PASS', held: false });
+  });
+
+  it('is read for the release\u2019s own sensor, and holds the stage when it cannot be', async () => {
+    const { res, run } = await pinnedSensorRun({});
+    expect(res).toMatchObject({ ok: false, reason: 'sensor_blocked' });
+    expect(run).toMatchObject({
+      result: 'BLOCKED',
+      held: true,
+      detail: { releaseIntegrityFailure: true },
+    });
+  });
+});

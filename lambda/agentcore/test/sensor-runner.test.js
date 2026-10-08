@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { createSensorRunner, isReleaseDependencyError, __test } from '../sensor-runner.js';
+import { createSensorRunner, __test } from '../sensor-runner.js';
 
 const { globToRegExp, resultFromScript } = __test;
 
@@ -503,6 +503,120 @@ describe('runStageSensors — script kind', () => {
   });
 });
 
+// A release sensor script's sibling imports. Without them the spawned
+// interpreter fails at startup with `Cannot find module` before the sensor
+// checks anything, which is what every pinned document sensor did.
+describe('runStageSensors — script import closure', () => {
+  let ws;
+  beforeEach(async () => {
+    ws = await mkdtemp(path.join(tmpdir(), 'sensor-closure-'));
+    await mkdir(path.join(ws, 'src'), { recursive: true });
+    await writeFile(path.join(ws, 'src', 'a.ts'), 'export const x = 1;');
+  });
+  afterEach(async () => {
+    await rm(ws, { recursive: true, force: true });
+  });
+
+  const okSpawn = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    setTimeout(() => {
+      child.stdout.emit('data', Buffer.from('{"pass":true}'));
+      child.emit('close', 0);
+    }, 0);
+    return child;
+  };
+
+  const LINTER = Object.freeze({
+    sensorId: 'linter',
+    severity: 'advisory',
+    runtime: 'bun',
+    command: 'bun aidlc-sensor-linter.ts',
+    matches: '**/*.ts',
+    timeoutSeconds: 5,
+  });
+
+  const runWith = async (loadScriptClosure) => {
+    const runner = createSensorRunner({
+      graph: null,
+      loadBlockScript: async () => 'import { budget } from "./aidlc-runtime-budget.ts";',
+      workspaceDir: ws,
+      spawnFn: okSpawn,
+      loadScriptClosure,
+    });
+    return runner.runStageSensors({ sensors: [LINTER], stageId: 'code-generation' });
+  };
+
+  const sensorsDir = () => path.join(ws, '.aidlc', 'sensors');
+
+  it('writes each sibling module next to the script before spawning it', async () => {
+    const verdicts = await runWith(async (sensorId, script) => {
+      expect(sensorId).toBe('linter');
+      expect(script).toContain('./aidlc-runtime-budget.ts');
+      return [{ relativePath: 'aidlc-runtime-budget.ts', content: 'export const budget = 1;' }];
+    });
+    expect(verdicts[0].result).toBe('PASS');
+    expect(await readFile(path.join(sensorsDir(), 'linter.ts'), 'utf8')).toContain(
+      './aidlc-runtime-budget.ts',
+    );
+    expect(await readFile(path.join(sensorsDir(), 'aidlc-runtime-budget.ts'), 'utf8')).toBe(
+      'export const budget = 1;',
+    );
+  });
+
+  it('holds the stage on an incomplete closure and writes nothing', async () => {
+    const error = Object.assign(new Error('core/tools/aidlc-runtime-budget.ts is not published'), {
+      name: 'ReleaseResolverError',
+      code: 'release_script_dependency_missing',
+    });
+    const verdicts = await runWith(async () => {
+      throw error;
+    });
+    expect(verdicts[0]).toMatchObject({
+      result: 'BLOCKED',
+      detail: { code: 'release_script_dependency_missing', releaseIntegrityFailure: true },
+    });
+    await expect(readFile(path.join(sensorsDir(), 'linter.ts'), 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('writes only the script when no closure reader is injected', async () => {
+    const verdicts = await runWith(null);
+    expect(verdicts[0].result).toBe('PASS');
+    expect(await readdir(sensorsDir())).toEqual(['linter.ts']);
+  });
+
+  // The resolver raises `runtime_file_missing` — a code without the `release_`
+  // prefix — when the release manifest lists a dependency whose object is gone
+  // from storage. An incompletely published closure has to hold the stage like
+  // any other integrity failure; classifying it as a best-effort loader error
+  // let an advisory sensor continue on a release that cannot be run.
+  it('holds the stage when a manifest-listed dependency is missing from storage', async () => {
+    const verdicts = await runWith(async () => {
+      throw Object.assign(new Error('runtime object for core/tools/aidlc-lib.ts is missing'), {
+        name: 'ReleaseResolverError',
+        code: 'runtime_file_missing',
+        details: { repoPath: 'core/tools/aidlc-lib.ts' },
+      });
+    });
+    expect(verdicts[0]).toMatchObject({
+      result: 'BLOCKED',
+      held: true,
+      detail: {
+        code: 'runtime_file_missing',
+        releaseIntegrityFailure: true,
+        details: { repoPath: 'core/tools/aidlc-lib.ts' },
+      },
+    });
+    await expect(readFile(path.join(sensorsDir(), 'linter.ts'), 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+});
+
 // The flag a script sensor is spawned with comes from the plan, which resolved
 // it from the sensor's declared contract. A document sensor spawned with the
 // code sensors' --file-path exits before it runs its check.
@@ -698,34 +812,5 @@ describe('runStageSensors — the stage budget bounds every child', () => {
     expect(verdict.result).toBe('PASS');
     expect(verdict.detail).not.toHaveProperty('boundedBy');
     expect(verdict.detail).not.toHaveProperty('stageBudgetExhausted');
-  });
-});
-
-// A release failure the runner must hold the stage on, whatever the sensor's
-// severity: the pinned check could not be run at all. `runtime_file_missing`
-// is the resolver's code for a manifest-listed object that is absent from
-// storage, and it carries no `release_` prefix — an incompletely published
-// closure used to be classified as a best-effort loader error, which let an
-// advisory sensor continue on a release that cannot be run.
-describe('isReleaseDependencyError', () => {
-  const resolverError = (code) => ({ name: 'ReleaseResolverError', code });
-
-  it('holds on an unreadable, mismatched, or incompletely published closure', () => {
-    for (const code of [
-      'release_closure_mismatch',
-      'release_object_unreadable',
-      'release_script_dependency_missing',
-      'runtime_file_missing',
-      'unpinned_user_block',
-      'user_block_missing',
-    ]) {
-      expect(isReleaseDependencyError(resolverError(code)), code).toBe(true);
-    }
-  });
-
-  it('leaves an ordinary loader failure best-effort', () => {
-    expect(isReleaseDependencyError(new Error('NoSuchKey'))).toBe(false);
-    expect(isReleaseDependencyError({ name: 'Error', code: 'runtime_file_missing' })).toBe(false);
-    expect(isReleaseDependencyError(null)).toBe(false);
   });
 });

@@ -252,6 +252,10 @@ export const createSensorRunner = ({
   // from outliving the container. Absent (unpinned, a policy-free release, or a
   // caller with no deadline) leaves the authored budget alone.
   remainingStageMs = null,
+  // Resolves the sibling modules a pinned sensor script imports, so the spawned
+  // interpreter can load them. Absent in legacy mode, where a sensor script is
+  // one self-contained object.
+  loadScriptClosure = null,
 } = {}) => {
   const readRemainingStageMs = () =>
     typeof remainingStageMs === 'function' ? remainingStageMs() : remainingStageMs;
@@ -407,10 +411,37 @@ export const createSensorRunner = ({
       }
       return { result: SENSOR_RESULT.BLOCKED, detail: { error: 'sensor has no script' } };
     }
+    // Resolve the script's import closure BEFORE writing anything: an
+    // incomplete closure must leave no half-materialized script behind for a
+    // later pass to pick up.
+    let closureFiles = [];
+    if (loadScriptClosure) {
+      try {
+        closureFiles = await loadScriptClosure(spec.sensorId, script);
+      } catch (error) {
+        if (!isReleaseDependencyError(error)) throw error;
+        return {
+          result: SENSOR_RESULT.BLOCKED,
+          fatal: true,
+          detail: {
+            error: error.message,
+            name: error.name,
+            code: error.code,
+            releaseIntegrityFailure: true,
+            ...(error.details ? { details: error.details } : {}),
+          },
+        };
+      }
+    }
     const scriptDir = path.join(workspaceDir, '.aidlc', 'sensors');
     await mkdir(scriptDir, { recursive: true });
     const scriptPath = path.join(scriptDir, `${spec.sensorId ?? 'sensor'}.ts`);
     await writeFile(scriptPath, script, 'utf8');
+    for (const dependency of closureFiles) {
+      const dependencyPath = path.resolve(scriptDir, dependency.relativePath);
+      await mkdir(path.dirname(dependencyPath), { recursive: true });
+      await writeFile(dependencyPath, dependency.content, 'utf8');
+    }
     const { file, args } = buildScriptArgv(spec, { scriptPath, substitutions });
 
     // One run per matching file (each upstream script takes a single path, on

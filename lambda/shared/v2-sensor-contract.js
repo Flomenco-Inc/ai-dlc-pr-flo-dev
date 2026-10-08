@@ -73,6 +73,9 @@ const sensorPathFlag = (inputSchema) => {
 // stable sensor id the seed assigns (basename minus `aidlc-` prefix).
 const GRAPH_SENSORS = Object.freeze(['required-sections', 'upstream-coverage', 'graph-coverage']);
 
+// The run-record naming convention: `<artifact>-timestamp[.md]`.
+const TIMESTAMP_MARKER_RE = /-timestamp(?:\.md)?$/;
+
 // Classify a resolved sensor into its execution kind. A sensor whose id is one
 // of the graph evaluators runs in-process; otherwise it is a script sensor that
 // inspects the workspace filesystem. `runtime: 'graph'` (set by a future block)
@@ -199,6 +202,12 @@ const buildScriptArgv = (spec, { scriptPath, substitutions = {} } = {}) => {
 // not code).
 const evalRequiredSections = (body = '', name = '', options = {}) => {
   const strictStructuredBlocks = Boolean(options.strictStructuredBlocks);
+  // A `<artifact>-timestamp` marker is a run record, not a document: the
+  // methodology specifies a single `Discovered: ...` line, so the heading floor
+  // reported two findings on every to-spec file. A `*-questions` marker keeps
+  // the floor, because each question is its own `##` section.
+  const timestampMarker =
+    Boolean(options.recordTimestampExempt) && TIMESTAMP_MARKER_RE.test(String(name));
   const seen = new Set();
   const headings = [];
   for (const raw of String(body).split(/\r?\n/)) {
@@ -209,8 +218,8 @@ const evalRequiredSections = (body = '', name = '', options = {}) => {
     headings.push(line);
   }
   const h2Count = headings.length;
-  let pass = h2Count >= 2;
-  let findingsCount = Math.max(0, 2 - h2Count);
+  let pass = timestampMarker || h2Count >= 2;
+  let findingsCount = timestampMarker ? 0 : Math.max(0, 2 - h2Count);
   const detail = { h2_count: h2Count, headings };
 
   // The machine-readable DAG check fires for the unit-of-work-dependency

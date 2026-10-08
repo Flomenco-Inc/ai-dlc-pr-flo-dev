@@ -180,6 +180,60 @@ describe('buildScriptArgv', () => {
   });
 });
 
+// A timestamp run record is one `Discovered: ...` line by specification, so the
+// two-heading floor reported two findings on every to-spec file. The exemption
+// applies only where the pinned catalog proves its record sensor covers run
+// records, which is the authored change that shipped the exemption upstream.
+describe('evalRequiredSections — a timestamp run record', () => {
+  const TIMESTAMP_BODY = 'Discovered: 2026-10-08T00:00:00Z\n';
+  const MARKER = 'practices-discovery-timestamp';
+
+  it('reports two missing headings without the exemption', () => {
+    const r = evalRequiredSections(TIMESTAMP_BODY, MARKER);
+    expect(r).toMatchObject({ pass: false, result: SENSOR_RESULT.FAIL });
+    expect(r.detail).toMatchObject({ h2_count: 0, findings_count: 2 });
+  });
+
+  it('passes with no findings under the exemption', () => {
+    const r = evalRequiredSections(TIMESTAMP_BODY, MARKER, { recordTimestampExempt: true });
+    expect(r).toMatchObject({ pass: true, result: SENSOR_RESULT.PASS });
+    expect(r.detail).toMatchObject({ h2_count: 0, headings: [], findings_count: 0 });
+  });
+
+  it('exempts the marker whether or not the name carries the .md suffix', () => {
+    for (const name of [MARKER, `${MARKER}.md`]) {
+      expect(
+        evalRequiredSections(TIMESTAMP_BODY, name, { recordTimestampExempt: true }).pass,
+        name,
+      ).toBe(true);
+    }
+  });
+
+  it('keeps the floor on a questions marker, which upstream keeps', () => {
+    const r = evalRequiredSections('One question?\n', 'requirements-questions', {
+      recordTimestampExempt: true,
+    });
+    expect(r.pass).toBe(false);
+    expect(r.detail.findings_count).toBe(2);
+  });
+
+  it('keeps the floor on an ordinary document', () => {
+    const r = evalRequiredSections('## Only one\n', 'practices-discovery', {
+      recordTimestampExempt: true,
+    });
+    expect(r.pass).toBe(false);
+    expect(r.detail.findings_count).toBe(1);
+  });
+
+  it('leaves the unit-of-work DAG check untouched', () => {
+    const name = 'unit-of-work-dependency';
+    const cyclic = '## A\n## B\n```units\nunits:\n  - id: a\n    dependsOn: [a]\n```\n';
+    const withExemption = evalRequiredSections(cyclic, name, { recordTimestampExempt: true });
+    expect(withExemption).toEqual(evalRequiredSections(cyclic, name));
+    expect(withExemption.pass).toBe(false);
+  });
+});
+
 describe('evalRequiredSections', () => {
   it('passes at >= 2 distinct H2 headings', () => {
     const r = evalRequiredSections('## One\n\ntext\n\n## Two\n');

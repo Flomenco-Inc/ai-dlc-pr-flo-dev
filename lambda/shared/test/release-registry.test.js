@@ -17,6 +17,7 @@ import {
   QueryCommand,
   TransactWriteCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { UNMAPPED_FIELD_GAP_VALUE } from '../aidlc-capabilities.js';
 import { customProfile, filesFromCompatibilityFixture } from '../aidlc-compatibility.js';
 import {
   AIDLC_RELEASE_IMPORTER_REVISION,
@@ -2317,6 +2318,23 @@ describe('a release authoring an execution-relevant field no adapter consumes', 
       }),
     ).rejects.toMatchObject({ code: 'release_capability_unhandled' });
   });
+  // The regression guard for the blocker itself: every release this build
+  // already promotes authors no such field, so none of them becomes blocked.
+  it.each(Object.keys(AIDLC_COMPATIBILITY_PROFILES))(
+    'leaves the allowlisted %s with no unmapped-field blocker',
+    async (profileId) => {
+      installFakes();
+      const bundle = buildReleaseBundle({ profileId, files: filesWithInvokeLines(profileId) });
+      await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+
+      const { release } = await registerRelease(registerArgs(profileId));
+
+      expect(bundle.manifest.compatibility.executionRelevantUnmappedFields).toEqual([]);
+      expect(
+        release.unhonouredValues.filter((gap) => gap.value === UNMAPPED_FIELD_GAP_VALUE),
+      ).toEqual([]);
+    },
+  );
 });
 
 describe('promotion of a record registered before protocol evidence existed', () => {

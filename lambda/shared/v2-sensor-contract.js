@@ -52,6 +52,22 @@ const ALLOWED_SCRIPT_RUNTIMES = Object.freeze(['bun', 'node', 'sh']);
 const MAX_TIMEOUT_SECONDS = 600;
 const DEFAULT_TIMEOUT_SECONDS = 30;
 
+// Which flag carries the path a script sensor analyses. A sensor's `input_schema`
+// IS its declared invocation contract, so the flag is read from the contract the
+// block authored and never from the sensor's id: a fork can ship a document
+// sensor under any name. A block that authors no schema keeps the default, which
+// is what every pre-2.8.2 catalog gets.
+const FILE_PATH_FLAG = '--file-path';
+const OUTPUT_PATH_FLAG = '--output-path';
+
+// Mirrors upstream `sensorTakesFilePath` (core/tools/aidlc-sensor.ts): a declared
+// contract decides, and only a contract that names `file_path` takes a file path.
+const sensorPathFlag = (inputSchema) => {
+  if (!inputSchema || typeof inputSchema !== 'object') return FILE_PATH_FLAG;
+  if (Object.keys(inputSchema).length === 0) return FILE_PATH_FLAG;
+  return Object.hasOwn(inputSchema, 'file_path') ? FILE_PATH_FLAG : OUTPUT_PATH_FLAG;
+};
+
 // The two sensors we evaluate in-process over graph content, by id. Everything
 // else is treated as a `script` sensor (materialize + spawn). Keyed on the
 // stable sensor id the seed assigns (basename minus `aidlc-` prefix).
@@ -77,6 +93,31 @@ const severityGate = (result, severity) => {
   return { continues: true, held: false };
 };
 
+// The bound that governs ONE child launch, and which of the three set it.
+//
+// `remainingStageMs` is what is left of the stage's wall-clock budget. Three
+// states, deliberately distinguished:
+//   - not a finite number — no deadline is available (an unpinned run, or a
+//     caller that reads no deadline): the authored budget stands;
+//   - greater than zero — the budget may narrow the authored one;
+//   - zero or less — the budget is EXHAUSTED. That is NOT "unavailable": the
+//     stage is already past its deadline, so nothing further may be launched.
+// The caller re-reads the remaining budget before each launch, because a sensor
+// matching several files must not hand every one of them the allowance the
+// first one found.
+const scriptTimeoutBound = (authoredSeconds, remainingStageMs = null) => {
+  const base =
+    authoredSeconds > MAX_TIMEOUT_SECONDS
+      ? { timeoutMs: MAX_TIMEOUT_SECONDS * 1000, boundedBy: 'ceiling' }
+      : { timeoutMs: authoredSeconds * 1000, boundedBy: 'authored' };
+  if (!Number.isFinite(remainingStageMs)) return { ...base, exhausted: false };
+  if (remainingStageMs <= 0) return { timeoutMs: 0, boundedBy: 'stage-deadline', exhausted: true };
+  if (remainingStageMs < base.timeoutMs) {
+    return { timeoutMs: remainingStageMs, boundedBy: 'stage-deadline', exhausted: false };
+  }
+  return { ...base, exhausted: false };
+};
+
 // Validate + normalize a script-sensor's run spec, or return an error. Mirrors
 // the old v2-script-contract: `command` is SERVER-CONTROLLED (from the block),
 // never agent input. The returned spec is the ONLY thing the runner executes.
@@ -96,13 +137,20 @@ const validateScriptSpec = (sensor) => {
   if (!Number.isFinite(seconds) || seconds <= 0) {
     return { ok: false, error: 'sensor timeout must be a positive number of seconds' };
   }
+  // The authored budget, clamped by the ceiling. The stage deadline is applied
+  // per child launch by the runner, not here: a spec is validated once but a
+  // sensor can launch a child per matching file, minutes apart.
+  const bound = scriptTimeoutBound(seconds);
   return {
     ok: true,
     spec: {
       sensorId: sensor.sensorId ?? sensor.id ?? null,
       runtime,
       command: sensor.command,
-      timeoutMs: Math.min(seconds, MAX_TIMEOUT_SECONDS) * 1000,
+      pathFlag: sensor.pathFlag ?? sensorPathFlag(sensor.inputSchema),
+      timeoutSeconds: seconds,
+      timeoutMs: bound.timeoutMs,
+      boundedBy: bound.boundedBy,
     },
   };
 };
@@ -447,7 +495,11 @@ export {
   MAX_TIMEOUT_SECONDS,
   DEFAULT_TIMEOUT_SECONDS,
   GRAPH_SENSORS,
+  FILE_PATH_FLAG,
+  OUTPUT_PATH_FLAG,
   sensorKind,
+  sensorPathFlag,
+  scriptTimeoutBound,
   severityGate,
   validateScriptSpec,
   resultFromExit,
@@ -464,7 +516,11 @@ export default {
   MAX_TIMEOUT_SECONDS,
   DEFAULT_TIMEOUT_SECONDS,
   GRAPH_SENSORS,
+  FILE_PATH_FLAG,
+  OUTPUT_PATH_FLAG,
   sensorKind,
+  sensorPathFlag,
+  scriptTimeoutBound,
   severityGate,
   validateScriptSpec,
   resultFromExit,

@@ -3,6 +3,8 @@ import {
   SENSOR_RESULT,
   sensorKind,
   severityGate,
+  sensorPathFlag,
+  scriptTimeoutBound,
   validateScriptSpec,
   resultFromExit,
   buildScriptArgv,
@@ -69,6 +71,86 @@ describe('validateScriptSpec', () => {
   });
   it('rejects an empty command', () => {
     expect(validateScriptSpec({ runtime: 'bun', command: '  ', timeoutSeconds: 5 }).ok).toBe(false);
+  });
+  it('carries the authored budget and its bound, leaving the stage deadline to the runner', () => {
+    const r = validateScriptSpec({ runtime: 'bun', command: 'bun x.ts', timeoutSeconds: 60 });
+    expect(r.spec).toMatchObject({ timeoutSeconds: 60, timeoutMs: 60000, boundedBy: 'authored' });
+  });
+  it('routes the path flag the sensor contract declares', () => {
+    const specFor = (inputSchema) =>
+      validateScriptSpec({ runtime: 'bun', command: 'bun x.ts', timeoutSeconds: 5, inputSchema })
+        .spec;
+    expect(specFor({ output_path: 'string', stage_slug: 'string' }).pathFlag).toBe('--output-path');
+    expect(specFor({ file_path: 'string' }).pathFlag).toBe('--file-path');
+    expect(specFor(undefined).pathFlag).toBe('--file-path');
+  });
+  it('takes a path flag the plan already resolved', () => {
+    const r = validateScriptSpec({
+      runtime: 'bun',
+      command: 'bun x.ts',
+      timeoutSeconds: 5,
+      pathFlag: '--output-path',
+    });
+    expect(r.spec.pathFlag).toBe('--output-path');
+  });
+});
+
+// The bound one child launch gets. The three states of the remaining stage
+// budget are NOT interchangeable: an unavailable deadline leaves the authored
+// budget alone, while an exhausted one must stop the pass instead of restoring
+// the whole authored allowance after the stage is already over.
+describe('scriptTimeoutBound', () => {
+  it('keeps the authored budget when no deadline is available', () => {
+    for (const remaining of [null, undefined, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(scriptTimeoutBound(60, remaining)).toEqual({
+        timeoutMs: 60000,
+        boundedBy: 'authored',
+        exhausted: false,
+      });
+    }
+  });
+  it('clamps an absurd authored budget to the ceiling', () => {
+    expect(scriptTimeoutBound(99999)).toEqual({
+      timeoutMs: 600000,
+      boundedBy: 'ceiling',
+      exhausted: false,
+    });
+  });
+  it('narrows to what is left of the stage, and names that bound', () => {
+    expect(scriptTimeoutBound(600, 90000)).toEqual({
+      timeoutMs: 90000,
+      boundedBy: 'stage-deadline',
+      exhausted: false,
+    });
+  });
+  it('leaves the authored budget alone when more stage time remains than it asks for', () => {
+    expect(scriptTimeoutBound(5, 90000)).toEqual({
+      timeoutMs: 5000,
+      boundedBy: 'authored',
+      exhausted: false,
+    });
+  });
+  it('reports an exhausted stage budget instead of restoring the authored one', () => {
+    for (const remaining of [0, -1, -600000]) {
+      expect(scriptTimeoutBound(600, remaining)).toEqual({
+        timeoutMs: 0,
+        boundedBy: 'stage-deadline',
+        exhausted: true,
+      });
+    }
+  });
+});
+
+describe('sensorPathFlag', () => {
+  it('reads the declared contract, not the sensor id', () => {
+    expect(sensorPathFlag({ file_path: 'string' })).toBe('--file-path');
+    expect(sensorPathFlag({ output_path: 'string', stage_slug: 'string' })).toBe('--output-path');
+  });
+  it('keeps the file-path default when no contract is authored', () => {
+    expect(sensorPathFlag(undefined)).toBe('--file-path');
+    expect(sensorPathFlag(null)).toBe('--file-path');
+    expect(sensorPathFlag({})).toBe('--file-path');
+    expect(sensorPathFlag('output_path')).toBe('--file-path');
   });
 });
 

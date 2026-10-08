@@ -2074,8 +2074,9 @@ const runStageAttempt = async (
   }
 
   // Release-authored scope policy can silently REMOVE verification (a reviewer, a
-  // sensor list). Record what it took away so an operator reading the timeline
-  // can see why a stage ran without the checks its stage block declares.
+  // sensor list, a stage's support personas). Record what it took away so an
+  // operator reading the timeline can see why a stage ran without the checks its
+  // stage block declares.
   const policyEffect = (plan.policyEffects ?? []).find((effect) => effect.stageId === stageId);
   if (policyEffect) {
     await store
@@ -2091,6 +2092,10 @@ const runStageAttempt = async (
         }${
           policyEffect.removedSensors.length
             ? `, sensors removed: ${policyEffect.removedSensors.join(', ')}`
+            : ''
+        }${
+          (policyEffect.withdrawnSupportAgents ?? []).length
+            ? `, support personas withdrawn: ${policyEffect.withdrawnSupportAgents.join(', ')}`
             : ''
         }`,
       })

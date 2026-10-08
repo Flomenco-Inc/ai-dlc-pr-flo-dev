@@ -56,6 +56,14 @@ export const IMPLEMENTED_RUNTIME_HANDLERS = Object.freeze([
 const RUNNABLE_MODES = ['inline', 'subagent'];
 const RELEASE_RUNNABLE_MODES = [...RUNNABLE_MODES, 'pipeline', 'mob'];
 
+// The stage modes that can get a real session per support persona: `pipeline`
+// and `mob` always, a `subagent` only when it declares supports. Exported
+// because the ensemble runner's topology gate and the plan's record of what the
+// collaborators switch withdrew must be the SAME mode set — otherwise the plan
+// would claim a downgrade on a stage that never had support sessions, or stay
+// silent about one that did.
+export const SUPPORT_SESSION_MODES = Object.freeze(['pipeline', 'mob', 'subagent']);
+
 // Reserved lead-agent refs that are NOT domain AGENT blocks and therefore have no
 // library entry to resolve against. Upstream's initialization stages declare
 // `lead_agent: orchestrator`, where "orchestrator" is the conductor / forwarding
@@ -506,8 +514,9 @@ const resolveStagePolicy = ({ scopeBlock, stage, stageId, errors, capabilities =
 
 // Apply the resolved policy to the stage instance: the plan is the ONE place
 // the effect is decided, so run-stage never re-derives it from frontmatter.
-// Every reviewer/sensor the policy REMOVES is recorded on `effects` so the
-// runtime can emit an audit event instead of the downgrade being invisible.
+// Every reviewer, sensor and support persona the policy REMOVES is recorded on
+// `effects` so the runtime can emit an audit event instead of the downgrade
+// being invisible.
 const applyStagePolicy = (instance, policy, effects = null) => {
   if (!policy) return instance;
   instance.policy = policy;
@@ -516,6 +525,14 @@ const applyStagePolicy = (instance, policy, effects = null) => {
     : [];
   const removedReviewer =
     policy.reviewClass === 'none' ? (instance.reviewer?.reviewerAgent ?? null) : null;
+  // `collaborators: off` withdraws the support sessions of a support-bearing
+  // stage. The refs stay on the instance (the authored topology is still what
+  // the plan document shows); this list is what the withdrawal costs, named so
+  // the runtime can say which personas did not review the lead's draft.
+  const withdrawnSupportAgents =
+    policy.collaborators === 'off' && SUPPORT_SESSION_MODES.includes(instance.mode)
+      ? (instance.supportAgentRefs ?? []).filter((ref) => ref && ref !== instance.agentRef)
+      : [];
   if (!policy.sensorsEnabled) instance.sensors = [];
   if (policy.reviewClass === 'none') {
     instance.reviewer = null;
@@ -527,12 +544,16 @@ const applyStagePolicy = (instance, policy, effects = null) => {
       instance.reviewer = { ...instance.reviewer, artifact: policy.reviewArtifact };
     }
   }
-  if (effects && (removedSensors.length > 0 || removedReviewer)) {
+  if (
+    effects &&
+    (removedSensors.length > 0 || removedReviewer || withdrawnSupportAgents.length > 0)
+  ) {
     effects.push({
       stageId: instance.stageId,
       stageInstanceId: instance.stageInstanceId,
       removedReviewer,
       removedSensors,
+      ...(withdrawnSupportAgents.length > 0 ? { withdrawnSupportAgents } : {}),
       reviewClass: policy.reviewClass,
     });
   }

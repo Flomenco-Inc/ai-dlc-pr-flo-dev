@@ -204,6 +204,42 @@ describe('the 2.11.0 collaborators switch', () => {
     }
   });
 
+  // Silence is the failure mode here: a stage that runs with three fewer
+  // sessions than its block declares must leave a record naming them.
+  it('names every withdrawn support persona on the plan policy effects', async () => {
+    const { plan } = await planFor({ scope: 'classic' });
+
+    expect(
+      (plan.policyEffects ?? [])
+        .filter((effect) => (effect.withdrawnSupportAgents ?? []).length > 0)
+        .map((effect) => ({
+          stageId: effect.stageId,
+          withdrawnSupportAgents: effect.withdrawnSupportAgents,
+        })),
+    ).toEqual([
+      {
+        stageId: 'reverse-engineering',
+        withdrawnSupportAgents: ['aidlc-architect-agent'],
+      },
+      {
+        stageId: 'practices-discovery',
+        withdrawnSupportAgents: [
+          'aidlc-quality-agent',
+          'aidlc-developer-agent',
+          'aidlc-devsecops-agent',
+        ],
+      },
+      {
+        stageId: 'user-stories',
+        withdrawnSupportAgents: [
+          'aidlc-design-agent',
+          'aidlc-developer-agent',
+          'aidlc-quality-agent',
+        ],
+      },
+    ]);
+  });
+
   // An `inline` stage that declares a support agent gets no separate session
   // today, with or without the switch, so the switch withdraws nothing from it
   // and must claim nothing.

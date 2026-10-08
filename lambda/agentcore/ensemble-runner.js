@@ -42,6 +42,7 @@
 import { dispatchPersona } from './persona-dispatch.js';
 import { neutralizeTokens } from './stage-materializer.js';
 import { evaluateGatePreconditions } from '../shared/gate-preconditions.js';
+import { SUPPORT_SESSION_MODES } from '../shared/v2-execution-plan.js';
 import { contributionArtifactId } from '../shared/ensemble-contribution.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
@@ -56,8 +57,10 @@ export { contributionArtifactId };
 
 // The stage modes that get real per-persona sessions. `pipeline` and `mob` have
 // separate support sessions; `subagent` does only when it declares supports. A
-// lead-only `subagent` remains one session like `inline`.
-export const SESSION_ENSEMBLE_MODES = Object.freeze(['pipeline', 'mob', 'subagent']);
+// lead-only `subagent` remains one session like `inline`. The plan records which
+// personas the collaborators switch withdrew from the SAME mode set, so the two
+// read one definition.
+export const SESSION_ENSEMBLE_MODES = SUPPORT_SESSION_MODES;
 
 // The closure's protocol file distinguishes delegated single-session subagents
 // from hub-and-spoke support sessions without relying on a release version.

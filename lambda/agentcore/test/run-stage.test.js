@@ -5914,6 +5914,33 @@ describe('runStage — release-mode fidelity', () => {
     expect(event[1].summary).toContain('linter');
   });
 
+  // A support persona that never gets its own session is a downgrade a human
+  // cannot otherwise see: the stage still declares it.
+  it('emits v2.policy.applied naming the support personas collaborators off withdrew', async () => {
+    const lib = library();
+    lib.fromRelease = true;
+    lib.stagesById['requirements-analysis'].mode = 'mob';
+    lib.stagesById['requirements-analysis'].supportAgents = ['aidlc-design-agent'];
+    lib.agentsById['aidlc-design-agent'] = { id: 'aidlc-design-agent' };
+    lib.scopesById = {
+      feature: { id: 'feature', version: 1, collaborators: 'off' },
+    };
+    const store = spyStore();
+    const deps = baseDeps({
+      store,
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: lib }),
+    });
+
+    await runStage(baseArgs, deps);
+
+    const event = store.calls.find(
+      ([name, args]) => name === 'appendEvent' && args.type === 'v2.policy.applied',
+    );
+    expect(event).toBeDefined();
+    expect(event[1].summary).toContain('support personas withdrawn: aidlc-design-agent');
+  });
+
   it('emits no policy event for a legacy library, even with the same SCOPE row', async () => {
     const lib = library();
     lib.scopesById = { feature: { id: 'feature', version: 1, reviewCap: 'none' } };

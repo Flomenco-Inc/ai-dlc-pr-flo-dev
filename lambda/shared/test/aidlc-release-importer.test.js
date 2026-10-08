@@ -37,6 +37,16 @@ const CATALOG_GOLDENS = Object.freeze({
     'v2.8.2': '11268485c203bdbc0b1253ab09af9b97ac3dab428fb24b8c515cfa9d0900b96a',
     'v2.9.0': 'fdb354d35b4f207fa81df92bf6230fb97be1e90e5b56e669b5dc2135fc30bd0b',
   }),
+  // Revision 3 adds the 2.11 scope settings. None of the vendored releases
+  // authors one, and `changeControl` falls back to `change_control`, so every
+  // digest is UNCHANGED — which is the compatibility claim, not a coincidence.
+  3: Object.freeze({
+    'current-stable': 'e755d11af6ac83b558c93367e66760a2422bb90a90101e71fdc783542456cdf6',
+    'v2.6.18': 'c96da502d523da21a2e19c661908c8dce43ddfe1f1dc95c36a50c89488f4f974',
+    'v2.7.0': '0f3d5f6b898ac5f92bd9cfb142781081b0480f418de61eb755a1dd75a3f13b1a',
+    'v2.8.2': '11268485c203bdbc0b1253ab09af9b97ac3dab428fb24b8c515cfa9d0900b96a',
+    'v2.9.0': 'fdb354d35b4f207fa81df92bf6230fb97be1e90e5b56e669b5dc2135fc30bd0b',
+  }),
 });
 
 const filesFor = (profileId) =>
@@ -65,8 +75,8 @@ const rebuilt = (manifest, patch) => {
 };
 
 describe('importer revision and mapper fingerprint', () => {
-  it('is on importer revision 2', () => {
-    expect(AIDLC_RELEASE_IMPORTER_REVISION).toBe(2);
+  it('is on importer revision 3', () => {
+    expect(AIDLC_RELEASE_IMPORTER_REVISION).toBe(3);
     expect(FIRST_FINGERPRINTED_IMPORTER_REVISION).toBe(2);
   });
 
@@ -126,14 +136,17 @@ describe('importer revision and mapper fingerprint', () => {
       expect(manifest.importerRevision).toBe(AIDLC_RELEASE_IMPORTER_REVISION);
       expect(manifest.mapperFingerprint).toBe(computeMapperFingerprint());
       expect(manifest.catalog.key).toBe(
-        releaseCatalogKey({ sha: manifest.sourceSha, importerRevision: 2 }),
+        releaseCatalogKey({
+          sha: manifest.sourceSha,
+          importerRevision: AIDLC_RELEASE_IMPORTER_REVISION,
+        }),
       );
       expect(validateReleaseManifest(manifest)).toBe(manifest);
     }
   });
 
   it('refuses to build any revision other than its own', () => {
-    for (const importerRevision of [1, 3]) {
+    for (const importerRevision of [1, 2, 4]) {
       expect(() =>
         buildReleaseBundle({
           profileId: 'v2.9.0',
@@ -187,7 +200,7 @@ describe('manifest fingerprint validation', () => {
 
   it('accepts a revision newer than this code on shape alone, so a rollback cannot strand it', () => {
     const { manifest } = bundles['v2.9.0'];
-    const future = rebuilt(manifest, { importerRevision: 3, mapperFingerprint: 'e'.repeat(64) });
+    const future = rebuilt(manifest, { importerRevision: 4, mapperFingerprint: 'e'.repeat(64) });
     expect(validateReleaseManifest(future)).toBe(future);
   });
 });

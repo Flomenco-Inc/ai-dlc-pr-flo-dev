@@ -2438,6 +2438,92 @@ describe('promotion of a record whose evidence read the engine sources', () => {
   });
 });
 
+// Mapping a new authored field removes its `unmapped` blocker. Nothing else
+// makes the setting work, so the field must have a classification the moment it
+// becomes mapped, and a release authoring a value whose handler has not shipped
+// must keep holding promotion — including a fork, which is the shape a customer
+// reaches this branch with.
+describe('a release authoring a 2.11 scope setting whose handler has not shipped', () => {
+  const SCOPE_PATH = 'core/scopes/aidlc-classic.md';
+  // [authored line, the gap promotion must name]. A row moves out of here in the
+  // PR that resolves that setting onto the runtime, never before.
+  const UNHANDLED = [
+    ['guard_policy: strict', { blockType: 'SCOPE', field: 'guard_policy', value: 'strict' }],
+    ['plan_approval: off', { blockType: 'SCOPE', field: 'plan_approval', value: 'off' }],
+    ['collaborators: off', { blockType: 'SCOPE', field: 'collaborators', value: 'off' }],
+    ['existing_code: true', { blockType: 'SCOPE', field: 'existing_code', value: 'true' }],
+  ];
+
+  const withSettings = (files, lines) => {
+    expect(files.has(SCOPE_PATH), SCOPE_PATH).toBe(true);
+    files.set(SCOPE_PATH, files.get(SCOPE_PATH).replace('---\n', `---\n${lines.join('\n')}\n`));
+    return files;
+  };
+
+  const registerFork = async (lines) => {
+    installFakes();
+    const FORK_SHA = 'bcdef0123456789abcdef0123456789abcdef012';
+    const profile = customProfile({
+      repository: 'acme/aidlc-settings',
+      sha: FORK_SHA,
+      baseProfileId: CANDIDATE_PROFILE,
+    });
+    const bundle = buildReleaseBundle({
+      profile,
+      files: withSettings(filesWithInvokeLines(CANDIDATE_PROFILE), lines),
+    });
+    await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+    return registerCustomRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      repository: 'acme/aidlc-settings',
+      sha: FORK_SHA,
+      baseProfileId: CANDIDATE_PROFILE,
+      actor: 'admin-1',
+    });
+  };
+
+  const promoteFork = (release, state) =>
+    updateRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      releaseId: release.releaseId,
+      expectedRevision: release.revision,
+      patch: { supportState: state },
+      actor: 'admin-1',
+    });
+
+  it.each(UNHANDLED)('holds a fork authoring %s alone', async (line, gap) => {
+    const { release } = await registerFork([line]);
+
+    expect(release.unhonouredValues).toContainEqual(gap);
+    // The field is mapped now, so its old blocker is gone — the classification
+    // is the only thing still holding it.
+    expect(
+      release.unhonouredValues.filter((entry) => entry.value === UNMAPPED_FIELD_GAP_VALUE),
+    ).toEqual([]);
+    await expect(promoteFork(release, 'selectable')).rejects.toMatchObject({
+      code: 'release_capability_unhandled',
+    });
+  });
+
+  it.each(['selectable', 'certified'])(
+    'refuses %s promotion of a fork authoring all of them',
+    async (state) => {
+      const { release } = await registerFork(UNHANDLED.map(([line]) => line));
+
+      for (const [, gap] of UNHANDLED) {
+        expect(release.unhonouredValues).toContainEqual(gap);
+      }
+      await expect(promoteFork(release, state)).rejects.toMatchObject({
+        code: 'release_capability_unhandled',
+      });
+    },
+  );
+});
+
 // A stored list carrying a NUMERIC revision this build has moved past is the
 // other stale shape, and the one an upgrade actually produces: the previous
 // build wrote `fidelityEvidenceRevision: 4` with evidence that never judged an

@@ -164,9 +164,17 @@ const mapScope = (fm, body, id) => {
     ...optional('sensorsPolicy', fm.sensors),
     ...optional('reviewCap', fm.review_cap),
     ...optional('summaryConfirmation', fm.summary_confirmation),
-    ...optional('changeControl', fm.change_control),
+    // 2.11 renames `change_control` to `guard_policy` and adds an `off` value.
+    // The new name is read FIRST and the old one second, so one resolver serves
+    // both dialects: a 2.11 scope resolves from `guard_policy`, and a 2.8.2 or
+    // 2.9.0 scope maps to exactly the bytes it maps to today.
+    ...optional('guardPolicy', fm.guard_policy),
+    ...optional('changeControl', fm.guard_policy ?? fm.change_control),
+    ...optional('planApproval', fm.plan_approval),
+    ...optional('collaborators', fm.collaborators),
     ...optional('learnings', fm.learnings),
     ...optional('skeleton', fm.skeleton),
+    ...(fm.existing_code == null ? {} : { existingCode: fm.existing_code }),
     ...(fm.runner == null ? {} : { runner: fm.runner }),
     body,
   };

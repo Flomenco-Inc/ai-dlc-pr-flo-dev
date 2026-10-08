@@ -339,7 +339,10 @@ const validatePolicyEnums = ({ scopeBlock, stage, stageId, errors }) => {
     const block = owner === 'scope' ? scopeBlock : stage;
     const value = block?.[key];
     if (value == null) continue;
-    if (!allowed.includes(value)) {
+    // A registry enum is a list of authored value TEXT, and one authored value
+    // is a YAML boolean (`existing_code: true`), so the comparison is on its
+    // text. The parsed type itself is validated at the analyzer boundary.
+    if (!allowed.includes(String(value))) {
       ok = false;
       errors.push(
         err(

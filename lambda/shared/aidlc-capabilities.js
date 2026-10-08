@@ -19,6 +19,11 @@
 //   handler             field-level runtime seam id (see RUNTIME_HANDLERS).
 //   values              per-authored-value { handling, handler }. Present ⇒ the
 //                       keys ARE the closed enum for this field.
+//   authoredType        the typeof the PARSED frontmatter value, 'string' unless
+//                       stated. The enum keys are always text, so a field whose
+//                       YAML value is a boolean declares it here and the
+//                       analyzer compares the real type rather than assuming a
+//                       string (aidlc-compatibility.js).
 //   defaultWhenAbsent   release-mode value applied when the field is ABSENT and
 //                       `capabilityPresentIf` holds. null = inert when absent
 //                       (the default rule for every field).
@@ -341,6 +346,11 @@ const AIDLC_CAPABILITIES = Object.freeze([
     values: Object.freeze({
       strict: Object.freeze({ handling: 'approximated', handler: 'policy.change-control@v1' }),
       relaxed: Object.freeze({ handling: 'approximated', handler: 'policy.change-control@v1' }),
+      // 2.11's third value, reaching this key through `guard_policy`. Legal, so
+      // the plan resolver no longer rejects a 2.11 scope outright, but not yet
+      // honoured: the removal it asks for is a separate change, and until then
+      // the value holds promotion.
+      off: Object.freeze({ handling: 'unsupported', handler: null }),
     }),
     // Upstream treats an omitted `change_control` as `strict`. Defaulting it
     // unconditionally would inject a change-control ritual into 2.6.18/2.7.0,
@@ -350,6 +360,86 @@ const AIDLC_CAPABILITIES = Object.freeze([
     defaultWhenAbsent: 'strict',
     capabilityPresentIf: 'anyBlockAuthorsField',
     note: 'A stage approval records the content fingerprints of what it produced; the next stage compares its required inputs against them BEFORE the agent runs. `relaxed` appends a deduplicated v2.change.accepted and continues; `strict` opens a two-option question gate (reconfirm / stop and rewind) whose halt is a rewind-eligible failure. Classified `approximated`, not `native`: this reproduces only the input-fingerprint half of upstream\u2019s mechanism \u2014 compare-before-run plus the strict/relaxed gate. Upstream\u2019s reviewer-request and completion-refusal halves (a reviewer that can itself request re-confirmation, and a human that can refuse the completion outright on a changed input) are not reproduced. Residual: an input no approval ever recorded has no fingerprint to differ from and is therefore not reported as changed.',
+  }),
+  // 2.11 renames `change_control` to `guard_policy` and adds an `off` value, and
+  // adds `plan_approval`, `collaborators` and `existing_code`. The importer maps
+  // all four onto the SCOPE block, so the analyzer stops calling them unmapped —
+  // and an authored value must therefore have SOMETHING here to judge it, or
+  // mapping alone would silently open promotion for a setting the runtime still
+  // drops. Each is classified `unsupported` with no handler until the PR that
+  // resolves it onto the per-stage policy flips the classification and names its
+  // seam. The enum is the real contribution of these entries meanwhile: an
+  // illegal value is refused at import instead of reaching the plan.
+  Object.freeze({
+    key: 'SCOPE:guard_policy',
+    blockType: 'SCOPE',
+    field: 'guard_policy',
+    planKey: 'guardPolicy',
+    policy: 'scope',
+    handling: 'unsupported',
+    handler: null,
+    values: Object.freeze({
+      strict: Object.freeze({ handling: 'unsupported', handler: null }),
+      relaxed: Object.freeze({ handling: 'unsupported', handler: null }),
+      off: Object.freeze({ handling: 'unsupported', handler: null }),
+    }),
+    defaultWhenAbsent: null,
+    capabilityPresentIf: null,
+    note: 'Upstream\u2019s rename of `change_control`, with a third value `off`. The mapper resolves `SCOPE:change_control` from this field first, so an existing closure maps exactly as before. No value is honoured yet: resolving it onto the per-stage policy is a separate change, and until then a release authoring it keeps holding promotion rather than running with a guard setting the platform dropped.',
+  }),
+  Object.freeze({
+    key: 'SCOPE:plan_approval',
+    blockType: 'SCOPE',
+    field: 'plan_approval',
+    planKey: 'planApproval',
+    policy: 'scope',
+    handling: 'unsupported',
+    handler: null,
+    values: Object.freeze({
+      on: Object.freeze({ handling: 'unsupported', handler: null }),
+      off: Object.freeze({ handling: 'unsupported', handler: null }),
+    }),
+    defaultWhenAbsent: null,
+    capabilityPresentIf: null,
+    note: 'Upstream\u2019s Plan Approval scope switch. Mapped onto the SCOPE block, not yet resolved onto the per-stage policy, so a release authoring it keeps holding promotion.',
+  }),
+  Object.freeze({
+    key: 'SCOPE:collaborators',
+    blockType: 'SCOPE',
+    field: 'collaborators',
+    planKey: 'collaborators',
+    policy: 'scope',
+    handling: 'unsupported',
+    handler: null,
+    values: Object.freeze({
+      on: Object.freeze({ handling: 'unsupported', handler: null }),
+      off: Object.freeze({ handling: 'unsupported', handler: null }),
+    }),
+    defaultWhenAbsent: null,
+    capabilityPresentIf: null,
+    note: 'Upstream\u2019s collaborator switch. Mapped onto the SCOPE block, not yet resolved onto the ensemble topology, so a release authoring it keeps holding promotion.',
+  }),
+  // The one authored setting that is a YAML BOOLEAN rather than a string, which
+  // is why the entry declares its authored type: the enum check at the analyzer
+  // boundary compares the real parsed value, so upstream\u2019s `existing_code: true`
+  // imports and a quoted `"true"` \u2014 which would reach the prompt renderer as a
+  // string and be dropped \u2014 is refused.
+  Object.freeze({
+    key: 'SCOPE:existing_code',
+    blockType: 'SCOPE',
+    field: 'existing_code',
+    planKey: 'existingCode',
+    policy: 'scope',
+    authoredType: 'boolean',
+    handling: 'unsupported',
+    handler: null,
+    values: Object.freeze({
+      true: Object.freeze({ handling: 'unsupported', handler: null }),
+      false: Object.freeze({ handling: 'unsupported', handler: null }),
+    }),
+    defaultWhenAbsent: null,
+    capabilityPresentIf: null,
+    note: 'The project type the scope authors. Mapped onto the SCOPE block, not yet resolved onto the per-stage policy, so a release authoring it keeps holding promotion.',
   }),
   Object.freeze({
     key: 'SCOPE:learnings',
@@ -531,6 +621,24 @@ const FRONTMATTER_ENUMS = Object.freeze(
   ),
 );
 
+// The typeof each enum field's PARSED frontmatter value. Derived from the same
+// entries, so the analyzer can never disagree with the registry about whether a
+// field is authored as text or as a YAML boolean.
+const FRONTMATTER_ENUM_TYPES = Object.freeze(
+  Object.fromEntries(
+    Object.keys(FRONTMATTER_ENUMS).map((blockType) => [
+      blockType,
+      Object.freeze(
+        Object.fromEntries(
+          AIDLC_CAPABILITIES.filter((entry) => entry.blockType === blockType && entry.values).map(
+            (entry) => [entry.field, entry.authoredType ?? 'string'],
+          ),
+        ),
+      ),
+    ]),
+  ),
+);
+
 // The plan's policy vocabulary: [owner, planKey, authored field, allowed values].
 // Scope-owned rows first, then stage-owned, so a catalog with several invalid
 // policy values reports them in the order the pre-registry table did.
@@ -687,6 +795,7 @@ export {
   ANNEX_HANDLED_ENGINE_COMMANDS,
   FIELD_FIDELITY,
   FRONTMATTER_ENUMS,
+  FRONTMATTER_ENUM_TYPES,
   LOOP_BACK_RESULTS_ARTIFACT,
   PLAN_APPROVAL_ARTIFACT,
   POLICY_ENUMS,
@@ -710,6 +819,7 @@ export default {
   ANNEX_HANDLED_ENGINE_COMMANDS,
   FIELD_FIDELITY,
   FRONTMATTER_ENUMS,
+  FRONTMATTER_ENUM_TYPES,
   LOOP_BACK_RESULTS_ARTIFACT,
   PLAN_APPROVAL_ARTIFACT,
   POLICY_ENUMS,

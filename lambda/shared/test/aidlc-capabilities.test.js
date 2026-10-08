@@ -175,12 +175,7 @@ describe('aidlc capability registry', () => {
 
   it('derives the policy tables the plan resolver consumes, scope rows before stage rows', () => {
     expect(POLICY_ENUMS.map(([owner]) => owner)).toEqual([
-      'scope',
-      'scope',
-      'scope',
-      'scope',
-      'scope',
-      'scope',
+      ...Array.from({ length: 10 }, () => 'scope'),
       'stage',
       'stage',
     ]);
@@ -189,6 +184,10 @@ describe('aidlc capability registry', () => {
       'reviewCap',
       'summaryConfirmation',
       'changeControl',
+      'guardPolicy',
+      'planApproval',
+      'collaborators',
+      'existingCode',
       'learnings',
       'skeleton',
     ]);

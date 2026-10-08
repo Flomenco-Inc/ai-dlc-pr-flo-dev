@@ -3,6 +3,7 @@ import {
   AIDLC_CAPABILITIES,
   FIELD_FIDELITY,
   FRONTMATTER_ENUMS,
+  FRONTMATTER_ENUM_TYPES,
   resolveCapabilities,
 } from './aidlc-capabilities.js';
 import {
@@ -88,6 +89,10 @@ const MAPPED_FRONTMATTER_FIELDS = Object.freeze({
     'review_cap',
     'summary_confirmation',
     'change_control',
+    'guard_policy',
+    'plan_approval',
+    'collaborators',
+    'existing_code',
     'learnings',
     'skeleton',
     'runner',
@@ -972,10 +977,18 @@ const analyzeAidlcCompatibility = ({ profileId, profile: explicitProfile = null,
       }
       const mapped = new Set(MAPPED_FRONTMATTER_FIELDS[type] ?? []);
       const enums = FRONTMATTER_ENUMS[type] ?? {};
+      const enumTypes = FRONTMATTER_ENUM_TYPES[type] ?? {};
       for (const [field, allowed] of Object.entries(enums)) {
         const value = data[field];
         if (value == null) continue;
-        if (typeof value !== 'string' || !allowed.includes(value)) {
+        // The enum keys are text, but not every authored value is: upstream
+        // writes `existing_code: true`, which YAML parses as a boolean. The
+        // registry declares the type it expects per field, so the real parsed
+        // value is checked instead of assumed to be a string — and a boolean
+        // field authored as the quoted string "true" stays a rejection, because
+        // the mapper would carry that string to a consumer comparing with `true`.
+        const expectedType = enumTypes[field] ?? 'string';
+        if (typeof value !== expectedType || !allowed.includes(String(value))) {
           diagnostics.push({
             code: 'frontmatter_enum_invalid',
             severity: 'error',

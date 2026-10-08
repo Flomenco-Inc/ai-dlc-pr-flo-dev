@@ -47,7 +47,7 @@ import {
 } from '../../shared/methodology-catalog.js';
 import { CORE_FILES } from '../../shared/test/fixtures/repo-files.js';
 import { filesFromCompatibilityFixture } from '../../shared/aidlc-compatibility.js';
-import { buildReleaseBundle } from '../../shared/aidlc-release.js';
+import { AIDLC_RELEASE_IMPORTER_REVISION, buildReleaseBundle } from '../../shared/aidlc-release.js';
 import { legacyReleaseBundle } from '../../shared/test/fixtures/legacy-release.js';
 import {
   __test as releaseResolverTest,
@@ -2645,7 +2645,7 @@ describe('POST /compose — composer sessions', () => {
       const methodologyRelease = {
         releaseId: 'aidlc:release-sha',
         sourceSha: 'release-sha',
-        importerRevision: 2,
+        importerRevision: AIDLC_RELEASE_IMPORTER_REVISION,
         closureDigest: 'closure-digest',
         catalogKey: 'catalog.json',
         manifestKey: 'manifest.json',
@@ -8822,14 +8822,17 @@ describe('AI-DLC per-intent release selection', () => {
   // release is re-imported. Without s3:ListBucket the missing new-revision
   // manifest reads as 403, so the row's own revision must be compared first.
   it.each([
-    ['a row at the previous importer revision stays unpinned without reading the manifest', 1],
-    ['a row at the current importer revision pins as before', 2],
+    [
+      'a row at the previous importer revision stays unpinned without reading the manifest',
+      AIDLC_RELEASE_IMPORTER_REVISION - 1,
+    ],
+    ['a row at the current importer revision pins as before', AIDLC_RELEASE_IMPORTER_REVISION],
   ])('%s', async (_label, rowRevision) => {
     const sub = `u-${randomUUID()}`;
     const projectId = await seedV2Project(sub);
     seedDeploymentWorkflowAtV1('feature');
     seedRegistryRecord(bundleA, 'current-stable', { importerRevision: rowRevision });
-    if (rowRevision !== 2) {
+    if (rowRevision !== AIDLC_RELEASE_IMPORTER_REVISION) {
       s3Mock.on(GetObjectCommand, { Bucket: 'artifacts-test', Key: pinA.manifestKey }).rejects(
         Object.assign(new Error('Access Denied'), {
           name: 'AccessDenied',
@@ -8869,8 +8872,11 @@ describe('AI-DLC per-intent release selection', () => {
         }
       })
       .find((entry) => entry?.level === 'WARN' && entry.code === 'release_registry_skew');
-    if (rowRevision === 2) {
-      expect(pin).toMatchObject({ releaseId: pinA.releaseId, importerRevision: 2 });
+    if (rowRevision === AIDLC_RELEASE_IMPORTER_REVISION) {
+      expect(pin).toMatchObject({
+        releaseId: pinA.releaseId,
+        importerRevision: AIDLC_RELEASE_IMPORTER_REVISION,
+      });
       expect(manifestReads.length).toBeGreaterThan(0);
       expect(warned).toBeUndefined();
     } else {
@@ -8879,8 +8885,8 @@ describe('AI-DLC per-intent release selection', () => {
       expect(warned).toMatchObject({
         releaseId: pinA.releaseId,
         fields: ['importerRevision'],
-        registeredImporterRevision: 1,
-        currentImporterRevision: 2,
+        registeredImporterRevision: AIDLC_RELEASE_IMPORTER_REVISION - 1,
+        currentImporterRevision: AIDLC_RELEASE_IMPORTER_REVISION,
       });
     }
   });
@@ -9197,7 +9203,7 @@ describe('AI-DLC per-intent release selection', () => {
 
     expect(after.statusCode).toBe(201);
     expect(metaFor(JSON.parse(after.body).id).methodologyRelease).toEqual(pinB);
-    expect(pinB.importerRevision).toBe(2);
+    expect(pinB.importerRevision).toBe(AIDLC_RELEASE_IMPORTER_REVISION);
     // The existing intent's persisted pin is untouched by the registry move.
     expect(metaFor(existingId).methodologyRelease).toEqual(legacyPinB);
     expect(legacyPinB.importerRevision).toBe(1);

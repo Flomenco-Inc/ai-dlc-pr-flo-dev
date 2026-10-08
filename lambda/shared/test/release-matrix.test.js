@@ -24,6 +24,8 @@ import { evaluateGatePreconditions } from '../gate-preconditions.js';
 import { LOOP_BACK_OPTION, resolveLoopBackOffer } from '../stage-loopback.js';
 import { resolveMethodologyLibrary } from '../release-resolver.js';
 import {
+  evalRequiredSections,
+  recordSensorsCoverRunRecords,
   SENSOR_RESULT,
   sensorKind,
   severityGate,
@@ -575,6 +577,45 @@ describe('release coexistence matrix', () => {
 
     expect(inherited).toEqual([]);
     expect(declaredWithoutPolicy).toEqual([]);
+  });
+
+  // No allowlisted release widens its record-sensor glob to the knowledge base,
+  // so none of them turns the run-record exemption on and a one-line timestamp
+  // record keeps reporting two missing headings on every pin that exists today.
+  it('leaves the run-record exemption off for every allowlisted release', async () => {
+    const TIMESTAMP_BODY = 'Discovered: 2026-10-08T00:00:00Z\n';
+    const exemptBySensor = {};
+
+    for (const profileId of PROFILE_IDS) {
+      const { workflow, releaseLibrary } = await fixtureContext(profileId);
+      expect(recordSensorsCoverRunRecords(releaseLibrary.sensorsById), profileId).toBe(false);
+      const scopes = [
+        ...new Set(
+          workflow.placements.flatMap((placement) => Object.keys(placement.scopeMembership ?? {})),
+        ),
+      ].toSorted();
+
+      for (const scope of scopes) {
+        const { plan } = buildExecutionPlan({ workflow, scope, library: releaseLibrary });
+        for (const stage of plan?.stages ?? []) {
+          for (const sensor of stage.sensors ?? []) {
+            if (sensor.sensorId !== 'required-sections') continue;
+            exemptBySensor[`${profileId}/${scope}/${stage.stageId}`] = Boolean(
+              sensor.recordTimestampExempt,
+            );
+            expect(
+              evalRequiredSections(TIMESTAMP_BODY, 'practices-discovery-timestamp', {
+                recordTimestampExempt: Boolean(sensor.recordTimestampExempt),
+              }),
+              `${profileId}/${scope}/${stage.stageId}`,
+            ).toMatchObject({ pass: false, detail: { h2_count: 0, findings_count: 2 } });
+          }
+        }
+      }
+    }
+
+    expect(Object.keys(exemptBySensor).length).toBeGreaterThan(0);
+    expect(Object.values(exemptBySensor).filter(Boolean)).toEqual([]);
   });
 
   // Every script sensor every allowlisted release runs, with the flag it is

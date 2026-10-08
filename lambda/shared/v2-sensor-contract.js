@@ -73,6 +73,19 @@ const sensorPathFlag = (inputSchema) => {
 // stable sensor id the seed assigns (basename minus `aidlc-` prefix).
 const GRAPH_SENSORS = Object.freeze(['required-sections', 'upstream-coverage', 'graph-coverage']);
 
+// A record sensor whose candidate set reaches the knowledge base also covers run
+// records, and that widening is the authored change upstream shipped the
+// timestamp exemption with, in the same sensor file. Reading the authored glob
+// of the RECORD sensors keeps the switch version-agnostic — it never reads a
+// version string — and keeps it out of reach of an unrelated sensor's glob. A
+// catalog whose record sensors claim no such coverage keeps the heading floor,
+// which is every release that shipped before the exemption.
+const RUN_RECORD_COVERAGE_MARKER = 'codekb';
+const recordSensorsCoverRunRecords = (sensorsById = {}) =>
+  GRAPH_SENSORS.some((sensorId) =>
+    String(sensorsById?.[sensorId]?.matches ?? '').includes(RUN_RECORD_COVERAGE_MARKER),
+  );
+
 // The run-record naming convention: `<artifact>-timestamp[.md]`.
 const TIMESTAMP_MARKER_RE = /-timestamp(?:\.md)?$/;
 
@@ -506,6 +519,7 @@ export {
   GRAPH_SENSORS,
   FILE_PATH_FLAG,
   OUTPUT_PATH_FLAG,
+  recordSensorsCoverRunRecords,
   sensorKind,
   sensorPathFlag,
   scriptTimeoutBound,
@@ -527,6 +541,7 @@ export default {
   GRAPH_SENSORS,
   FILE_PATH_FLAG,
   OUTPUT_PATH_FLAG,
+  recordSensorsCoverRunRecords,
   sensorKind,
   sensorPathFlag,
   scriptTimeoutBound,

@@ -349,6 +349,47 @@ describe('buildExecutionPlan — plan shape', () => {
     expect(plan.stages[0].sensors[0].scriptRef).toBeNull();
   });
 
+  // A catalog whose record sensors cover run records exempts a one-line
+  // timestamp record from the heading floor. The switch rides the plan, so the
+  // runtime reads the catalog's claim rather than re-deriving it, and a catalog
+  // that claims nothing keeps a byte-identical plan.
+  describe('record-sensor run-record coverage', () => {
+    const planFor = ({ matches, policyEnabled }) =>
+      buildExecutionPlan({
+        workflow: workflow([placement('a')]),
+        scope: 'feature',
+        library: baseLibrary({
+          ...(policyEnabled ? { fromRelease: true } : {}),
+          stagesById: { a: stage('a', { sensors: ['required-sections'] }) },
+          sensorsById: {
+            'required-sections': {
+              command: 'aidlc-sensor-required-sections.ts',
+              runtime: 'bun',
+              matches,
+            },
+          },
+        }),
+      }).plan.stages[0].sensors[0];
+
+    it('rides the plan when the catalog widens the record glob', () => {
+      expect(
+        planFor({ matches: '**/{aidlc-docs,intents,codekb}/**', policyEnabled: true }),
+      ).toMatchObject({ recordTimestampExempt: true });
+    });
+
+    it('is absent for the glob every earlier release authors', () => {
+      expect(
+        planFor({ matches: '**/{aidlc-docs,intents}/**', policyEnabled: true }),
+      ).not.toHaveProperty('recordTimestampExempt');
+    });
+
+    it('is absent without a release policy, whatever the glob says', () => {
+      expect(
+        planFor({ matches: '**/{aidlc-docs,intents,codekb}/**', policyEnabled: false }),
+      ).not.toHaveProperty('recordTimestampExempt');
+    });
+  });
+
   // A document sensor declares `output_path`, so it must not be spawned with
   // the code sensors' `--file-path`. The flag is resolved on the plan, and only
   // when the authored contract moves it — a catalog that authors none, and a

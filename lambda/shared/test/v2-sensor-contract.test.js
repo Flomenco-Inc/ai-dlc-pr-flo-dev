@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   SENSOR_RESULT,
+  recordSensorsCoverRunRecords,
   sensorKind,
   severityGate,
   sensorPathFlag,
@@ -184,6 +185,34 @@ describe('buildScriptArgv', () => {
 // two-heading floor reported two findings on every to-spec file. The exemption
 // applies only where the pinned catalog proves its record sensor covers run
 // records, which is the authored change that shipped the exemption upstream.
+describe('recordSensorsCoverRunRecords', () => {
+  it('reads the record sensors own authored glob', () => {
+    expect(
+      recordSensorsCoverRunRecords({
+        'required-sections': { matches: '**/{aidlc-docs,intents,codekb}/**' },
+      }),
+    ).toBe(true);
+    expect(
+      recordSensorsCoverRunRecords({
+        'upstream-coverage': { matches: '**/{aidlc-docs,intents,codekb}/**' },
+      }),
+    ).toBe(true);
+  });
+  it('is false for the glob every earlier release authors', () => {
+    expect(
+      recordSensorsCoverRunRecords({
+        'required-sections': { matches: '**/{aidlc-docs,intents}/**' },
+      }),
+    ).toBe(false);
+    expect(recordSensorsCoverRunRecords({ 'required-sections': {} })).toBe(false);
+    expect(recordSensorsCoverRunRecords({})).toBe(false);
+    expect(recordSensorsCoverRunRecords()).toBe(false);
+  });
+  it('ignores a glob authored by a sensor that is not a record sensor', () => {
+    expect(recordSensorsCoverRunRecords({ linter: { matches: '**/codekb/**' } })).toBe(false);
+  });
+});
+
 describe('evalRequiredSections — a timestamp run record', () => {
   const TIMESTAMP_BODY = 'Discovered: 2026-10-08T00:00:00Z\n';
   const MARKER = 'practices-discovery-timestamp';

@@ -503,6 +503,46 @@ describe('runStageSensors — script kind', () => {
   });
 });
 
+// The record sensor runs in-process over graph artifacts, so the exemption has
+// to travel on the plan sensor entry to reach the evaluator at all.
+describe('runStageSensors — a timestamp run record at the gate', () => {
+  const runnerFor = () =>
+    createSensorRunner({
+      graph: fakeGraph({
+        'practices-discovery-timestamp': [
+          { id: 'ts1', content: 'Discovered: 2026-10-08T00:00:00Z\n' },
+        ],
+      }),
+      loadBlockScript: async () => '',
+      workspaceDir: null,
+    });
+
+  const verdictFor = async (sensor) =>
+    (
+      await runnerFor().runStageSensors({
+        sensors: [sensor],
+        outputArtifacts: [{ artifact: 'practices-discovery-timestamp' }],
+        stageId: 'practices-discovery',
+      })
+    )[0];
+
+  it('reports two missing headings when the catalog claims no record coverage', async () => {
+    const verdict = await verdictFor({ sensorId: 'required-sections', severity: 'advisory' });
+    expect(verdict).toMatchObject({ kind: 'graph', result: 'FAIL', held: false });
+    expect(verdict.detail.artifacts[0]).toMatchObject({ h2_count: 0, findings_count: 2 });
+  });
+
+  it('passes when the plan carries the catalog record coverage', async () => {
+    const verdict = await verdictFor({
+      sensorId: 'required-sections',
+      severity: 'advisory',
+      recordTimestampExempt: true,
+    });
+    expect(verdict).toMatchObject({ result: 'PASS' });
+    expect(verdict.detail.artifacts[0]).toMatchObject({ h2_count: 0, findings_count: 0 });
+  });
+});
+
 // A release sensor script's sibling imports. Without them the spawned
 // interpreter fails at startup with `Cannot find module` before the sensor
 // checks anything, which is what every pinned document sensor did.

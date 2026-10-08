@@ -318,6 +318,7 @@ export const createSensorRunner = ({
                 // blocks. Default lenient — absence is an audit finding until
                 // field-test compliance justifies flipping the switch.
                 strictStructuredBlocks: Boolean(sensor.strictStructuredBlocks),
+                recordTimestampExempt: Boolean(sensor.recordTimestampExempt),
               });
         details.push({ artifact: artifactType, id: row.id ?? null, ...evalled.detail });
         if (evalled.result === SENSOR_RESULT.FAIL) worst = SENSOR_RESULT.FAIL;

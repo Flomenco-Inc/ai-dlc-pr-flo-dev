@@ -33,7 +33,12 @@ import {
 import { compileStageGraph, compileRules } from './compile.js';
 import { isLoopBackRecommenderStage, loopBackApplies } from './stage-loopback.js';
 import { stageSkipBlockReason } from './stage-skip.js';
-import { FILE_PATH_FLAG, sensorKind, sensorPathFlag } from './v2-sensor-contract.js';
+import {
+  FILE_PATH_FLAG,
+  recordSensorsCoverRunRecords,
+  sensorKind,
+  sensorPathFlag,
+} from './v2-sensor-contract.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
 // this module implements. Checked against the registry by a test, so a
@@ -209,7 +214,13 @@ const stageInputs = (stage) =>
 
 // Resolve + validate the deterministic sensors a stage runs. The reviewer is a
 // SEPARATE axis (stage.reviewer), handled below — it is NOT a sensor here.
-const resolveSensors = (stage, stageId, sensorsById, errors, { policyEnabled = false } = {}) =>
+const resolveSensors = (
+  stage,
+  stageId,
+  sensorsById,
+  errors,
+  { policyEnabled = false, recordTimestampExempt = false } = {},
+) =>
   (stage?.sensors ?? [])
     .map((sid) => {
       const sensor = sensorsById[sid];
@@ -254,6 +265,10 @@ const resolveSensors = (stage, stageId, sensorsById, errors, { policyEnabled = f
         // has no gate plane and runs every sensor in its one pass, so a SYSTEM
         // seed or a user block that authors the field must not change its plan.
         ...(policyEnabled && sensor.fireOn ? { fireOn: sensor.fireOn } : {}),
+        // Whether this catalog's record sensors cover run records. Emitted only
+        // when they claim that coverage, so a catalog that does not keeps a
+        // byte-identical plan and keeps the heading floor.
+        ...(recordTimestampExempt ? { recordTimestampExempt: true } : {}),
       };
     })
     .filter(Boolean);
@@ -769,7 +784,10 @@ const buildExecutionPlan = ({
         }
       }
 
-      const sensors = resolveSensors(stage, stageId, sensorsById, errors, { policyEnabled });
+      const sensors = resolveSensors(stage, stageId, sensorsById, errors, {
+        policyEnabled,
+        recordTimestampExempt: policyEnabled && recordSensorsCoverRunRecords(sensorsById),
+      });
       const reviewer = resolveReviewer(stage, stageId, agentsById, errors);
 
       // Dependencies: every in-scope stage that must run before this one — the

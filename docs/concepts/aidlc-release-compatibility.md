@@ -21,8 +21,9 @@ or changes an existing intent.
 ## Profile identity and trust
 
 The built-in profiles are pinned to exact upstream commit SHAs. The allowlist
-includes the current 2.3.3 baseline and the 2.6.18, 2.7.0, 2.8.2, and 2.9.0
-catalogs. A custom fork receives a synthesized profile with its own source
+includes the current 2.3.3 baseline and the 2.6.18, 2.7.0, 2.8.2, 2.9.0, and
+2.11.0 catalogs. No intermediate release is onboarded: 2.10.0 is not on the
+allowlist and registering it is refused as an unknown profile. A custom fork receives a synthesized profile with its own source
 identity; an unknown tag or branch is not treated as an official release.
 
 All official profiles use the same source trust tier. Trust establishes whether
@@ -197,6 +198,61 @@ not a version allowlist, and the report's Boolean is not treated as durable
 authorization by itself: the release-promotion guard stores the authored
 fidelity gaps and reevaluates them against the handlers in the running build.
 
+A profile may additionally declare a support **ceiling**. 2.11.0 declares
+`selectable`: it is promotable and usable, and `certified` is refused with
+`release_certification_withheld`. The eleven engine commands below are answered,
+not reproduced, and a release that answers behaviour it does not reproduce is
+not a certified reproduction of its source. No other profile declares a ceiling,
+so none of their promotions changed.
+
+### AI-DLC 2.11.0: handled, approximated, refused
+
+2.11.0 renames Change Control to **Guard Policy** (adding a third value, `off`)
+and adds **Plan Approval**, **collaborators** and **`existing_code`** as scope
+settings. All four are mapped by the importer, resolved onto the per-stage
+policy, and choosable per intent by a project member before the run starts.
+Guard Policy `off` means no change-control reopen; **it never removes a human
+approval gate**, and that invariant is asserted for every 2.11 scope and stage.
+
+| 2.11 behaviour                                               | Disposition                     | What the platform does                                                                                                                                                                                                                               |
+| ------------------------------------------------------------ | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Guard Policy `strict` / `relaxed`                            | approximated                    | The existing change-control gate, unchanged.                                                                                                                                                                                                         |
+| Guard Policy `off`                                           | approximated                    | No reopen and no change-control prose. Upstream's `off` also lowers execution fences this platform never had, and its per-fence `Guards Off`/`Guards On` overrides and kill-switch chain are **refused** — there is no per-fence surface.            |
+| Plan Approval `on`                                           | approximated                    | The existing outcome-gate approximation.                                                                                                                                                                                                             |
+| Plan Approval `off`                                          | approximated                    | No plan gate is offered and the completion ladder requires no plan receipt. The stage's own approval gate is untouched, and the gate carries a notice naming whose choice it was.                                                                    |
+| collaborators `off`                                          | native                          | One session: the lead agent produces every declared output. Each withdrawn persona is named on the plan's policy effects.                                                                                                                            |
+| collaborators `on`                                           | approximated                    | The existing per-persona blind sessions.                                                                                                                                                                                                             |
+| `existing_code`                                              | approximated                    | Becomes the default project type, overridable by a human, and stated in the prompt. Mid-run reclassification is **refused** (see `orchestrate next`).                                                                                                |
+| `sensors`, `learnings`, `summary_confirmation`, `review_cap` | as before                       | Already mapped; only their 2.11 defaults changed. `review_cap` stays a scope ceiling and raising it per intent is refused.                                                                                                                           |
+| The composer's settings proposal                             | handled                         | `guardPolicy`, the six `scopeSettings`, `baseScope` and `creationDepth` are parsed and kept; a member accepts them on the compose page and the provenance is recorded. A proposed `settingsChanges` (a change to work in flight) is refused by name. |
+| `engine audit append-raw`                                    | approximated                    | The note is bound to `emit_stage_note`. No upstream audit shard or taxonomy event is written, and the agent may not claim one was.                                                                                                                   |
+| `engine config get`                                          | approximated                    | The effective settings and their source are rendered into the prompt. The annex forbids reading a settings, environment or shell file to find them.                                                                                                  |
+| `engine now`                                                 | approximated                    | The platform's own event stamps are in the prompt; a timestamp it cannot supply is omitted and said to be unavailable, never fabricated.                                                                                                             |
+| `engine config set`                                          | refused                         | Settings belong to the intent and only a human changes them, before the run starts; afterwards the API answers `settings_locked`. The agent records the request.                                                                                     |
+| `engine log answer`, `engine log decision`                   | refused (protected checkpoints) | Ordinary questions and summary confirmations bind to `ask_question` / `confirm_summary`. The plan-approval receipt and the approved verification command have no store here and are named as unavailable.                                            |
+| `engine orchestrate next`                                    | refused                         | No rescan, no Reverse Engineering re-insertion, no return to the interrupted stage. The agent records a `RECOMMENDED PROJECT TYPE CHANGE` and a human rewinds and recomposes.                                                                        |
+| `engine state set-construction-execution`                    | refused                         | Construction scheduling is platform state; the agent records the intended value.                                                                                                                                                                     |
+| `engine state set-construction-verification-command`         | refused                         | No approved-command store; the command is a recommendation, never executable authority.                                                                                                                                                              |
+| `engine testing-posture restore`                             | refused                         | No approved-bundle restore; the agent says it is unavailable and names what was lost.                                                                                                                                                                |
+| `engine worktree list` / `discard` / `restore` / `purge`     | refused                         | No parked-attempt store. Lanes are branches the platform creates and merges; the agent parks, deletes, restores and purges nothing and never substitutes git.                                                                                        |
+| `testing-posture fingerprint --reapprove`                    | retired upstream                | This platform never ran it, and no adapter here revives the retired route.                                                                                                                                                                           |
+| `doctor`                                                     | refused                         | No source-boundary diagnostic runs here. The agent reports the failure through its own output and never emits `VALID`/`INVALID`.                                                                                                                     |
+| `workspace codekb-scope-diff --check`                        | refused                         | No publication validator runs here. The missing prerequisite is named; no verdict is produced.                                                                                                                                                       |
+
+Every name the guard honours carries a row in the annex, asserted verbatim by
+test. A command instructed **only** from a body whose consuming sessions have no
+platform answer — a reviewer's or a support persona's knowledge — is not
+honoured: it keeps holding promotion. `engine now` is the case that proves it,
+which is why it is classified `approximated` (answered for every session) rather
+than honoured as a refusal it could not claim.
+
+What these green tests do **not** prove, stated so the support claim stays
+bounded: real model behaviour under the truncated composer knowledge; live human
+reply, approval, edit and restore flows; reviewer and support prompts in a real
+run; a real ESLint or tsc subprocess in the container image; per-Unit checkpoints
+and reopen with finished work retained; and production-equivalent dependency
+packaging.
+
 ## Registry, promotion, and channels
 
 Registration creates an invisible, structurally-valid record. It does not make
@@ -254,8 +310,8 @@ cannot honour; the admin screen explains a refused promotion.
 
 ### Enable pinning and promote a release
 
-A deployment of this build can run 2.8.2, 2.9.0 or an admin-promoted fork as
-follows. Every step is explicit; none happens on its own.
+A deployment of this build can run 2.8.2, 2.9.0, 2.11.0 or an admin-promoted
+fork as follows. Every step is explicit; none happens on its own.
 
 1. Turn release pinning on. In the Terraform variables for the deployment, set
    `aidlc_release_pinning = "on"` and apply. The demo deployment workflow reads
@@ -265,7 +321,8 @@ follows. Every step is explicit; none happens on its own.
 3. In the admin AI-DLC releases tab, register the published release. Check its
    unhonoured values: a release with any cannot be promoted, and the list says
    which behavior this build is missing.
-4. Set its support state to `selectable` (or `certified`), then make it
+4. Set its support state to `selectable` (or `certified`, where the profile
+   declares no lower ceiling — 2.11.0 declares `selectable`), then make it
    visible. Each step re-checks the release against this build.
 5. Optionally point a channel at it. `stable` makes it the default for new
    intents; it requires `certified` unless the release is the platform baseline.

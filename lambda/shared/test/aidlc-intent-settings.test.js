@@ -18,6 +18,7 @@ import {
 import { buildFromFiles } from '../block-mappers.js';
 import { buildExecutionPlan } from '../v2-execution-plan.js';
 import { resolveMethodologyLibrary } from '../release-resolver.js';
+import { evaluateGatePreconditions } from '../gate-preconditions.js';
 import { toolsForRole } from '../../agentcore/mcp/server.js';
 import {
   AIDLC_SETTING_KEYS,
@@ -393,6 +394,93 @@ describe('no agent can write a setting', () => {
     ).toEqual([]);
     for (const key of AIDLC_SETTING_KEYS) {
       expect(everyTool).not.toContain(key);
+    }
+  });
+});
+
+// The notice a human reads at a gate that no plan approval preceded. Two cases,
+// and both statements are true for every reachable state: the `scope-default`
+// branch is only emitted when the current scope really defaults off, and the
+// `intent` branch only when the intent really differs from it.
+describe('the gate notice when Plan Approval is off', () => {
+  const noticeFor = (stage) =>
+    evaluateGatePreconditions({
+      stage,
+      policy: stage.policy,
+      producedArtifacts: null,
+    }).findings.find((item) => item.code === 'plan_approval_off') ?? null;
+
+  const planGateStage = (plan) =>
+    plan.stages.find((stage) => stage.policy?.planApproval === 'required') ?? null;
+
+  it('names the scope that turns it off by default, on the stage that lost the gate', async () => {
+    const withGate = planGateStage(await planFor({ scope: 'classic' }));
+    expect(withGate).not.toBeNull();
+
+    const plan = await planFor({ scope: 'express' });
+    const lost = plan.stages.filter((stage) => stage.policy?.planApprovalWithheld);
+
+    expect(lost.map((stage) => stage.stageId)).toEqual([withGate.stageId]);
+    const notice = noticeFor(lost[0]);
+    expect(notice).toMatchObject({
+      code: 'plan_approval_off',
+      severity: 'advisory',
+      title: 'Plan Approval is off for this intent; the build proceeded without a plan approval',
+    });
+    expect(notice.detail).toMatchObject({ source: 'scope-default', scope: 'express' });
+    expect(notice.remediation).toContain('**express** scope turns it off by default');
+    expect(notice.remediation).toContain('no project member changed it');
+    expect(notice.remediation).toContain('never mid-run');
+  });
+
+  it('says the intent turned it off and points at the timeline for who', async () => {
+    const plan = await planFor({
+      scope: 'classic',
+      intentSettings: { planApproval: 'off' },
+    });
+    const lost = plan.stages.filter((stage) => stage.policy?.planApprovalWithheld);
+
+    expect(lost.length).toBe(1);
+    const notice = noticeFor(lost[0]);
+    expect(notice.detail).toMatchObject({ source: 'intent', scope: 'classic' });
+    expect(notice.remediation).toContain('turned off for this intent by a project member');
+    expect(notice.remediation).toContain("**classic** scope's own default leaves it on");
+    expect(notice.remediation).toContain("timeline records which member's save stored it");
+    expect(notice.remediation).toContain('never mid-run');
+  });
+
+  // No name anywhere in the notice or its detail: attribution lives in the
+  // append-only timeline, never in the pinned plan a gate reads.
+  it('names nobody', async () => {
+    const plan = await planFor({ scope: 'classic', intentSettings: { planApproval: 'off' } });
+    const notice = noticeFor(plan.stages.find((stage) => stage.policy?.planApprovalWithheld));
+
+    expect(notice.detail).not.toHaveProperty('actor');
+    expect(JSON.stringify(notice)).not.toMatch(/actor/i);
+  });
+
+  // The notice belongs to the stage that would have asked for the approval. On
+  // every other gate of the run it would be noise about a gate that never
+  // applied there.
+  it('appears on no other stage of the run', async () => {
+    const plan = await planFor({ scope: 'express' });
+    const others = plan.stages.filter((stage) => !stage.policy?.planApprovalWithheld);
+
+    expect(others.length).toBeGreaterThan(0);
+    for (const stage of others) {
+      expect({ stageId: stage.stageId, notice: noticeFor(stage) }).toEqual({
+        stageId: stage.stageId,
+        notice: null,
+      });
+    }
+  });
+
+  it('says nothing on a release that never had the switch', async () => {
+    const plan = await planFor({ scope: 'express', scopes: 'upstream-base' });
+
+    for (const stage of plan.stages) {
+      expect(stage.policy).not.toHaveProperty('planApprovalWithheld');
+      expect(noticeFor(stage)).toBeNull();
     }
   });
 });

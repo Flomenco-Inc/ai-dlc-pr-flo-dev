@@ -36,6 +36,7 @@ const FINDING_CODES = Object.freeze([
   'summary_confirmation_missing',
   'summary_confirmation_stale',
   'plan_approval_missing',
+  'plan_approval_off',
   'ensemble_evidence_unavailable',
   'persona_contribution_missing',
   'pipeline_link_incomplete',
@@ -371,6 +372,39 @@ const evaluateGatePreconditions = ({
         }),
       );
     }
+  } else if (policy.planApprovalWithheld) {
+    // The stage WOULD have asked for a plan approval and did not, because a
+    // setting says so. Advisory by construction: nothing is wrong, but the human
+    // approving this stage is approving work no plan gate preceded, and the
+    // notice has to say WHY so the absence is explicable rather than mysterious.
+    // Only this stage carries it — the plan marks the stage that lost the gate,
+    // not every stage of the run.
+    //
+    // Two cases, and they are exhaustive: a stored value equal to the authored
+    // default is impossible, so `scope-default` is emitted only when the
+    // current scope really does turn the gate off, and `intent` only when the
+    // intent really differs from it. Neither sentence can be made false by a
+    // later scope change. Attribution is deliberately absent from both: a name
+    // frozen into a pinned plan is what made a historical default
+    // misattributable, and the intent timeline is where WHO lives. The timeline
+    // names the member whose SAVE stored the change, which is the chooser in the
+    // normal case and a peer whose autosave carried it otherwise, so the notice
+    // says exactly that rather than promising more than the record holds.
+    const { source, scope } = policy.planApprovalWithheld;
+    const named = scope ? `**${scope}**` : 'selected';
+    const remediation =
+      source === 'intent'
+        ? `Plan Approval was turned off for this intent by a project member before the run started; the ${named} scope's own default leaves it on. The intent timeline records which member's save stored it and when. It can only be changed before a run starts, never mid-run.`
+        : `Plan Approval is off because the pinned AI-DLC release's ${named} scope turns it off by default — no project member changed it. It can only be changed by a project member on the intent before it starts, never mid-run.`;
+    findings.push(
+      finding({
+        code: 'plan_approval_off',
+        severity: 'advisory',
+        title: 'Plan Approval is off for this intent; the build proceeded without a plan approval',
+        detail: { stageInstanceId: stage?.stageInstanceId ?? null, source, scope: scope ?? null },
+        remediation,
+      }),
+    );
   }
 
   // The ensemble's evidence channel could not be read (the receipt history for

@@ -483,6 +483,11 @@ const buildReviewerPrompt = ({
     persona: reviewerPersona,
     knowledge,
     role: 'reviewer',
+    // A reviewer's MCP role carries neither checkpoint tool and no
+    // `ask_question`, so the annex must not advertise either.
+    policy: stage.policy ?? null,
+    checkpointOwner: false,
+    canAsk: false,
   });
 
 const latestReviewerVerdict = async ({ store, executionId, stageInstanceId, reviewerAgent }) => {

@@ -84,11 +84,58 @@ const READ_ONLY_RECORDING_PREAMBLE = [
   '> value it would have produced — applies to you unchanged.',
 ].join('\n');
 
+// `engine log answer` / `engine log decision` are mapped onto an ordinary
+// question and a summary confirmation, and BOTH of those tools are conditional:
+// `confirm_summary` exists only where the resolved policy asks for a summary
+// confirmation, and neither exists in a session that does not own the stage's
+// checkpoint (a dispatched support with no answer path, a reviewer). Advertising
+// them unconditionally is the same policy/annex mismatch already fixed for
+// `learnings: off` in the MCP annex: it tells a session to call a tool that was
+// deliberately never registered for it.
+//
+// The refusals in the row are untouched — the protected checkpoints stay
+// unavailable in every session — and only the substitute changes, so a release's
+// answer is still the same answer everywhere it is deliverable.
+const CHECKPOINT_ANNEX_ROW = /^- `engine log answer …` \/ `engine log decision …`: .*$/m;
+// Whether the bodies in THIS prompt actually invoke the two commands the row
+// maps. A release that never invokes them reads the row as inert prose, so
+// leaving it verbatim is what keeps the prompt of every release before these
+// commands existed byte-for-byte unchanged.
+const CHECKPOINT_LOG_INVOKE = /\{\{INVOKE\}\}\s+engine\s+log\s+(answer|decision)\b/;
+export const invokesCheckpointLog = (...parts) =>
+  parts.some((part) => typeof part === 'string' && CHECKPOINT_LOG_INVOKE.test(part));
+const checkpointRowFor = ({ policy, checkpointOwner, canAsk }) => {
+  const confirms =
+    checkpointOwner &&
+    (policy?.summaryConfirmation === 'required' || policy?.summaryConfirmation === 'if-present');
+  const asks = checkpointOwner && canAsk;
+  if (asks && confirms) return null;
+  const substitute = asks
+    ? "Ask with `ask_question`, which records the human's exact words. There is **no summary confirmation** in this run: no `confirm_summary` tool exists for this session, so do not instruct one — put what you would have confirmed in your output."
+    : "**You cannot raise either checkpoint in this session**: the stage's own session owns them, and neither `ask_question` nor `confirm_summary` is registered here. Say that the checkpoint cannot be raised from this session, record the question or decision you would have put to the human, and defer to the owning session.";
+  return `- \`engine log answer …\` / \`engine log decision …\`: **An ordinary question and a summary confirmation only.** ${substitute} The protected checkpoints are **unavailable**: this runtime mints no plan-approval fingerprint or receipt and holds no approved verification command. For those, say the checkpoint cannot be recorded here, record what you would have asked, and never invent a receipt, an answer id or an approval.`;
+};
+
 // The dialect annex for ONE prompt, in the form the session receiving it can
 // actually perform. `readOnly` is the caller's MCP role, not a release property:
-// the answers are the same, the channel that carries them is not.
-export const invokeDialectAnnex = ({ readOnly = false } = {}) =>
-  readOnly ? `${READ_ONLY_RECORDING_PREAMBLE}\n\n${INVOKE_DIALECT_ANNEX}` : INVOKE_DIALECT_ANNEX;
+// the answers are the same, the channel that carries them is not. `policy`,
+// `checkpointOwner` and `canAsk` are the same three facts `toolsForRole` reads,
+// so the prompt and the tool surface cannot disagree.
+export const invokeDialectAnnex = ({
+  readOnly = false,
+  policy = null,
+  checkpointOwner = !readOnly,
+  canAsk = !readOnly,
+  // Only a prompt whose own bodies invoke `engine log answer` / `log decision`
+  // has its mapping adapted; every other prompt keeps the annex verbatim.
+  checkpointLogInvoked = false,
+} = {}) => {
+  const row = checkpointLogInvoked ? checkpointRowFor({ policy, checkpointOwner, canAsk }) : null;
+  const annex = row
+    ? INVOKE_DIALECT_ANNEX.replace(CHECKPOINT_ANNEX_ROW, row)
+    : INVOKE_DIALECT_ANNEX;
+  return readOnly ? `${READ_ONLY_RECORDING_PREAMBLE}\n\n${annex}` : annex;
+};
 
 // Upstream bodies carry a literal `{{HARNESS_DIR}}` token (substituted only at
 // upstream's own dist build, which we bypass by fetching core/ raw). We neutralize
@@ -412,7 +459,15 @@ export const buildStagePrompt = ({
   // the platform assembles, not authored release content, so it is neutralized
   // above but never gated on.
   if (hasInvokeToken(stageBody, conductor, agentPersona, knowledge)) {
-    sections.push('', INVOKE_DIALECT_ANNEX);
+    // The stage's own session: it owns the checkpoints and can ask, so only the
+    // resolved policy decides whether a summary confirmation exists.
+    sections.push(
+      '',
+      invokeDialectAnnex({
+        policy: stage.policy,
+        checkpointLogInvoked: invokesCheckpointLog(stageBody, conductor, agentPersona, knowledge),
+      }),
+    );
   }
   return sections.join('\n');
 };

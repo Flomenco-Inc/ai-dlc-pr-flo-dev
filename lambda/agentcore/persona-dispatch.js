@@ -23,7 +23,12 @@ import { getDriver } from './cli/drivers.js';
 import { runChild } from './cli/spawn.js';
 import { withOpenCodeStore as defaultWithOpenCodeStore } from './cli/opencode-store.js';
 import { resolveStageModel } from './model-resolver.js';
-import { hasInvokeToken, invokeDialectAnnex, neutralizeTokens } from './stage-materializer.js';
+import {
+  hasInvokeToken,
+  invokeDialectAnnex,
+  invokesCheckpointLog,
+  neutralizeTokens,
+} from './stage-materializer.js';
 
 // Package-manager caches use container-local /tmp; the working tree stays on the
 // session mount so cache growth cannot consume space needed for durable changes.
@@ -57,7 +62,17 @@ const roleLabel = (role) => role.charAt(0).toUpperCase() + role.slice(1);
 // must carry its answer too, or the promotion guard would have marked that
 // command answered in a session that never saw the answer
 // (`shared/annex-reach.js`). The annex's form follows this role's MCP surface.
-export const composePersonaPrompt = ({ brief, persona, knowledge, role }) =>
+export const composePersonaPrompt = ({
+  brief,
+  persona,
+  knowledge,
+  role,
+  // The same three facts the MCP session is built from, so the annex advertises
+  // only the checkpoint tools this persona actually has.
+  policy = null,
+  checkpointOwner = true,
+  canAsk = true,
+}) =>
   [
     brief,
     '',
@@ -65,7 +80,16 @@ export const composePersonaPrompt = ({ brief, persona, knowledge, role }) =>
     neutralizeTokens(persona) || `(no ${role} persona supplied)`,
     knowledge ? `\n## Reference knowledge\n${neutralizeTokens(knowledge)}` : '',
     ...(hasInvokeToken(persona, knowledge)
-      ? ['', invokeDialectAnnex({ readOnly: mcpRoleFor(role) === 'reviewer' })]
+      ? [
+          '',
+          invokeDialectAnnex({
+            readOnly: mcpRoleFor(role) === 'reviewer',
+            policy,
+            checkpointOwner,
+            canAsk,
+            checkpointLogInvoked: invokesCheckpointLog(persona, knowledge),
+          }),
+        ]
       : []),
   ].join('\n');
 
@@ -148,7 +172,15 @@ export const dispatchPersona = async ({
       ...(canAsk === false ? { canAsk: false } : {}),
       model,
     };
-    const prompt = composePersonaPrompt({ brief, persona, knowledge, role });
+    const prompt = composePersonaPrompt({
+      brief,
+      persona,
+      knowledge,
+      role,
+      policy,
+      checkpointOwner,
+      canAsk,
+    });
     const mcpKwargs =
       cli === 'kiro'
         ? {

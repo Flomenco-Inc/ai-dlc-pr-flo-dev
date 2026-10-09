@@ -435,6 +435,88 @@ describe('composePersonaPrompt — the dialect annex in a secondary session', ()
     }
   });
 
+  // `engine log answer` / `engine log decision` are mapped onto `ask_question`
+  // and `confirm_summary`, and tool registration withholds BOTH from a session
+  // that does not own the stage's checkpoint and withholds `confirm_summary`
+  // wherever the policy asks for no summary confirmation. Advertising them
+  // regardless told a session to call a tool it was deliberately never
+  // registered for — the same mismatch already fixed for `learnings: off`.
+  describe('the checkpoint mapping follows the session that receives it', () => {
+    const CHECKPOINT_KNOWLEDGE = 'Log the answer: `{{INVOKE}} engine log answer --question q`.';
+    const VERBATIM_ROW = 'Ask with `ask_question`, confirm with `confirm_summary`';
+
+    const promptFor = (overrides) =>
+      composePersonaPrompt({
+        brief: 'b',
+        persona: 'p',
+        knowledge: CHECKPOINT_KNOWLEDGE,
+        role: 'support',
+        ...overrides,
+      });
+
+    it('keeps the mapping verbatim for the session that has both tools', () => {
+      const prompt = promptFor({ policy: { summaryConfirmation: 'required' } });
+
+      expect(prompt).toContain(VERBATIM_ROW);
+    });
+
+    it('withdraws the confirmation where the policy asks for none', () => {
+      const prompt = promptFor({ policy: { summaryConfirmation: 'none' } });
+
+      expect(prompt).not.toContain(VERBATIM_ROW);
+      expect(prompt).toContain('no `confirm_summary` tool exists for this session');
+      expect(prompt).toContain('Ask with `ask_question`');
+      // The refusal half of the row is untouched in every form.
+      expect(prompt).toContain('The protected checkpoints are **unavailable**');
+    });
+
+    it('defers to the owning session for a support that cannot ask', () => {
+      for (const overrides of [
+        { policy: { summaryConfirmation: 'required' }, canAsk: false },
+        { policy: { summaryConfirmation: 'required' }, checkpointOwner: false },
+      ]) {
+        const prompt = promptFor(overrides);
+
+        expect(prompt).not.toContain(VERBATIM_ROW);
+        expect(prompt).toContain('cannot raise either checkpoint in this session');
+        expect(prompt).toContain('defer to the owning session');
+      }
+    });
+
+    it('defers for the reviewer, which has neither tool', () => {
+      const prompt = composePersonaPrompt({
+        brief: 'b',
+        persona: 'p',
+        knowledge: CHECKPOINT_KNOWLEDGE,
+        role: 'reviewer',
+        policy: { summaryConfirmation: 'required' },
+        checkpointOwner: false,
+        canAsk: false,
+      });
+
+      expect(prompt).toContain('**You are a read-only session.**');
+      expect(prompt).not.toContain(VERBATIM_ROW);
+      expect(prompt).toContain('cannot raise either checkpoint in this session');
+    });
+
+    // And a release that never invokes these commands reads the row as inert
+    // prose, so its prompt keeps the annex verbatim — which is what leaves every
+    // older pinned release's prompt byte-for-byte unchanged.
+    it('leaves the annex verbatim for a release that invokes neither command', () => {
+      const prompt = composePersonaPrompt({
+        brief: 'b',
+        persona: 'p',
+        knowledge: INSTRUCTING,
+        role: 'support',
+        policy: { summaryConfirmation: 'none' },
+        canAsk: false,
+        checkpointOwner: false,
+      });
+
+      expect(prompt).toContain(INVOKE_DIALECT_ANNEX);
+    });
+  });
+
   it('answers it in the real reviewer prompt the runtime builds', () => {
     const prompt = runStageInternals.buildReviewerPrompt({
       stage: {

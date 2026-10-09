@@ -26,11 +26,16 @@ import {
 } from '../block-loader.js';
 import { buildExecutionPlan } from '../../shared/v2-execution-plan.js';
 import {
+  authoredScopeSettings,
   buildGroundingPack,
   COMPOSER_AGENT_ID,
   parseComposeProposal,
-  PROPOSAL_CONTRACT,
+  proposalContract,
 } from '../../shared/compose-match.js';
+import {
+  effectiveAidlcSettingRows,
+  scopeAidlcSettings,
+} from '../../shared/intent-aidlc-settings.js';
 import { resolveCliSelection } from './discussion-assist-start.js';
 import { closeGraphSource } from '../mcp/graph-writer.js';
 import { hasInvokeToken, INVOKE_DIALECT_ANNEX, neutralizeTokens } from '../stage-materializer.js';
@@ -67,16 +72,19 @@ const buildScopeGrounding = ({ workflow, library, scopeBlocks }) => {
   const scopes = scopeBlocks.filter((s) => offered.has(s.id ?? s.blockId));
   const summaries = {};
   const grids = {};
+  const scopeSettings = {};
   for (const scope of scopes) {
     const id = scope.id ?? scope.blockId;
     const { valid, plan } = buildExecutionPlan({ workflow, scope: id, library });
     if (valid && plan) summaries[id] = plan.summary;
     grids[id] = scopeGridFor(workflow, id);
+    const authored = authoredScopeSettings(scope);
+    if (Object.keys(authored).length > 0) scopeSettings[id] = authored;
   }
   const stages = (workflow.placements ?? [])
     .map((p) => library.stagesById[p.stageId])
     .filter(Boolean);
-  return { scopes, summaries, grids, stages, offeredScopeIds: [...offered] };
+  return { scopes, summaries, grids, stages, scopeSettings, offeredScopeIds: [...offered] };
 };
 
 // Validate a parsed proposal through the plan resolver — the ONLY authority.
@@ -165,7 +173,14 @@ const buildComposePrompt = ({
   repoSignals,
   reportExcerpt,
   progressContext,
+  // Whether the PINNED CATALOG authors the per-intent AI-DLC settings at all.
+  // Gating the richer output contract on the catalog — never on a version
+  // string — is what keeps the whole compose prompt of an unpinned, 2.3.3,
+  // 2.8.2 or 2.9.0 intent byte-identical: a release that authors no setting is
+  // asked for none and its prompt is the one it was before.
+  settingsAware = false,
 }) => {
+  const contract = proposalContract({ settingsAware });
   const head = [
     neutralizeTokens(
       persona ||
@@ -188,18 +203,18 @@ const buildComposePrompt = ({
   ]
     .filter(Boolean)
     .map(String);
-  const whole = [...head, ...tail, PROPOSAL_CONTRACT].join('\n\n');
+  const whole = [...head, ...tail, contract].join('\n\n');
   if (whole.length <= CONTEXT_LIMIT) return whole;
   // The output contract is appended whole after the cut. If the rest still does
   // not fit once the persona and knowledge are gone, its end (the grounding) is
   // cut too; the mode task comes first in it, so it stays.
-  const budget = CONTEXT_LIMIT - PROPOSAL_CONTRACT.length - 2;
+  const budget = CONTEXT_LIMIT - contract.length - 2;
   const rest = tail.join('\n\n');
   const room = Math.max(0, budget - rest.length - COMPOSER_PERSONA_TRUNCATED.length - 3);
   const body = [`${head.join('\n\n').slice(0, room)}\n${COMPOSER_PERSONA_TRUNCATED}`, rest]
     .join('\n\n')
     .slice(0, budget);
-  return `${body}\n\n${PROPOSAL_CONTRACT}`;
+  return `${body}\n\n${contract}`;
 };
 
 export const createComposePlanStart = ({
@@ -232,6 +247,16 @@ export const createComposePlanStart = ({
       // methodology the intent will actually run.
       methodologyRelease = null,
       methodologyPins = null,
+      // The per-intent AI-DLC settings this intent already runs with. The
+      // composer must see them to propose a VALID change, and seeing them here
+      // is what lets the annex forbid it hunting for them on disk.
+      aidlcSettings = null,
+      // The scope whose own settings the intent currently runs with: its base
+      // scope when the selection is a composed grid, its scope otherwise. The
+      // effective settings are that scope's values with the recorded overrides
+      // on top, so the composer is grounded in what the run WOULD do rather
+      // than in the subset a member happened to change.
+      policyScope = null,
       prompt = '',
       instructions = '',
       repoSignals = null,
@@ -307,12 +332,29 @@ export const createComposePlanStart = ({
         const scopeBlocks = methodologyRelease
           ? await listReleaseBlocksFn('SCOPE', methodologyRelease, methodologyPins)
           : await listMergedBlocksFn('SCOPE').catch(() => []);
-        const { scopes, summaries, grids, stages, offeredScopeIds } = buildScopeGrounding({
-          workflow,
-          library,
-          scopeBlocks,
+        const { scopes, summaries, grids, stages, scopeSettings, offeredScopeIds } =
+          buildScopeGrounding({ workflow, library, scopeBlocks });
+        // The per-intent settings exist only for a release that authors at least
+        // one of them. Gating the settings grounding AND the richer output
+        // contract on the CATALOG — never on a version string — is what keeps
+        // the compose prompt of every older pinned release byte-for-byte what
+        // it was.
+        const settingsAware = scopes.some(
+          (scope) => Object.keys(scopeAidlcSettings(scope)).length > 0,
+        );
+        const settingsScopeBlock =
+          scopes.find((scope) => (scope.id ?? scope.blockId) === policyScope) ?? null;
+        const grounding = buildGroundingPack({
+          scopes,
+          summaries,
+          grids,
+          stages,
+          scopeSettings,
+          settingsScopeId: settingsAware ? (policyScope ?? null) : null,
+          effectiveSettings: settingsAware
+            ? effectiveAidlcSettingRows(aidlcSettings, scopeAidlcSettings(settingsScopeBlock))
+            : [],
         });
-        const grounding = buildGroundingPack({ scopes, summaries, grids, stages });
 
         // Composer persona + methodology knowledge from the block library
         // (fork-shadowing applies — a user's edited composer is honoured).
@@ -336,6 +378,7 @@ export const createComposePlanStart = ({
           repoSignals,
           reportExcerpt,
           progressContext,
+          settingsAware,
         });
 
         g = await openGraph();

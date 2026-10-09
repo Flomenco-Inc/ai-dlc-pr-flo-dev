@@ -324,6 +324,13 @@ const runtimeSessionIdFor = (intentId) => `aidlc-intent-${intentId}`.padEnd(33, 
 // stateless, so a fresh microVM (on the CURRENT image) per request is exactly
 // right; see the compose dispatch below for the field incident this avoids.
 const composeSessionIdFor = (composeId) => `aidlc-compose-${composeId}`.padEnd(33, '0');
+
+// The stock scope a compose should be grounded in: the recorded base of a
+// composed grid, or the scope of a selection that names one directly. A
+// customization with NO recorded base has none — its `scope` is a display label
+// that names no SCOPE block, so grounding the composer in it would describe a
+// scope that does not exist and invite a proposal the draft write then refuses.
+const composePolicyScope = (meta) => meta.policyScope ?? (meta.composedGrid ? null : meta.scope);
 // Unit-lane session ids — must mirror v2-orchestrator/section.js laneSessionIdFor.
 const laneSessionIdFor = (intentId, sectionIndex, slug) =>
   `aidlc-intent-${intentId}-s${sectionIndex}-${slug}`.padEnd(33, '0');
@@ -3834,6 +3841,12 @@ export const handler = async (event, context) => {
                 ...(frozenGrid && Object.keys(frozenGrid).length ? { frozenGrid } : {}),
                 ...(progressContext ? { progressContext } : {}),
                 ...(meta.methodologyRelease ? { methodologyRelease: meta.methodologyRelease } : {}),
+                // The settings this intent already runs with, and the scope
+                // whose own values they override. The composer is grounded in
+                // the EFFECTIVE values rather than the subset a member changed,
+                // which is what lets the annex forbid it reading them off disk.
+                ...(meta.aidlcSettings ? { aidlcSettings: meta.aidlcSettings } : {}),
+                ...(composePolicyScope(meta) ? { policyScope: composePolicyScope(meta) } : {}),
                 ...(meta.methodologyRelease && meta.methodologyPins
                   ? { methodologyPins: meta.methodologyPins }
                   : {}),

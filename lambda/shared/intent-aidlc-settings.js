@@ -192,13 +192,73 @@ const describeAidlcSettingsChange = ({
   return lines;
 };
 
+// The EFFECTIVE settings as prompt rows: the authored field name the
+// methodology itself uses, the value in force, and whether that value is the
+// scope's own or an override recorded for this intent. This is the honest half
+// of upstream's `engine config get` — the composer reads the effective settings
+// out of its prompt, and the dialect annex forbids it looking for them in a
+// settings or environment file, which upstream warns can hold credentials.
+//
+// Effective means the SELECTED SCOPE's own value with any override on top, which
+// is what the run resolves. Rendering only the overrides made the section a list
+// of deltas while calling itself the whole truth: an intent that changed one
+// setting showed that one and hid the rest, and an intent that changed none
+// produced no section at all — leaving the composer to conclude the release has
+// no such settings.
+const effectiveAidlcSettingRows = (settings, authored = null) => {
+  const rows = [];
+  for (const key of AIDLC_SETTING_KEYS) {
+    const override = settings?.[key];
+    const value = override ?? authored?.[key];
+    if (value == null) continue;
+    rows.push({
+      name: aidlcSettingField(key),
+      value: String(value),
+      source: override == null ? 'scope default' : 'changed for this intent',
+    });
+  }
+  return rows;
+};
+
+// The per-intent settings a composer proposal proposes, mapped onto the keys a
+// human may actually choose here. Guard Policy and two of the six ceremony
+// settings have a per-intent surface; the rest are reported to the member
+// instead (`composeSettingsWithoutIntentSurface`) rather than being dropped, so
+// a proposal is never silently thinner than what the composer sent.
+const COMPOSE_PROPOSAL_SETTING_SOURCES = Object.freeze({
+  planApproval: 'plan_approval',
+  collaborators: 'collaborators',
+});
+
+const aidlcSettingsFromComposeProposal = (proposal) => {
+  const proposed = {};
+  if (!proposal) return proposed;
+  if (proposal.guardPolicy != null) proposed.guardPolicy = proposal.guardPolicy;
+  for (const [key, authoredName] of Object.entries(COMPOSE_PROPOSAL_SETTING_SOURCES)) {
+    const value = proposal.scopeSettings?.[authoredName];
+    if (value != null) proposed[key] = value;
+  }
+  return proposed;
+};
+
+// The settings a proposal carries that this platform does not make per-intent:
+// they stay visible on the proposal for the member to read and keep following
+// the scope. Named, never dropped.
+const composeSettingsWithoutIntentSurface = (proposal) =>
+  Object.entries(proposal?.scopeSettings ?? {})
+    .filter(([key]) => !Object.values(COMPOSE_PROPOSAL_SETTING_SOURCES).includes(key))
+    .map(([key, value]) => ({ name: key, value: String(value) }));
+
 export {
   AIDLC_SETTING_CAPABILITIES,
   AIDLC_SETTING_KEYS,
   aidlcSettingField,
   aidlcSettingType,
   aidlcSettingValues,
+  aidlcSettingsFromComposeProposal,
+  composeSettingsWithoutIntentSurface,
   describeAidlcSettingsChange,
+  effectiveAidlcSettingRows,
   normalizeAidlcSettings,
   scopeAidlcSettings,
 };

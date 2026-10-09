@@ -593,3 +593,88 @@ describe('compose-plan-start', () => {
     await waitForFinish(deps.store);
   });
 });
+
+// The compatibility property the gating exists for, asserted on the REAL compose
+// job rather than on the contract string: a release whose scopes author no
+// per-intent setting is asked for none and grounded in none, so its whole
+// compose prompt is the one it was before this PR. A release that authors them
+// gets both, and the effective values it is grounded in name nobody.
+describe('compose-plan-start — the settings proposal is gated on the catalog', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const settingsScopeBlocks = [
+    { id: 'feature', keywords: ['feature'], description: 'Full flow', guardPolicy: 'off' },
+    {
+      id: 'bugfix',
+      keywords: ['hotfix'],
+      description: 'Fix and ship',
+      guardPolicy: 'off',
+      planApproval: 'on',
+      collaborators: 'off',
+    },
+  ];
+
+  const promptFor = async ({ blocks, payload = {} }) => {
+    const deps = makeDeps({
+      oneShotText:
+        '```json\n{"mode":"matched","scope":"bugfix","rationale":["fits"],"confidence":0.8}\n```',
+    });
+    deps.listMergedBlocksFn = vi.fn(async (type) => (type === 'SCOPE' ? blocks : []));
+    const start = createComposePlanStart(deps);
+    await start({ ...basePayload, ...payload });
+    await waitForFinish(deps.store);
+    return deps.oneShot.mock.calls[0][0].prompt;
+  };
+
+  it('asks a release without the settings for none of them', async () => {
+    const prompt = await promptFor({ blocks: scopeBlocks });
+
+    expect(prompt).toContain(PROPOSAL_CONTRACT);
+    expect(prompt).not.toContain('"guardPolicy"');
+    expect(prompt).not.toContain('"scopeSettings"');
+    expect(prompt).not.toContain('Do NOT return "settingsChanges"');
+    expect(prompt).not.toContain('AI-DLC settings in force for this intent');
+    expect(prompt).not.toContain('Settings:');
+  });
+
+  it('asks a settings-bearing release for them and grounds it in the effective values', async () => {
+    const prompt = await promptFor({
+      blocks: settingsScopeBlocks,
+      payload: {
+        policyScope: 'bugfix',
+        aidlcSettings: { guardPolicy: 'strict' },
+      },
+    });
+
+    expect(prompt).toContain('"scopeSettings"');
+    expect(prompt).toContain('Do NOT return "settingsChanges"');
+    expect(prompt).toContain('## AI-DLC settings in force for this intent');
+    expect(prompt).toContain('Resolved for the selected scope "bugfix".');
+    expect(prompt).toContain('- guard_policy: strict (changed for this intent)');
+    expect(prompt).toContain('- plan_approval: on (scope default)');
+    expect(prompt).toContain('- collaborators: off (scope default)');
+    expect(prompt).not.toMatch(/chosen by/i);
+  });
+
+  // An intent that changed nothing still gets the whole section: rendering only
+  // the overrides left the composer to conclude the release has no settings.
+  it('grounds an intent that changed nothing in every authored value', async () => {
+    const prompt = await promptFor({
+      blocks: settingsScopeBlocks,
+      payload: { policyScope: 'bugfix' },
+    });
+
+    expect(prompt).toContain('## AI-DLC settings in force for this intent');
+    expect(prompt).toContain('- guard_policy: off (scope default)');
+    expect(prompt).toContain('- plan_approval: on (scope default)');
+  });
+
+  // No selected settings scope: the section is withheld rather than guessed,
+  // and the annex tells the composer to say the values are unavailable here.
+  it('withholds the section when no settings scope is in force', async () => {
+    const prompt = await promptFor({ blocks: settingsScopeBlocks });
+
+    expect(prompt).toContain('"scopeSettings"');
+    expect(prompt).not.toContain('AI-DLC settings in force for this intent');
+  });
+});

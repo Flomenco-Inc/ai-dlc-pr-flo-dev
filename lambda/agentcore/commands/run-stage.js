@@ -4610,9 +4610,11 @@ const runStageAttempt = async (
       spawnFn,
       store,
       publish,
-      // Release mode only, like the plane split below: an unpinned run reads no
-      // stage deadline, so its sensor argv and timeouts stay what they were.
-      ...(methodologyRelease ? { remainingStageMs: () => stageDeadlineMs - nowMs() } : {}),
+      // Budget enforcement follows authored release policy, like repair turns.
+      // Policy-free catalogs (including 2.3.3) keep their legacy sensor budget.
+      ...(methodologyRelease && stage.policy
+        ? { remainingStageMs: () => stageDeadlineMs - nowMs() }
+        : {}),
       ...postAgentSensorPass({ methodologyRelease, attemptChangedFiles }),
     }).catch(() => null);
     if (writePlane?.held) {
@@ -4865,7 +4867,7 @@ const runStageAttempt = async (
         store,
         publish,
         planes: ['gate'],
-        remainingStageMs: () => stageDeadlineMs - nowMs(),
+        ...(stage.policy ? { remainingStageMs: () => stageDeadlineMs - nowMs() } : {}),
       });
     } catch (error) {
       gatePlaneError = error?.message ?? String(error);

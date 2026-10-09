@@ -76,6 +76,8 @@ const draftState: Record<string, unknown> = {};
 const setSkipStageIds = vi.fn();
 const setScope = vi.fn();
 const setComposedGrid = vi.fn();
+const setAidlcSetting = vi.fn();
+const pruneAidlcSettings = vi.fn((..._a: unknown[]) => [] as string[]);
 const flushDraft = vi.fn();
 vi.mock('@/hooks/useCollaborativeIntentDraft', () => ({
   useCollaborativeIntentDraft: () => ({
@@ -84,6 +86,7 @@ vi.mock('@/hooks/useCollaborativeIntentDraft', () => ({
     scope: (draftState.scope as string) ?? null,
     composedGrid: (draftState.composedGrid as Record<string, 'EXECUTE' | 'SKIP'>) ?? null,
     skipStageIds: (draftState.skipStageIds as string[]) ?? null,
+    aidlcSettings: (draftState.aidlcSettings as Record<string, string | boolean>) ?? null,
     synced: true,
     hydrated: (draftState.hydrated as boolean) ?? true,
     remoteUsers: new Map(),
@@ -94,6 +97,9 @@ vi.mock('@/hooks/useCollaborativeIntentDraft', () => ({
     setScope: (...a: unknown[]) => setScope(...a),
     setComposedGrid: (...a: unknown[]) => setComposedGrid(...a),
     setSkipStageIds: (...a: unknown[]) => setSkipStageIds(...a),
+    setAidlcSetting: (...a: unknown[]) => setAidlcSetting(...a),
+    setAidlcSettings: vi.fn(),
+    pruneAidlcSettings: (...a: unknown[]) => pruneAidlcSettings(...a),
     flushDraft: (...a: unknown[]) => flushDraft(...a),
   }),
 }));
@@ -615,6 +621,149 @@ describe('IntentComposePage', () => {
 // that resolution fails (the release was demoted, or is no longer offered), the
 // page must say so rather than quietly rendering the LIVE methodology — a preview
 // of stages and scopes this intent will never execute.
+// The per-intent AI-DLC settings on the real page: offered only for what the
+// previewed scope authors, written straight into the shared draft selection, and
+// pruned — with the withdrawal named — when the selection stops offering one.
+describe('IntentComposePage — the per-intent AI-DLC settings', () => {
+  beforeEach(() => {
+    for (const k of Object.keys(draftState)) delete draftState[k];
+    draftState.prompt = 'Build X';
+    draftState.scope = 'feature';
+    get.mockReset().mockResolvedValue(draftIntent());
+    start.mockReset().mockResolvedValue({});
+    update.mockReset().mockResolvedValue({});
+    listComposes.mockReset().mockResolvedValue({ composes: [] });
+    attachments.mockReset().mockResolvedValue({ attachments: [], attachmentRevision: 0 });
+    getProjectCapabilities.mockReset().mockResolvedValue({ available: ['kiro'], runtimeClis: [] });
+    flushDraft.mockReset().mockResolvedValue(undefined);
+    reloadIntent.mockReset().mockResolvedValue(undefined);
+    setAssistAgentCli.mockReset();
+    setAidlcSetting.mockReset();
+    pruneAidlcSettings.mockReset().mockReturnValue([]);
+    compose.mockReset().mockResolvedValue({ composeId: 'c1', state: 'PENDING', mode: 'front' });
+    composeReportUpload.mockReset();
+    compiled.mockReset().mockResolvedValue({
+      scopeGrid: { feature: { init: 'EXECUTE' } },
+      autonomy: { perStage: {}, rollup: { selfHalting: 0, mixed: 0, humanGated: 0, total: 0 } },
+      graph: {
+        nodes: [{ stageId: 'init', phasePath: '01', order: 0 }],
+        edges: [],
+        cycles: [],
+        danglingConsumes: [],
+        orphanProduces: [],
+        unknownArtifacts: [],
+        acyclic: true,
+      },
+      rules: { universal: [], phaseRules: {}, pairings: [], perStage: {}, unresolved: [] },
+      stages: { init: { id: 'init', phase: 'inception' } },
+    });
+    getWorkflow.mockReset().mockResolvedValue({
+      phases: [
+        {
+          phaseId: 'initialization',
+          name: 'Initialization',
+          kind: 'phase',
+          path: '01',
+          parentPath: null,
+          order: 0,
+        },
+      ],
+    });
+    validateGrid.mockReset();
+    useProjectCache.mockReset();
+    useProjectCache.mockReturnValue({ project: baseProject(), loading: false });
+    window.HTMLElement.prototype.hasPointerCapture = vi.fn().mockReturnValue(false);
+    window.HTMLElement.prototype.setPointerCapture = vi.fn();
+    window.HTMLElement.prototype.releasePointerCapture = vi.fn();
+    window.HTMLElement.prototype.scrollIntoView = vi.fn();
+  });
+
+  const SUMMARY = {
+    executedStages: 24,
+    totalStages: 32,
+    approvalGates: 18,
+    perUnitStages: 5,
+    skippedStages: 0,
+    outOfScopeStages: 8,
+  };
+
+  const withAuthored = (authored: Record<string, string | boolean> | null) =>
+    executionPreview.mockReset().mockResolvedValue({
+      valid: true,
+      errors: [],
+      summary: SUMMARY,
+      plan: { stages: [], summary: SUMMARY, aidlcSettingsAuthored: authored },
+    });
+
+  it('stays hidden for a release that authors no setting', async () => {
+    withAuthored(null);
+
+    renderPage();
+
+    await screen.findByTestId('scope-summary');
+    expect(screen.queryByTestId('aidlc-settings')).not.toBeInTheDocument();
+  });
+
+  it('offers the settings the previewed scope authors', async () => {
+    withAuthored({ guardPolicy: 'off', planApproval: 'on' });
+
+    renderPage();
+
+    await screen.findByTestId('aidlc-settings');
+    expect(screen.getByRole('combobox', { name: 'Guard Policy' })).toHaveTextContent('Off');
+    expect(screen.queryByRole('combobox', { name: 'Project type' })).toBeNull();
+  });
+
+  // A pick is a change to the shared draft selection, nothing else: no request
+  // of its own, so there is no second operation Start has to wait for.
+  it('writes a pick into the shared selection with no request of its own', async () => {
+    withAuthored({ guardPolicy: 'off' });
+    const user = userEvent.setup();
+
+    renderPage();
+    await screen.findByTestId('aidlc-settings');
+    await user.click(screen.getByRole('combobox', { name: 'Guard Policy' }));
+    await user.click(screen.getByRole('option', { name: 'Strict' }));
+
+    expect(setAidlcSetting).toHaveBeenCalledWith('guardPolicy', 'strict');
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('shows a chosen override against the scope default', async () => {
+    withAuthored({ guardPolicy: 'off' });
+    draftState.aidlcSettings = { guardPolicy: 'strict' };
+
+    renderPage();
+
+    await screen.findByTestId('aidlc-settings');
+    expect(screen.getByTestId('aidlc-setting-source-guardPolicy')).toHaveTextContent(
+      'Changed for this intent (scope default: Off)',
+    );
+  });
+
+  // The selection decides which settings exist, so the page prunes against the
+  // authored map of the selection now in force and names what it withdrew.
+  it('prunes against the previewed selection and names what it withdrew', async () => {
+    withAuthored({ guardPolicy: 'off', planApproval: 'on' });
+    pruneAidlcSettings.mockReturnValue(['existingCode']);
+
+    renderPage();
+
+    const notice = await screen.findByTestId('aidlc-settings-dropped');
+    expect(notice).toHaveTextContent('Project type');
+    expect(pruneAidlcSettings).toHaveBeenCalledWith({ guardPolicy: 'off', planApproval: 'on' });
+  });
+
+  it('says nothing when the selection withdrew no setting', async () => {
+    withAuthored({ guardPolicy: 'off' });
+
+    renderPage();
+
+    await screen.findByTestId('aidlc-settings');
+    expect(screen.queryByTestId('aidlc-settings-dropped')).not.toBeInTheDocument();
+  });
+});
+
 describe('IntentComposePage — a pinned release that no longer resolves', () => {
   beforeEach(() => {
     for (const k of Object.keys(draftState)) delete draftState[k];

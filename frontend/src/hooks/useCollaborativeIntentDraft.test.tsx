@@ -1,0 +1,324 @@
+// The collaborative slice of a DRAFT intent, with TWO real Yjs documents.
+//
+// A single member editing in sequence proves nothing about a CRDT: the whole
+// question is what two members do to each other's work. These tests drive the
+// real hook twice over two real documents and exchange their updates by hand,
+// which is the in-process equivalent of the WebSocket provider.
+//
+// The AI-DLC settings are the interesting case. They are ORDINARY SELECTION
+// STATE: a top-level `Y.Map` with one entry per setting, merged per key, saved
+// by the existing debounced PATCH in the same payload as the scope, and flushed
+// by the existing Start barrier. Nothing is published back from the server, so
+// the interleavings below are the same ones `scope` already has.
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { renderHook, act, cleanup } from '@testing-library/react';
+import { useEffect, useState } from 'react';
+import * as Y from 'yjs';
+
+const transport = vi.hoisted(() => ({
+  peers: new Map<string, { doc: Y.Doc; flushDocument: ReturnType<typeof vi.fn> }>(),
+}));
+const api = vi.hoisted(() => ({
+  update: vi.fn(),
+  draftEditState: vi.fn(),
+}));
+
+vi.mock('../services/intents', () => ({ intentsService: api }));
+vi.mock('./useYjsDocument', () => ({
+  useYjsDocument: (_id: string, name: string) => {
+    const peer = transport.peers.get(name)!;
+    const [localRevision, setRevision] = useState(0);
+    useEffect(() => {
+      const changed = (_update: Uint8Array, _origin: unknown, _doc: Y.Doc, tx: Y.Transaction) => {
+        if (tx.local) setRevision((n) => n + 1);
+      };
+      peer.doc.on('update', changed);
+      return () => peer.doc.off('update', changed);
+    }, [peer]);
+    return { ...peer, synced: true, localRevision, remoteUsers: new Map(), setCursor: vi.fn() };
+  },
+}));
+
+import { useCollaborativeIntentDraft } from './useCollaborativeIntentDraft';
+
+const member = (name: string) => {
+  const peer = { doc: new Y.Doc(), flushDocument: vi.fn().mockResolvedValue(undefined) };
+  transport.peers.set(name, peer);
+  return { ...renderHook(() => useCollaborativeIntentDraft('p1', 'i1', name)), doc: peer.doc };
+};
+
+const sync = (a: Y.Doc, b: Y.Doc) => {
+  const fromA = Y.encodeStateAsUpdate(a);
+  const fromB = Y.encodeStateAsUpdate(b);
+  Y.applyUpdate(a, fromB, 'remote');
+  Y.applyUpdate(b, fromA, 'remote');
+};
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const intent = (extra = {}) =>
+  ({
+    id: 'i1',
+    title: 'An intent',
+    prompt: 'Build X',
+    scope: 'classic',
+    draftRevision: 7,
+    ...extra,
+  }) as any;
+
+const CLASSIC_AUTHORED = { guardPolicy: 'off', planApproval: 'on', collaborators: 'off' };
+
+beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  api.update.mockReset().mockResolvedValue(intent({ draftRevision: 8 }));
+  api.draftEditState.mockReset().mockResolvedValue({ draftRevision: 7 });
+});
+afterEach(() => {
+  vi.useRealTimers();
+  cleanup();
+  transport.peers.clear();
+});
+
+const bothSeeded = (extra = {}) => {
+  const a = member('Alice');
+  const b = member('Bob');
+  act(() => {
+    a.result.current.initFromIntent(intent(extra));
+    b.result.current.initFromIntent(intent(extra));
+    sync(a.doc, b.doc);
+  });
+  return { a, b };
+};
+
+describe('useCollaborativeIntentDraft — choosing an AI-DLC setting', () => {
+  it('is a local synchronous change both members see', () => {
+    const { a, b } = bothSeeded();
+
+    act(() => {
+      a.result.current.setAidlcSetting('guardPolicy', 'strict');
+    });
+    expect(a.result.current.aidlcSettings).toEqual({ guardPolicy: 'strict' });
+
+    act(() => sync(a.doc, b.doc));
+    expect(b.result.current.aidlcSettings).toEqual({ guardPolicy: 'strict' });
+  });
+
+  it('follows the scope default again when the entry is cleared', () => {
+    const { a } = bothSeeded();
+
+    act(() => {
+      a.result.current.setAidlcSetting('guardPolicy', 'strict');
+      a.result.current.setAidlcSetting('guardPolicy', null);
+    });
+
+    expect(a.result.current.aidlcSettings).toBeNull();
+  });
+
+  // The map merges per KEY, so two members changing different settings
+  // concurrently both survive with no revision bookkeeping anywhere.
+  it('keeps both members’ choices when they change different settings', () => {
+    const { a, b } = bothSeeded();
+
+    act(() => {
+      a.result.current.setAidlcSetting('guardPolicy', 'strict');
+      b.result.current.setAidlcSetting('collaborators', 'on');
+    });
+    act(() => sync(a.doc, b.doc));
+
+    const expected = { guardPolicy: 'strict', collaborators: 'on' };
+    expect(a.result.current.aidlcSettings).toEqual(expected);
+    expect(b.result.current.aidlcSettings).toEqual(expected);
+  });
+
+  // The SAME setting is last-writer-wins, identical to two members changing the
+  // scope, and the two documents converge on one answer. Whichever CRDT order
+  // wins, both pages agree — which is the property that matters, and the one
+  // the server-answer design could not provide.
+  it('converges on one value when both change the same setting', () => {
+    const { a, b } = bothSeeded();
+
+    act(() => {
+      a.result.current.setAidlcSetting('guardPolicy', 'strict');
+      b.result.current.setAidlcSetting('guardPolicy', 'relaxed');
+    });
+    act(() => sync(a.doc, b.doc));
+
+    expect(a.result.current.aidlcSettings).toEqual(b.result.current.aidlcSettings);
+    expect(['strict', 'relaxed']).toContain(a.result.current.aidlcSettings!.guardPolicy);
+  });
+});
+
+describe('useCollaborativeIntentDraft — persisting the AI-DLC settings', () => {
+  it('sends them in the same payload as the selection', async () => {
+    const { a } = bothSeeded();
+
+    act(() => {
+      a.result.current.setAidlcSetting('guardPolicy', 'strict');
+    });
+    await act(async () => {
+      await a.result.current.flushDraft();
+    });
+
+    expect(api.update).toHaveBeenCalledTimes(1);
+    expect(api.update.mock.calls[0][2]).toMatchObject({
+      scope: 'classic',
+      composedGrid: null,
+      aidlcSettings: { guardPolicy: 'strict' },
+      ifDraftRevision: 7,
+    });
+  });
+
+  // There is no second in-flight operation for Start to await, so a choice made
+  // one tick before Start is in the payload the existing barrier flushes.
+  it('persists a setting chosen one tick before Start', async () => {
+    const { a } = bothSeeded();
+
+    let flushed: Promise<unknown> | null = null;
+    act(() => {
+      a.result.current.setAidlcSetting('planApproval', 'off');
+      flushed = a.result.current.flushDraft();
+    });
+    await act(async () => {
+      await flushed;
+    });
+
+    expect(api.update.mock.calls.at(-1)![2].aidlcSettings).toEqual({ planApproval: 'off' });
+  });
+
+  // A draft that has never had a setting sends NO settings field: that is the
+  // body every unpinned, 2.3.3, 2.8.2 and 2.9.0 draft sent before these
+  // settings existed, and it keeps those drafts off the server's settings path
+  // entirely.
+  it('sends no settings field for a draft that has none', async () => {
+    const { a } = bothSeeded();
+
+    act(() => {
+      a.result.current.setTitle('Renamed');
+    });
+    await act(async () => {
+      await a.result.current.flushDraft();
+    });
+
+    expect(api.update.mock.calls[0][2]).not.toHaveProperty('aidlcSettings');
+  });
+
+  // Once the draft has had one, the field is sent even when it is now empty —
+  // otherwise clearing the LAST override could not reach the server.
+  it('sends null once the last override is cleared', async () => {
+    const { a } = bothSeeded();
+
+    act(() => {
+      a.result.current.setAidlcSetting('guardPolicy', 'strict');
+    });
+    await act(async () => {
+      await a.result.current.flushDraft();
+    });
+    act(() => {
+      a.result.current.setAidlcSetting('guardPolicy', null);
+    });
+    await act(async () => {
+      await a.result.current.flushDraft();
+    });
+
+    expect(api.update.mock.calls.at(-1)![2].aidlcSettings).toBeNull();
+  });
+
+  // The settings are seeded INSIDE the empty-document seed, exactly like the
+  // scope, so a mount is not a local edit and a hydration of a draft with no
+  // settings writes nothing at all.
+  it('makes no request when a hydration changed nothing', async () => {
+    const a = member('Alice');
+    act(() => {
+      a.result.current.initFromIntent(intent());
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+
+    expect(api.update).not.toHaveBeenCalled();
+    expect(api.draftEditState).not.toHaveBeenCalled();
+  });
+
+  it('makes no request when a hydration carried settings either', async () => {
+    const a = member('Alice');
+    act(() => {
+      a.result.current.initFromIntent(intent({ aidlcSettings: { guardPolicy: 'strict' } }));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+
+    expect(a.result.current.aidlcSettings).toEqual({ guardPolicy: 'strict' });
+    expect(api.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('useCollaborativeIntentDraft — pruning the settings a selection drops', () => {
+  it('withdraws an unauthored setting in one transaction and names it', () => {
+    const { a, b } = bothSeeded({ scope: 'bugfix', aidlcSettings: { existingCode: false } });
+    let updates = 0;
+    a.doc.on('update', () => {
+      updates += 1;
+    });
+
+    let dropped: string[] = [];
+    act(() => {
+      dropped = a.result.current.pruneAidlcSettings(CLASSIC_AUTHORED);
+    });
+
+    expect(dropped).toEqual(['existingCode']);
+    expect(a.result.current.aidlcSettings).toBeNull();
+    expect(updates).toBe(1);
+
+    act(() => sync(a.doc, b.doc));
+    expect(b.result.current.aidlcSettings).toBeNull();
+  });
+
+  it('withdraws an override equal to the new scope default', () => {
+    const { a } = bothSeeded();
+    act(() => {
+      a.result.current.setAidlcSetting('guardPolicy', 'strict');
+    });
+
+    act(() => {
+      a.result.current.pruneAidlcSettings({ ...CLASSIC_AUTHORED, guardPolicy: 'strict' });
+    });
+
+    expect(a.result.current.aidlcSettings).toBeNull();
+  });
+
+  // A selection that authors the same settings must write NOTHING: an
+  // unconditional rewrite would make every preview a local edit and every
+  // mount an autosave.
+  it('writes nothing when the selection authors the same settings', () => {
+    const { a } = bothSeeded();
+    act(() => {
+      a.result.current.setAidlcSetting('guardPolicy', 'strict');
+    });
+    let updates = 0;
+    a.doc.on('update', () => {
+      updates += 1;
+    });
+
+    let dropped: string[] = [];
+    act(() => {
+      dropped = a.result.current.pruneAidlcSettings(CLASSIC_AUTHORED);
+    });
+
+    expect(dropped).toEqual([]);
+    expect(updates).toBe(0);
+    expect(a.result.current.aidlcSettings).toEqual({ guardPolicy: 'strict' });
+  });
+
+  it('withdraws every setting for a selection that authors none', () => {
+    const { a } = bothSeeded({ aidlcSettings: { guardPolicy: 'strict', collaborators: 'on' } });
+
+    let dropped: string[] = [];
+    act(() => {
+      dropped = a.result.current.pruneAidlcSettings(null);
+    });
+
+    expect(dropped.toSorted()).toEqual(['collaborators', 'guardPolicy']);
+    expect(a.result.current.aidlcSettings).toBeNull();
+  });
+});

@@ -17,6 +17,8 @@ import { AGENT_CLIS, AGENT_CLI_METADATA, AGENT_CREDENTIAL_SOURCE_LABELS } from '
 import { useDiscussions } from '@/components/discussion/DiscussionProvider';
 import { CollaborativeTextarea } from '@/components/CollaborativeTextarea';
 import { ComposePanel } from '@/components/intent/ComposePanel';
+import { AidlcSettingsPanel } from '@/components/AidlcSettingsPanel';
+import { AIDLC_SETTING_LABELS, type AidlcSettingValue } from '@/lib/aidlcSettings';
 import { StageGridEditor } from '@/components/intent/StageGridEditor';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -421,6 +423,15 @@ function IntentComposePageContent() {
   // (the selected scope already fully describes the run).
   const [showGridEditor, setShowGridEditor] = useState(false);
 
+  // The AI-DLC settings the previewed scope AUTHORS. Null for an unpinned intent
+  // and for every release before 2.11, which is what keeps the chooser hidden
+  // for them rather than showing an empty box. Declared here because the
+  // selection handlers below read it.
+  const [authoredSettings, setAuthoredSettings] = useState<Record<
+    string,
+    AidlcSettingValue
+  > | null>(null);
+
   const toggleGridStage = (stageId: string) => {
     if (!draftReady || lockedStageIds.has(stageId)) return;
     // First customization materializes the scope's projection into a composed
@@ -460,6 +471,9 @@ function IntentComposePageContent() {
   // re-fetched whenever the shared selection changes (keyed on the serialized
   // selection so a peer's grid edit re-previews too).
   const [summary, setSummary] = useState<ScopeSummary | null>(null);
+  // The settings the new selection does not offer, named so the team is told
+  // which choice it withdrew rather than seeing a control quietly disappear.
+  const [withdrawnSettings, setWithdrawnSettings] = useState<string[]>([]);
   const [previewNote, setPreviewNote] = useState<string | null>(null);
   const [previewErrors, setPreviewErrors] = useState<string[]>([]);
   const gridKey = JSON.stringify(draft.composedGrid ?? null);
@@ -491,6 +505,18 @@ function IntentComposePageContent() {
       .then((preview) => {
         if (cancelled) return;
         setSummary(preview.plan?.summary ?? null);
+        const authored = preview.plan?.aidlcSettingsAuthored ?? null;
+        setAuthoredSettings(authored);
+        // The selection decides which settings EXIST, so the overrides are
+        // pruned against the authored map of the selection now in force,
+        // through the same rule the API runs on the saved payload. Done here
+        // because this is where the authored map for the current selection
+        // arrives; a selection that authors the same settings prunes nothing
+        // and writes nothing to the document.
+        if (draftReady) {
+          const dropped = draft.pruneAidlcSettings(authored);
+          setWithdrawnSettings(dropped.map((key) => AIDLC_SETTING_LABELS[key] ?? key));
+        }
         setPreviewErrors(
           preview.valid ? [] : (preview.errors ?? []).map((e) => e.message).slice(0, 6),
         );
@@ -505,6 +531,7 @@ function IntentComposePageContent() {
       .catch(() => {
         if (!cancelled) {
           setSummary(null);
+          setAuthoredSettings(null);
           setPreviewNote(null);
           setPreviewErrors([]);
         }
@@ -878,6 +905,19 @@ function IntentComposePageContent() {
               )}
             </div>
           </div>
+
+          <AidlcSettingsPanel
+            authored={authoredSettings}
+            chosen={draft.aidlcSettings}
+            disabled={starting || !draftReady}
+            onChange={draft.setAidlcSetting}
+          />
+          {withdrawnSettings.length > 0 && (
+            <p className="text-xs text-amber-600" data-testid="aidlc-settings-dropped">
+              This selection does not offer {withdrawnSettings.join(', ')}, so the choice recorded
+              for it was removed and the run follows the scope&rsquo;s defaults.
+            </p>
+          )}
 
           {gridStages.length > 0 && (
             <div className="space-y-2">

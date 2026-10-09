@@ -1,3 +1,4 @@
+import type { AidlcSettingValue } from '../lib/aidlcSettings';
 import { api } from './api';
 import type { AgentCli } from './projects';
 import type { AgentCredentialSource } from './agents';
@@ -140,6 +141,14 @@ export interface Intent {
   // Per-intent composed EXECUTE/SKIP grid (Adaptive Workflows): when set it
   // replaces the named-scope projection and `scope` is the provenance label.
   composedGrid?: Record<string, 'EXECUTE' | 'SKIP'> | null;
+  // The per-intent AI-DLC settings chosen for this intent: the OVERRIDES on top
+  // of the pinned scope's own defaults, as plain values. Absent for an intent
+  // with none, which is every intent on a release that authors no such setting.
+  // Read-only once the intent starts (409 `settings_locked`).
+  aidlcSettings?: Record<string, AidlcSettingValue> | null;
+  // The settings the saved selection does not author, named by the save that
+  // dropped them so the page can say which choice a scope change withdrew.
+  aidlcSettingsDropped?: string[];
   source: IntentSource | null;
   // Non-fatal plan warnings snapshotted at create: the selected scope resolves
   // to a runnable but DEGRADED plan (required inputs whose producer stage is
@@ -829,6 +838,10 @@ export interface CreateIntentInput {
   // Per-intent composed EXECUTE/SKIP grid — replaces the scope projection
   // (scope becomes a label). Validated server-side by the plan resolver.
   composedGrid?: Record<string, 'EXECUTE' | 'SKIP'>;
+  // Per-intent AI-DLC settings, as bare values. Only settings the pinned
+  // release's chosen scope authors are kept; a value outside the capability
+  // registry's own value set is refused with `aidlc_setting_invalid`.
+  aidlcSettings?: Record<string, AidlcSettingValue>;
   // Pin this intent to a registered AI-DLC release. Only
   // selectable releases are accepted; 400 codes: release_not_selectable,
   // release_not_found, release_selection_disabled. Omit for legacy behaviour.
@@ -1099,6 +1112,10 @@ export const intentsService = {
       scope?: string;
       composedGrid?: Record<string, 'EXECUTE' | 'SKIP'> | null;
       skipStageIds?: string[] | null;
+      // The per-intent AI-DLC settings, which the API only accepts in the same
+      // body as the selection they belong to (400
+      // `selection_required_with_settings` otherwise). `null` clears them.
+      aidlcSettings?: Record<string, AidlcSettingValue> | null;
     },
   ) => api.patch<Intent>(`/projects/${projectId}/intents/${intentId}`, patch),
   // ── Composer (Adaptive Workflows) ──

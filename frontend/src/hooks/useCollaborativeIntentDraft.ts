@@ -7,6 +7,11 @@ import { saveCollaborativeProjection } from '../lib/collaborativeSave';
 import { generateColor } from '../utils/colors';
 import { seedYjsDocumentIfEmpty } from '../lib/yjsSeed';
 import { intentsService, type Intent } from '../services/intents';
+import {
+  AIDLC_SETTING_KEYS,
+  normalizeAidlcSettings,
+  type AidlcSettingValue,
+} from '../lib/aidlcSettings';
 
 // The collaboratively edited slice of a DRAFT intent. Clustered Yjs checkpoints
 // the CRDT; debounced PATCH saves maintain the intent's business-data META row.
@@ -17,13 +22,32 @@ import { intentsService, type Intent } from '../services/intents';
 //     scope: string                — scope name or composed-grid label
 //     composedGrid: JSON string    — {stageId: EXECUTE|SKIP} or absent
 //     skipStageIds: JSON string    — string[] or absent
+//   Y.Map  'aidlcSettings'         — LWW per SETTING KEY: settingKey -> scalar
+//     override. An absent entry follows the pinned scope's own default. Per-key
+//     rather than one atomic blob so two members changing DIFFERENT settings
+//     concurrently both survive, which is the same resolution
+//     useCollaborativeStructuredAnswer's selections map already uses.
 export interface IntentDraftState {
   title: string;
   prompt: string;
   scope: string | null;
   composedGrid: Record<string, 'EXECUTE' | 'SKIP'> | null;
   skipStageIds: string[] | null;
+  // The per-intent AI-DLC settings the TEAM has chosen: the overrides on top of
+  // the pinned scope's defaults. Ordinary collaborative selection state, like
+  // `scope` — not a server answer republished into the document, so there is
+  // nothing here to order against a response in flight.
+  aidlcSettings: Record<string, AidlcSettingValue> | null;
 }
+
+const AIDLC_SETTINGS_MAP = 'aidlcSettings';
+
+const readAidlcSettings = (doc: Y.Doc): Record<string, AidlcSettingValue> | null => {
+  const entries = [...doc.getMap<AidlcSettingValue>(AIDLC_SETTINGS_MAP).entries()].filter(
+    ([, value]) => value !== undefined && value !== null,
+  );
+  return entries.length ? Object.fromEntries(entries) : null;
+};
 
 const parseJson = <T>(raw: unknown): T | null => {
   if (typeof raw !== 'string' || !raw) return null;
@@ -34,7 +58,9 @@ const parseJson = <T>(raw: unknown): T | null => {
   }
 };
 
-const readConfig = (config: Y.Map<unknown>): Omit<IntentDraftState, 'title' | 'prompt'> => {
+const readConfig = (
+  config: Y.Map<unknown>,
+): Omit<IntentDraftState, 'title' | 'prompt' | 'aidlcSettings'> => {
   const scope = config.get('scope');
   return {
     scope: typeof scope === 'string' && scope ? scope : null,
@@ -69,30 +95,46 @@ export function useCollaborativeIntentDraft(
     scope: null,
     composedGrid: null,
     skipStageIds: null,
+    aidlcSettings: null,
   });
   const seededRef = useRef(false);
+  // Sticky: has this draft ever had a per-intent setting? A release that
+  // authors none never puts a key in the map, so this stays false and the save
+  // body omits `aidlcSettings` entirely — which is the request every pre-2.11
+  // draft already sends, byte for byte. It latches on the first key seen from
+  // any source (the seed, this member, a peer) so clearing the LAST override
+  // still sends `null` and still clears the stored one.
+  const hadSettingsRef = useRef(false);
   const [hydratedDoc, setHydratedDoc] = useState<Y.Doc | null>(null);
 
   useEffect(() => {
     if (!doc) return;
     seededRef.current = false;
+    hadSettingsRef.current = false;
     const titleText = doc.getText('title');
     const promptText = doc.getText('prompt');
     const config = doc.getMap('config');
-    const update = () =>
+    const settings = doc.getMap(AIDLC_SETTINGS_MAP);
+    const update = () => {
+      const aidlcSettings = readAidlcSettings(doc);
+      if (aidlcSettings) hadSettingsRef.current = true;
       setState({
         title: titleText.toString(),
         prompt: promptText.toString(),
         ...readConfig(config),
+        aidlcSettings,
       });
+    };
     titleText.observe(update);
     promptText.observe(update);
     config.observe(update);
+    settings.observe(update);
     update();
     return () => {
       titleText.unobserve(update);
       promptText.unobserve(update);
       config.unobserve(update);
+      settings.unobserve(update);
     };
   }, [doc]);
 
@@ -112,6 +154,16 @@ export function useCollaborativeIntentDraft(
         }
         if (intent.skipStageIds?.length) {
           config.set('skipStageIds', JSON.stringify(intent.skipStageIds));
+        }
+        // Seeded INSIDE the empty-document seed, exactly like `scope`. Hydrating
+        // out of band would make a mount a local edit: the observer would bump
+        // the revision and the autosave would write a draft nobody touched.
+        if (intent.aidlcSettings) {
+          const seeded = seed.getMap<AidlcSettingValue>(AIDLC_SETTINGS_MAP);
+          for (const key of AIDLC_SETTING_KEYS) {
+            const value = intent.aidlcSettings[key];
+            if (value !== undefined && value !== null) seeded.set(key, value);
+          }
         }
       });
       setHydratedDoc(doc);
@@ -176,6 +228,65 @@ export function useCollaborativeIntentDraft(
     },
     [doc],
   );
+  // Choose ONE setting, or follow the scope default again with `null`.
+  // Synchronous and local, exactly like `setScope`: persistence is the
+  // autosave's business and its failure already has a draft-level surface
+  // shared with the title, the prompt and the scope. There is no pending state
+  // and no per-setting promise, so there is no second operation for Start to
+  // await — the existing `flushDraft` barrier covers it.
+  const setAidlcSetting = useCallback(
+    (key: string, value: AidlcSettingValue | null) => {
+      if (!doc) return;
+      const settings = doc.getMap<AidlcSettingValue>(AIDLC_SETTINGS_MAP);
+      if (value === null) {
+        if (settings.has(key)) settings.delete(key);
+        return;
+      }
+      if (settings.get(key) !== value) settings.set(key, value);
+    },
+    [doc],
+  );
+
+  // Replace the whole override map in ONE transaction, writing only the keys
+  // that actually differ so a no-op leaves the document — and therefore the
+  // autosave — untouched. Used to prune the settings a new selection no longer
+  // authors, and by the compose step to apply a proposal.
+  const setAidlcSettings = useCallback(
+    (next: Record<string, AidlcSettingValue> | null) => {
+      if (!doc) return;
+      const settings = doc.getMap<AidlcSettingValue>(AIDLC_SETTINGS_MAP);
+      const changed = AIDLC_SETTING_KEYS.filter((key) => {
+        const value = next?.[key];
+        return value === undefined ? settings.has(key) : settings.get(key) !== value;
+      });
+      if (changed.length === 0) return;
+      doc.transact(() => {
+        for (const key of changed) {
+          const value = next?.[key];
+          if (value === undefined) settings.delete(key);
+          else settings.set(key, value);
+        }
+      });
+    },
+    [doc],
+  );
+
+  // Drop the overrides the EFFECTIVE selection does not author, through the
+  // shared rule the server runs on the same payload. Returns the keys it
+  // withdrew so the page can name them; a selection that authors the same
+  // settings changes nothing and writes nothing.
+  const pruneAidlcSettings = useCallback(
+    (authored: Record<string, AidlcSettingValue> | null | undefined) => {
+      if (!doc) return [];
+      const current = readAidlcSettings(doc);
+      if (!current) return [];
+      const { value, dropped } = normalizeAidlcSettings({ settings: current, authored });
+      setAidlcSettings(value);
+      return dropped;
+    },
+    [doc, setAidlcSettings],
+  );
+
   const setSkipStageIds = useCallback(
     (ids: string[] | null) => {
       if (!doc) return;
@@ -198,6 +309,12 @@ export function useCollaborativeIntentDraft(
       ...(cfg.scope ? { scope: cfg.scope } : {}),
       composedGrid: cfg.composedGrid,
       skipStageIds: cfg.skipStageIds,
+      // Sent WITH the selection, never alone: the API validates the settings
+      // against the selection in the same body and refuses a body that carries
+      // one without the other. OMITTED for a draft that has never had a
+      // setting, so an unpinned, 2.3.3, 2.8.2 or 2.9.0 draft keeps sending
+      // exactly the body it sent before these settings existed.
+      ...(hadSettingsRef.current ? { aidlcSettings: readAidlcSettings(doc) } : {}),
     };
   }, [doc, synced, intentId]);
 
@@ -242,6 +359,9 @@ export function useCollaborativeIntentDraft(
     setScope,
     setComposedGrid,
     setSkipStageIds,
+    setAidlcSetting,
+    setAidlcSettings,
+    pruneAidlcSettings,
     // Awaitable flush so Start can guarantee the last edits are persisted
     // before launching (the launch reads the META row, not the Yjs doc).
     flushDraft: flushLatest,

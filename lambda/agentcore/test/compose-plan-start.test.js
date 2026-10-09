@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
+  settingsScopeFor,
+  validateProposal,
   buildComposePrompt,
   COMPOSER_PERSONA_TRUNCATED,
   createComposePlanStart,
@@ -676,5 +678,183 @@ describe('compose-plan-start — the settings proposal is gated on the catalog',
 
     expect(prompt).toContain('"scopeSettings"');
     expect(prompt).not.toContain('AI-DLC settings in force for this intent');
+  });
+});
+
+// A proposal must not offer a setting the selection does not author: Apply
+// would silently prune it under a card that says Applied. The settings scope
+// therefore has to be resolved for ALL THREE shapes a proposal takes, not only
+// for the one that happens to carry an optional base scope.
+describe('validateProposal — the settings scope of every proposal mode', () => {
+  const SCOPE_BLOCKS = [
+    { id: 'bugfix', keywords: ['hotfix'], planApproval: 'on' },
+    { id: 'feature', keywords: ['feature'], guardPolicy: 'strict', planApproval: 'on' },
+  ];
+  const OFFERED = ['bugfix', 'feature'];
+
+  const validate = (proposal, { policyScope = null, settingsAware = true } = {}) =>
+    validateProposal({
+      proposal,
+      workflow: workflow(),
+      library: library(),
+      scopeBlocks: SCOPE_BLOCKS,
+      offeredScopeIds: OFFERED,
+      policyScope,
+      settingsAware,
+    });
+
+  const matched = (extra = {}) => ({
+    mode: 'matched',
+    scope: 'bugfix',
+    grid: null,
+    rationale: [],
+    confidence: null,
+    ...extra,
+  });
+  const custom = (extra = {}) => ({
+    mode: 'custom',
+    scope: 'bugfix-custom',
+    grid: { init: 'EXECUTE', analyze: 'SKIP', build: 'EXECUTE' },
+    rationale: [],
+    confidence: null,
+    ...extra,
+  });
+
+  it('resolves the matched scope as the settings scope and refuses what it does not author', () => {
+    expect(settingsScopeFor({ proposal: matched() })).toBe('bugfix');
+    expect(validate(matched({ scopeSettings: { plan_approval: 'on' } })).error).toBeUndefined();
+
+    const refused = validate(matched({ guardPolicy: 'strict' }));
+    expect(refused.error).toMatch(/guardPolicy/);
+    expect(refused.error).toMatch(/not authored by scope "bugfix"/);
+  });
+
+  it('accepts a matched proposal whose settings the matched scope does author', () => {
+    const ok = validate({ ...matched({ scope: 'feature' }), guardPolicy: 'relaxed' });
+
+    expect(ok.error).toBeUndefined();
+    expect(ok.settingsScope).toBe('feature');
+  });
+
+  it('resolves an explicit base scope for a custom proposal', () => {
+    expect(settingsScopeFor({ proposal: custom({ baseScope: 'feature' }) })).toBe('feature');
+
+    const ok = validate(custom({ baseScope: 'feature', guardPolicy: 'relaxed' }));
+    expect(ok.error).toBeUndefined();
+    expect(ok.settingsScope).toBe('feature');
+
+    const refused = validate(custom({ baseScope: 'bugfix', guardPolicy: 'relaxed' }));
+    expect(refused.error).toMatch(/not authored by scope "bugfix"/);
+  });
+
+  // The omitted-base case: the proposal inherits the scope the selection
+  // already runs on, which is exactly the scope Apply will keep.
+  it('falls back to the selection’s own scope when the proposal omits the base', () => {
+    expect(settingsScopeFor({ proposal: custom(), policyScope: 'feature' })).toBe('feature');
+
+    const ok = validate(custom({ guardPolicy: 'relaxed' }), { policyScope: 'feature' });
+    expect(ok.error).toBeUndefined();
+    expect(ok.settingsScope).toBe('feature');
+
+    const refused = validate(custom({ guardPolicy: 'relaxed' }), { policyScope: 'bugfix' });
+    expect(refused.error).toMatch(/not authored by scope "bugfix"/);
+  });
+
+  // No base and no current scope: there is no authored map at all, so a
+  // proposal that still offers a setting is refused by name rather than
+  // completing with values nothing can carry.
+  it('refuses proposed settings when no scope resolves to author them', () => {
+    const refused = validate(custom({ guardPolicy: 'relaxed' }));
+
+    expect(refused.error).toMatch(/have no scope to be authored by/);
+  });
+
+  it('leaves a proposal that offers no per-intent setting alone in every mode', () => {
+    expect(validate(matched()).error).toBeUndefined();
+    expect(validate(custom()).error).toBeUndefined();
+    expect(validate(custom({ baseScope: 'bugfix' })).settingsScope).toBe('bugfix');
+  });
+
+  it('still refuses a base scope this workflow does not offer', () => {
+    expect(validate(custom({ baseScope: 'not-a-scope' })).error).toMatch(/is not offered/);
+  });
+
+  // A catalog that authors none of these settings is never asked for one, so a
+  // value a model volunteers there is ignored exactly as the parser contract
+  // says: the verdict, the recorded fields and therefore the compose DTO of an
+  // unpinned, 2.3.3, 2.8.2 or 2.9.0 compose are what they were before the
+  // settings existed.
+  it('ignores volunteered settings on a catalog that authors none', () => {
+    const notAware = { settingsAware: false };
+
+    const matchedOk = validate(matched({ guardPolicy: 'strict' }), notAware);
+    expect(matchedOk.error).toBeUndefined();
+    expect(matchedOk.settingsScope).toBeNull();
+
+    const customOk = validate(custom({ guardPolicy: 'relaxed' }), notAware);
+    expect(customOk.error).toBeUndefined();
+    expect(customOk.settingsScope).toBeNull();
+
+    // Even a base scope the workflow does not offer is left alone: nothing
+    // reads it, so refusing the whole proposal over it would turn a compose
+    // that used to COMPLETE into a FAILED one.
+    expect(validate(custom({ baseScope: 'not-a-scope' }), notAware).error).toBeUndefined();
+    expect(validate(custom({ baseScope: 'feature' }), notAware).settingsScope).toBeNull();
+  });
+
+  // The settings a proposal carries that have no per-intent surface here are
+  // NOT part of the authored check: they are reported to the member and keep
+  // following the scope, so they can never be refused for being unauthored.
+  it('ignores the proposed settings this platform does not make per-intent', () => {
+    expect(
+      validate(matched({ scopeSettings: { sensors: 'off', review_cap: 'advisory' } })).error,
+    ).toBeUndefined();
+  });
+});
+
+// The same rule on the real compose job: a proposal whose settings the resolved
+// settings scope does not author must finish FAILED, not COMPLETED.
+describe('compose-plan-start — a proposal is refused for an unauthored setting', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const SCOPE_BLOCKS = [
+    { id: 'feature', keywords: ['feature'], description: 'Full flow', planApproval: 'on' },
+    { id: 'bugfix', keywords: ['hotfix'], description: 'Fix and ship', planApproval: 'on' },
+  ];
+
+  const runJob = async (proposalJson, payload = {}) => {
+    const deps = makeDeps({ oneShotText: `\`\`\`json\n${proposalJson}\n\`\`\`` });
+    deps.listMergedBlocksFn = vi.fn(async (type) => (type === 'SCOPE' ? SCOPE_BLOCKS : []));
+    const start = createComposePlanStart(deps);
+    await start({ ...basePayload, ...payload });
+    return waitForFinish(deps.store);
+  };
+
+  it('fails a matched proposal that offers a setting the matched scope lacks', async () => {
+    const update = await runJob('{"mode":"matched","scope":"bugfix","guardPolicy":"strict"}');
+
+    expect(update.state).toBe('FAILED');
+    expect(update.fields.failureReason).toMatch(/guardPolicy/);
+    expect(update.fields.failureReason).toMatch(/not authored by scope "bugfix"/);
+  });
+
+  it('fails a custom proposal with an omitted base for the same reason', async () => {
+    const update = await runJob(
+      '{"mode":"custom","scope":"bugfix-custom","grid":{"init":"EXECUTE","analyze":"SKIP","build":"EXECUTE"},"guardPolicy":"strict"}',
+      { policyScope: 'bugfix' },
+    );
+
+    expect(update.state).toBe('FAILED');
+    expect(update.fields.failureReason).toMatch(/not authored by scope "bugfix"/);
+  });
+
+  it('completes and records the settings scope a proposal was validated against', async () => {
+    const update = await runJob(
+      '{"mode":"custom","scope":"bugfix-custom","grid":{"init":"EXECUTE","analyze":"SKIP","build":"EXECUTE"},"baseScope":"bugfix","scopeSettings":{"plan_approval":"on"}}',
+    );
+
+    expect(update.state).toBe('COMPLETED');
+    expect(update.fields.settingsScope).toBe('bugfix');
+    expect(update.fields.proposal.scopeSettings).toEqual({ plan_approval: 'on' });
   });
 });

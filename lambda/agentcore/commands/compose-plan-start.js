@@ -33,6 +33,7 @@ import {
   proposalContract,
 } from '../../shared/compose-match.js';
 import {
+  aidlcSettingsFromComposeProposal,
   effectiveAidlcSettingRows,
   scopeAidlcSettings,
 } from '../../shared/intent-aidlc-settings.js';
@@ -87,10 +88,62 @@ const buildScopeGrounding = ({ workflow, library, scopeBlocks }) => {
   return { scopes, summaries, grids, stages, scopeSettings, offeredScopeIds: [...offered] };
 };
 
+// The scope whose authored settings a proposal's settings must come from, for
+// ALL THREE shapes a proposal can take:
+//
+//   matched           -> the matched stock scope IS the settings scope;
+//   custom + base     -> the explicit base scope the proposal names;
+//   custom, no base   -> the scope the selection already runs on.
+//
+// Resolving this for every mode is the point. Checking it only when an optional
+// `baseScope` happened to be present let a matched proposal, and a custom
+// proposal that omitted the member, complete with settings the draft write then
+// refused — an Apply card that says Applied over values that were silently
+// pruned.
+const settingsScopeFor = ({ proposal, policyScope = null }) =>
+  proposal.mode === 'matched' ? proposal.scope : (proposal.baseScope ?? policyScope ?? null);
+
+const scopeBlockFor = (scopeBlocks, scopeId) =>
+  scopeBlocks.find((block) => (block.id ?? block.blockId) === scopeId) ?? null;
+
+// The settings a member may accept are the ones the resolved settings scope
+// AUTHORS. Checked against the SCOPE block rather than against the proposal, so
+// the answer is the same one the draft write will give.
+const unauthoredProposalSettings = ({ proposal, scopeBlocks, settingsScope }) => {
+  const proposed = Object.keys(aidlcSettingsFromComposeProposal(proposal));
+  if (proposed.length === 0) return [];
+  const authored = scopeAidlcSettings(scopeBlockFor(scopeBlocks, settingsScope));
+  return proposed.filter((key) => !Object.hasOwn(authored, key));
+};
+
 // Validate a parsed proposal through the plan resolver — the ONLY authority.
-// Returns { validation } (authoritative verdict for a runnable proposal) or
-// { error, validation } when the proposal is not runnable.
-const validateProposal = ({ proposal, workflow, library, offeredScopeIds, strict = false }) => {
+// Returns { validation, settingsScope } (authoritative verdict for a runnable
+// proposal) or { error, validation } when the proposal is not runnable.
+const validateProposal = ({
+  proposal,
+  workflow,
+  library,
+  scopeBlocks = [],
+  offeredScopeIds,
+  policyScope = null,
+  // Whether the PINNED CATALOG authors the per-intent settings at all. Gated
+  // on the catalog, never on a version string: a release that authors none is
+  // never asked for one, so a value a model volunteers there is ignored exactly
+  // as the parser contract says — the compose row, the DTO and the outcome of
+  // an unpinned, 2.3.3, 2.8.2 or 2.9.0 compose are what they were before the
+  // settings existed.
+  settingsAware = false,
+  strict = false,
+}) => {
+  const settingsScope = settingsAware ? settingsScopeFor({ proposal, policyScope }) : null;
+  const settingsError = () => {
+    if (!settingsAware) return null;
+    const unauthored = unauthoredProposalSettings({ proposal, scopeBlocks, settingsScope });
+    if (!unauthored.length) return null;
+    return settingsScope
+      ? `proposal settings ${unauthored.join(', ')} are not authored by scope "${settingsScope}"`
+      : `proposal settings ${unauthored.join(', ')} have no scope to be authored by — this selection resolves none`;
+  };
   if (proposal.mode === 'matched') {
     if (!offeredScopeIds.includes(proposal.scope)) {
       return { error: `matched scope "${proposal.scope}" is not offered by this workflow` };
@@ -101,17 +154,25 @@ const validateProposal = ({ proposal, workflow, library, offeredScopeIds, strict
       library,
     });
     const validation = { valid, errors, warnings, summary: plan?.summary ?? null };
-    return valid ? { validation } : { error: 'matched scope does not resolve', validation };
+    if (!valid) return { error: 'matched scope does not resolve', validation };
+    const unauthored = settingsError();
+    return unauthored ? { error: unauthored, validation } : { validation, settingsScope };
+  }
+  if (settingsAware && proposal.baseScope && !offeredScopeIds.includes(proposal.baseScope)) {
+    return { error: `proposal baseScope "${proposal.baseScope}" is not offered by this workflow` };
   }
   const { valid, errors, warnings, plan } = buildExecutionPlan({
     workflow,
     scope: proposal.scope,
     library,
     composedGrid: proposal.grid,
+    ...(settingsScope ? { policyScope: settingsScope } : {}),
     strict,
   });
   const validation = { valid, errors, warnings, summary: plan?.summary ?? null };
-  return valid ? { validation } : { error: 'proposed grid does not resolve', validation };
+  if (!valid) return { error: 'proposed grid does not resolve', validation };
+  const unauthored = settingsError();
+  return unauthored ? { error: unauthored, validation } : { validation, settingsScope };
 };
 
 const MODE_TASKS = {
@@ -460,11 +521,18 @@ export const createComposePlanStart = ({
             proposal.grid[stageId] = value;
           }
         }
-        const { validation, error: validationError } = validateProposal({
+        const {
+          validation,
+          settingsScope,
+          error: validationError,
+        } = validateProposal({
           proposal,
           workflow,
           library,
+          scopeBlocks,
           offeredScopeIds,
+          policyScope,
+          settingsAware,
           strict: mode === 'inflight',
         });
         if (validationError) {
@@ -477,7 +545,14 @@ export const createComposePlanStart = ({
           });
           return;
         }
-        await finish({ state: 'COMPLETED', fields: { proposal, validation } });
+        // The settings scope the proposal was validated against is recorded on
+        // the row, so Apply normalises the accepted values against the SAME
+        // authored map the validation used instead of re-deriving one that may
+        // since have changed.
+        await finish({
+          state: 'COMPLETED',
+          fields: { proposal, validation, ...(settingsScope ? { settingsScope } : {}) },
+        });
       } catch (err) {
         log(`job failed (${key}):`, err?.message ?? err);
         await finish({
@@ -498,4 +573,10 @@ export const createComposePlanStart = ({
   return start;
 };
 
-export { buildScopeGrounding, validateProposal, buildComposePrompt, scopeGridFor };
+export {
+  buildScopeGrounding,
+  settingsScopeFor,
+  validateProposal,
+  buildComposePrompt,
+  scopeGridFor,
+};

@@ -444,6 +444,44 @@ describe('Per-release adapters: the plan boundary judges the authored type', () 
   });
 });
 
+// Classifying a field as a scope policy makes the plan KNOW it; it must not make
+// the plan ACT on it. An entry whose handling is still `unsupported` has no
+// consumer, so a scope — or a user overlay — authoring only such a field must
+// resolve exactly the policy-free plan it resolved before the entry existed.
+// Otherwise the unrelated defaults (change control, loop-back) and every policy
+// gate downstream switch on for a release whose setting the platform drops.
+describe('Per-release adapters: an unsupported-only field activates no policy', () => {
+  it.each(['plan_approval', 'collaborators'])(
+    'resolves no policy for a scope authoring only %s',
+    (field) => {
+      const result = planFor({ scopeFm: { [field]: 'off' } });
+      expect(result.valid).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.plan.stages[0].policy).toBeUndefined();
+    },
+  );
+
+  it('resolves no policy for a scope authoring only the project type', () => {
+    const result = planFor({ scopeFm: { existing_code: true } });
+    expect(result.valid).toBe(true);
+    expect(result.plan.stages[0].policy).toBeUndefined();
+  });
+
+  // `guard_policy` is the exception, and deliberately so: the mapper resolves
+  // `changeControl` from it first, so authoring it IS authoring change control —
+  // a field that has had a consumer since 2.6.18. The guard still holds
+  // promotion for the value itself.
+  it('treats the guard policy as the change-control field it renames', () => {
+    const { plan } = planFor({ scopeFm: { guard_policy: 'strict' } });
+    expect(plan.stages[0].policy).toMatchObject({ changeControl: 'strict' });
+  });
+
+  it('still resolves the policy when a supported field is authored alongside', () => {
+    const { plan } = planFor({ scopeFm: { change_control: 'relaxed', collaborators: 'off' } });
+    expect(plan.stages[0].policy).toMatchObject({ changeControl: 'relaxed' });
+  });
+});
+
 describe('Per-release adapters: learnings default', () => {
   const fixture = (profileId) =>
     JSON.parse(

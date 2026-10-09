@@ -657,14 +657,31 @@ const policyRows = (owner) =>
   );
 const POLICY_ENUMS = Object.freeze([...policyRows('scope'), ...policyRows('stage')]);
 
-const policyKeys = (owner) =>
+// Two different questions, two different lists.
+//
+// `*_POLICY_KEYS` is the vocabulary the plan KNOWS: every policy field the
+// registry names, so an authored value of any of them is type- and enum-checked
+// even before a handler exists.
+//
+// `*_RUNTIME_POLICY_KEYS` is the subset whose handling is no longer
+// `unsupported` — the fields that actually have a consumer. Only those may
+// ACTIVATE a resolved `stage.policy`, because activation also switches on every
+// other policy key's default (change control, loop-back, the review lattice) and
+// is the enablement gate the ensemble topology reads. A field that is merely
+// mapped-and-validated must leave the plan exactly as policy-free as it was
+// before its entry existed, or classifying it would ship its neighbours' effects
+// to a release whose own setting is still dropped.
+const policyKeys = (owner, predicate = () => true) =>
   Object.freeze(
-    AIDLC_CAPABILITIES.filter((entry) => entry.policy === owner && entry.planKey).map(
-      (entry) => entry.planKey,
-    ),
+    AIDLC_CAPABILITIES.filter(
+      (entry) => entry.policy === owner && entry.planKey && predicate(entry),
+    ).map((entry) => entry.planKey),
   );
+const isHandled = (entry) => entry.handling !== 'unsupported';
 const SCOPE_POLICY_KEYS = policyKeys('scope');
 const STAGE_POLICY_KEYS = policyKeys('stage');
+const SCOPE_RUNTIME_POLICY_KEYS = policyKeys('scope', isHandled);
+const STAGE_RUNTIME_POLICY_KEYS = policyKeys('stage', isHandled);
 
 // ── Capability presence ─────────────────────────────────────────────────────
 // Version-agnostic presence tests over the resolved release catalog. Evaluated
@@ -811,7 +828,9 @@ export {
   QUESTION_CHANNEL_OUTPUT_SUFFIX,
   RUNTIME_HANDLERS,
   SCOPE_POLICY_KEYS,
+  SCOPE_RUNTIME_POLICY_KEYS,
   STAGE_POLICY_KEYS,
+  STAGE_RUNTIME_POLICY_KEYS,
   UNMAPPED_FIELD_GAP_VALUE,
   capabilityFor,
   defaultWhenAbsent,
@@ -835,7 +854,9 @@ export default {
   QUESTION_CHANNEL_OUTPUT_SUFFIX,
   RUNTIME_HANDLERS,
   SCOPE_POLICY_KEYS,
+  SCOPE_RUNTIME_POLICY_KEYS,
   STAGE_POLICY_KEYS,
+  STAGE_RUNTIME_POLICY_KEYS,
   UNMAPPED_FIELD_GAP_VALUE,
   capabilityFor,
   defaultWhenAbsent,

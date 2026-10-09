@@ -24,7 +24,9 @@ import { createHash } from 'node:crypto';
 import {
   POLICY_ENUMS,
   SCOPE_POLICY_KEYS,
+  SCOPE_RUNTIME_POLICY_KEYS,
   STAGE_POLICY_KEYS,
+  STAGE_RUNTIME_POLICY_KEYS,
   defaultWhenAbsent,
   planApprovalApplies,
   resolveCapabilities,
@@ -389,10 +391,18 @@ const validatePolicyEnums = ({ scopeBlock, stage, stageId, errors }) => {
 // capability map (see resolveCapabilities): it decides whether a field the
 // catalog OMITS gets its release default or stays inert.
 const resolveStagePolicy = ({ scopeBlock, stage, stageId, errors, capabilities = {} }) => {
-  const scopeHas = hasAnyKey(scopeBlock, SCOPE_POLICY_KEYS);
-  const stageHas = hasAnyKey(stage, STAGE_POLICY_KEYS);
-  if (!scopeHas && !stageHas) return null;
+  // KNOWN first: every registry-named policy field is type- and enum-checked,
+  // whether or not a handler exists for it yet.
+  if (!hasAnyKey(scopeBlock, SCOPE_POLICY_KEYS) && !hasAnyKey(stage, STAGE_POLICY_KEYS))
+    return null;
   if (!validatePolicyEnums({ scopeBlock, stage, stageId, errors })) return null;
+  // ACTIVATED second: only a field with a consumer may switch the policy on.
+  // Otherwise mapping a field for validation alone would hand its neighbours'
+  // defaults — and the ensemble topology's enablement gate — to a release whose
+  // own setting the platform still drops.
+  const scopeHas = hasAnyKey(scopeBlock, SCOPE_RUNTIME_POLICY_KEYS);
+  const stageHas = hasAnyKey(stage, STAGE_RUNTIME_POLICY_KEYS);
+  if (!scopeHas && !stageHas) return null;
 
   const declaredClass = stage?.reviewClass ?? (stage?.reviewer ? 'adversarial' : 'none');
   const cap = scopeBlock?.reviewCap ?? 'adversarial';

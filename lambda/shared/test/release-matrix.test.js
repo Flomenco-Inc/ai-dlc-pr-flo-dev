@@ -56,7 +56,7 @@ const LEGACY_PLAN_DIGESTS = Object.freeze({
 // stage immediately before it. Scopes that run code generation per unit (a
 // parallel section) have no linear target and are absent here.
 const EXPECTED_LOOP_BACK_TUPLES = Object.freeze(
-  ['v2.6.18', 'v2.7.0', 'v2.8.2', 'v2.9.0'].flatMap((profileId) =>
+  ['v2.6.18', 'v2.7.0', 'v2.8.2', 'v2.9.0', 'v2.11.0'].flatMap((profileId) =>
     ['bugfix', 'express', 'poc', 'refactor', 'security-patch'].map((scope) => ({
       profileId,
       scope,
@@ -252,6 +252,14 @@ const loopBackOfferFor = ({ stage, stages, profileId, skippedStageIds = [] }) =>
   });
 };
 
+// Which support personas the collaborators switch withdrew from one stage, read
+// off the plan's policy effects — the audit record that makes a lead-only run a
+// stated downgrade rather than a silently shorter roster.
+const withdrawnSupportAgentsFor = (plan, stageId) =>
+  (plan.policyEffects ?? [])
+    .filter((effect) => effect.stageId === stageId)
+    .flatMap((effect) => effect.withdrawnSupportAgents ?? []);
+
 const matrixRow = ({ profileId, scope, plan, gateStats, checkpoints, ensembles, loopBacks }) => ({
   profile: profileId,
   scope,
@@ -345,15 +353,34 @@ describe('release coexistence matrix', () => {
             const supports = (stage.supportAgentRefs ?? []).filter(
               (ref) => ref && ref !== stage.agentRef && releaseLibrary.agentsById[ref],
             );
-            const expectedSeparateSessions =
+            // A release whose scope switches collaborators off resolves NO
+            // topology: the lead produces every declared output in one session.
+            // The stage keeps its authored mode and roster on the plan — the
+            // withdrawal is a policy effect, so a human reading the plan sees
+            // both what the methodology declared and what the policy removed.
+            const collaboratorsOff = stage.policy?.collaborators === 'off';
+            const wouldHaveSeparateSessions =
               supports.length > 0 &&
               (stage.mode === 'pipeline' ||
                 stage.mode === 'mob' ||
                 (stage.mode === 'subagent' &&
                   releaseLibrary.runtimeFilePaths.includes(ENSEMBLE_PROTOCOL_FILE)));
+            const expectedSeparateSessions = wouldHaveSeparateSessions && !collaboratorsOff;
             expect(Boolean(topology), `${profileId}/${scope}/${stage.stageId} topology`).toBe(
               expectedSeparateSessions,
             );
+            if (collaboratorsOff && wouldHaveSeparateSessions) {
+              // The authored roster stays on the plan, and every persona the
+              // switch withdrew is named on the policy effects — so the
+              // downgrade is an audit record, not a shorter roster nobody can
+              // see.
+              expect(stage.supportAgentRefs ?? []).toEqual(
+                releaseLibrary.stagesById[stage.stageId].supportAgents ?? [],
+              );
+              for (const ref of supports) {
+                expect(withdrawnSupportAgentsFor(plan, stage.stageId)).toContain(ref);
+              }
+            }
             if (topology) {
               expect(topology.mode).toBe(stage.mode);
               ensembles.push(stage.stageId);
@@ -510,7 +537,7 @@ describe('release coexistence matrix', () => {
     // Every other scope that runs build-and-test runs code generation per unit,
     // so its gate shows the recommendation as a note instead of the option.
     expect(loopBackUnavailable.filter((cell) => cell.endsWith('/build-and-test'))).toEqual(
-      ['v2.6.18', 'v2.7.0', 'v2.8.2', 'v2.9.0'].flatMap((profileId) =>
+      ['v2.6.18', 'v2.7.0', 'v2.8.2', 'v2.9.0', 'v2.11.0'].flatMap((profileId) =>
         ['classic', 'enterprise', 'feature', 'mvp', 'workshop'].map(
           (scope) => `${profileId}/${scope}/build-and-test`,
         ),

@@ -71,6 +71,36 @@ const AIDLC_COMPATIBILITY_PROFILES = Object.freeze({
     trustTier: 'T1',
     currentPlatformBaseline: false,
   }),
+  // 2.11.0 is promotable as `selectable` and never as `certified`: the engine
+  // families it invokes that this runtime refuses stay `unsupported` in the
+  // fidelity report, so `readyForCertification` is false by construction. What
+  // it supports, approximates and refuses is published in
+  // docs/concepts/aidlc-release-compatibility.md. No intermediate release
+  // (2.10.0) is admitted — an unknown profile stays `release_profile_unknown`.
+  'v2.11.0': Object.freeze({
+    id: 'v2.11.0',
+    releaseId: 'aidlc:6a378b53c0a4fe0641ed7d8de8dfff94264d5b6a',
+    fixtureDigest: '4a77093efb88810b0b4f93dde19c8cb9afe0c2c0955d3946dd1160592f0dc60b',
+    label: 'AI-DLC 2.11.0',
+    upstreamVersion: '2.11.0',
+    upstreamRef: '6a378b53c0a4fe0641ed7d8de8dfff94264d5b6a',
+    upstreamChannel: 'stable',
+    compatibilityStatus: 'candidate',
+    frontmatterDialect: 'invoke-template-v1',
+    trustTier: 'T1',
+    currentPlatformBaseline: false,
+    // The declared support CEILING. 2.11 invokes eleven engine commands this
+    // runtime refuses — the parked-worktree verbs, the mid-run settings write,
+    // the protected checkpoint receipts, the construction-scheduling writes,
+    // the project-type transaction and the approved-bundle restore. Each has a
+    // named answer in the dialect annex, which is what makes the release
+    // honestly RUNNABLE; none is a reproduction, which is what makes it
+    // honestly NOT certified. Stating the ceiling as data means the registry
+    // refuses the claim instead of an admin having to know not to make it, and
+    // it says nothing about any other release: a profile without this key
+    // promotes exactly as it does today.
+    maxSupportState: 'selectable',
+  }),
 });
 
 const profileFor = (profileIdOrRef) => {

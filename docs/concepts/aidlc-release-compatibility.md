@@ -352,6 +352,45 @@ stage fails with a rewind-eligible reason.
 - `AGENT.maxTurns` maps to the native OpenCode turn limit; it remains inert on
   CLIs that expose no equivalent.
 
+### Per-intent AI-DLC settings
+
+A scope's Guard Policy, Plan Approval, collaborators and project type can be
+overridden for ONE intent. The settings are ordinary draft selection state: they
+travel in the same `PATCH /projects/{projectId}/intents/{intentId}` body as
+`scope` and `composedGrid`, under the same draft-revision CAS, and are flushed by
+the same barrier Start already awaits. There is no separate route and no second
+write path.
+
+- Only the settings the pinned release's chosen scope AUTHORS are offered
+  (`plan.aidlcSettingsAuthored`). A release that authors none — unpinned, 2.3.3,
+  2.8.2, 2.9.0 — offers nothing, stores nothing and resolves exactly the policy
+  it resolved before.
+- Only DELTAS from that scope's default are stored. A value equal to the default
+  is not an override, so it is not persisted; the consequence is that an explicit
+  choice which happens to equal the default is not retained across a later scope
+  change, the same semantics `composedGrid` already has relative to `scope`.
+- The settings are only ever validated against a selection that arrived in the
+  same request: a body carrying settings without `scope` or `composedGrid` is
+  refused with `400 selection_required_with_settings`.
+- A setting the new selection does not author is dropped and named in the
+  response, so the UI can say which choice a scope change withdrew. A value
+  outside the capability registry's own value set, or of the wrong authored type,
+  is refused with `400 aidlc_setting_invalid`.
+- Settings are DRAFT-only. A write once the run has started answers
+  `409 settings_locked`, which is the platform's half of the dialect annex's
+  refusal of a mid-run settings change. No MCP tool can write one.
+- Each changed key appends one `v2.intent.settings.changed` timeline event naming
+  the authenticated member whose write changed it. The append is best-effort
+  after persistence, like the other event appends.
+- The recorded overrides reach the run, not only the draft: the orchestrator
+  walk, every stage and resume dispatch and both of AgentCore's own stage
+  resolutions project them through one shared contract
+  (`shared/intent-methodology.js`).
+- A stage that would have asked for a plan approval and did not carries an
+  advisory gate notice saying whether the pinned release's named scope turns Plan
+  Approval off by default or the intent turned it off before the run started. The
+  notice names nobody; attribution is on the intent timeline.
+
 ### Build-and-test loop-back
 
 Releases that ship the construction protocol (2.6.18 and later) let

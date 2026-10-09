@@ -1091,6 +1091,62 @@ describe('runStage — release-pinned conductor', () => {
   });
 });
 
+// The container resolves its OWN plan, so a setting that only reached the
+// orchestrator's walk would leave the materialized stage running under the scope
+// defaults — the opposite policy from the one the gates announced.
+describe('runStage — per-intent AI-DLC settings', () => {
+  const okSpawn = () => ({
+    on: (event, callback) => event === 'close' && setImmediate(() => callback(0)),
+    stdin: { end() {} },
+  });
+  const SETTINGS = { guardPolicy: 'strict', collaborators: 'on', existingCode: false };
+
+  const materializedPolicy = async (args) => {
+    const releaseLibrary = library();
+    releaseLibrary.fromRelease = true;
+    releaseLibrary.scopesById = {
+      feature: { id: 'feature', guardPolicy: 'off', collaborators: 'off', existingCode: true },
+    };
+    const seen = [];
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: releaseLibrary }),
+      materializeStage: async ({ stage }) => {
+        seen.push(stage.policy);
+        return { prompt: 'PROMPT', mcpConfigPath: '/ws/.aidlc/mcp.json' };
+      },
+    });
+
+    const res = await runStage(
+      { ...baseArgs, methodologyRelease: { releaseId: 'aidlc:abc' }, ...args },
+      deps,
+    );
+
+    expect(res).toMatchObject({ ok: true });
+    return seen[0];
+  };
+
+  it('resolves the stage under the recorded choices, not the scope defaults', async () => {
+    expect(await materializedPolicy({ intentSettings: SETTINGS })).toMatchObject({
+      guardPolicy: 'strict',
+      changeControl: 'strict',
+      collaborators: 'on',
+      existingCode: false,
+      existingCodeChoice: { source: 'intent' },
+    });
+  });
+
+  it('resolves the scope defaults for a dispatch that carries no settings', async () => {
+    expect(await materializedPolicy({})).toMatchObject({
+      guardPolicy: 'off',
+      changeControl: null,
+      collaborators: 'off',
+      existingCode: true,
+      existingCodeChoice: { source: 'scope-default' },
+    });
+  });
+});
+
 describe('runStage — MCP secret resolution + child-env injection', () => {
   it.each([
     ['global', undefined],

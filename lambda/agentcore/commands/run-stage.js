@@ -257,6 +257,7 @@ const resolveStage = ({
   stageId,
   skipStageIds = [],
   composedGrid = null,
+  intentSettings = null,
 }) => {
   const { valid, errors, plan } = buildExecutionPlan({
     workflow,
@@ -264,6 +265,7 @@ const resolveStage = ({
     library,
     ...(skipStageIds.length ? { skipStageIds } : {}),
     ...(composedGrid ? { composedGrid } : {}),
+    ...(intentSettings ? { intentSettings } : {}),
   });
   if (!valid) return { error: 'plan_invalid', detail: errors };
   const stage = plan.stages.find((s) => s.stageId === stageId);
@@ -1633,6 +1635,12 @@ const runStageAttempt = async (
     // every dispatch for the same plan-parity reason as the skip overlay: the
     // grid — not the scope name — is the projection this run executes.
     composedGrid = null,
+    // Per-intent AI-DLC settings (shared/intent-aidlc-settings.js), forwarded by
+    // the orchestrator on every dispatch for the same plan-parity reason: the
+    // member's recorded choices are part of the projection, so resolving the
+    // stage without them would run it under the scope defaults while the walk
+    // gated on the choices.
+    intentSettings = null,
     requestedCli,
     cliModels = {},
     // Tier-model config (shared/tier-models.js flat-row shape), snapshotted on
@@ -1937,7 +1945,14 @@ const runStageAttempt = async (
   if (!loaded.workflow || !loaded.library)
     return fail(null, 'workflow_not_found', `${workflowId}@${workflowVersion}`);
 
-  const probe = resolveStage({ ...loaded, scope: { scope }, stageId, skipStageIds, composedGrid });
+  const probe = resolveStage({
+    ...loaded,
+    scope: { scope },
+    stageId,
+    skipStageIds,
+    composedGrid,
+    intentSettings,
+  });
   if (probe.error) return fail(null, probe.error, JSON.stringify(probe.detail));
 
   const memory = await readProjectMemory({
@@ -1960,6 +1975,7 @@ const runStageAttempt = async (
     stageId,
     skipStageIds,
     composedGrid,
+    intentSettings,
   });
   if (resolved.error) return fail(null, resolved.error, JSON.stringify(resolved.detail));
   const { plan } = resolved;

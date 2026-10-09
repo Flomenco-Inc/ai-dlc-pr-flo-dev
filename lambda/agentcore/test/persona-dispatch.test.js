@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { dispatchPersona, composePersonaPrompt } from '../persona-dispatch.js';
 import { INVOKE_DIALECT_ANNEX } from '../stage-materializer.js';
 import { __test as runStageInternals } from '../commands/run-stage.js';
+import { toolsForRole } from '../mcp/server.js';
 
 // A child mock that resolves 'close' with exit code 0 and records whatever was
 // piped to stdin — every driver here (claude/kiro/opencode) delivers its prompt
@@ -515,6 +516,64 @@ describe('composePersonaPrompt — the dialect annex in a secondary session', ()
 
       expect(prompt).toContain(INVOKE_DIALECT_ANNEX);
     });
+  });
+
+  // The LIVE reviewer path is `runReviewer` → `dispatchPersona`, which composes
+  // the prompt itself. A helper that passes the right flags proves nothing about
+  // that path: the dispatcher defaulted checkpoint ownership and `ask_question`
+  // to true, so the reviewer's own prompt told it to call a tool MCP never
+  // registers for its role.
+  it('refuses the checkpoints in the prompt the live reviewer dispatch builds', async () => {
+    const capture = {};
+    const scopes = [];
+    const res = await dispatchPersona({
+      ...baseDeps({ stageId: 'design' }),
+      role: 'reviewer',
+      personaScope: { agentRef: 'aidlc-architecture-reviewer-agent' },
+      agentBlock: { modelOverride: null },
+      persona: 'You are the independent reviewer.',
+      knowledge: 'Log the answer: `{{INVOKE}} engine log answer --question q`.',
+      brief: 'Clean-room review brief.',
+      spawnFn: capturingSpawn(capture),
+      materializeMcpConfig: async ({ scope }) => {
+        scopes.push(scope);
+        return '/ws/.aidlc/mcp.json';
+      },
+    });
+
+    expect(res.ok).toBe(true);
+    const prompt = capture.stdin ?? capture.args.join(' ');
+    expect(prompt).toContain('**You cannot raise either checkpoint in this session**');
+    expect(prompt).not.toContain('Ask with `ask_question`');
+    // And the trusted scope agrees with the prompt, so the tools MCP registers
+    // for this role are the tools the prompt names.
+    expect(scopes[0]).toMatchObject({ role: 'reviewer', checkpointOwner: false, canAsk: false });
+    expect(
+      toolsForRole('reviewer', 'design', null, { checkpointOwner: false, canAsk: false }),
+    ).not.toContain('ask_question');
+  });
+
+  // An author session keeps everything it had: the role owns the checkpoints,
+  // so only the resolved policy decides whether a confirmation exists.
+  it('keeps the checkpoint mapping of an author-role dispatch', async () => {
+    const capture = {};
+    await dispatchPersona({
+      ...baseDeps({ stageId: 'design' }),
+      role: 'support',
+      personaScope: {
+        agentRef: 'aidlc-design-agent',
+        policy: { summaryConfirmation: 'required' },
+      },
+      agentBlock: { modelOverride: null },
+      persona: 'p',
+      knowledge: 'Log the answer: `{{INVOKE}} engine log answer --question q`.',
+      brief: 'b',
+      spawnFn: capturingSpawn(capture),
+    });
+
+    const prompt = capture.stdin ?? capture.args.join(' ');
+    expect(prompt).toContain('Ask with `ask_question`, confirm with `confirm_summary`');
+    expect(prompt).not.toContain('**You cannot raise either checkpoint in this session**');
   });
 
   it('answers it in the real reviewer prompt the runtime builds', () => {

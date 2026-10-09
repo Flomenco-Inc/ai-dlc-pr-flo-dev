@@ -483,11 +483,11 @@ const buildReviewerPrompt = ({
     persona: reviewerPersona,
     knowledge,
     role: 'reviewer',
-    // A reviewer's MCP role carries neither checkpoint tool and no
-    // `ask_question`, so the annex must not advertise either.
+    stageId: stage.stageId,
+    // The reviewer's MCP role carries neither checkpoint tool and no
+    // `ask_question`; `composePersonaPrompt` caps the annex on that surface
+    // itself, so this passes only the policy the rest of the row reads.
     policy: stage.policy ?? null,
-    checkpointOwner: false,
-    canAsk: false,
   });
 
 const latestReviewerVerdict = async ({ store, executionId, stageInstanceId, reviewerAgent }) => {
@@ -552,7 +552,10 @@ const runReviewer = async ({
   const dispatch = await dispatchPersona({
     role: 'reviewer',
     stageId: stage.stageId,
-    personaScope: { agentRef: reviewerAgent },
+    // The stage's resolved policy travels with the reviewer too: the annex's
+    // checkpoint mapping is capped by the reviewer role's own tool surface, and
+    // the policy is what decides the rest of the row.
+    personaScope: { agentRef: reviewerAgent, policy: stage.policy ?? null },
     agentBlock: reviewerBlock,
     persona: reviewerPersona,
     knowledge,

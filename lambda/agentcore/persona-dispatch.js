@@ -29,6 +29,7 @@ import {
   invokesCheckpointLog,
   neutralizeTokens,
 } from './stage-materializer.js';
+import { CHECKPOINT_TOOLS, toolsForRole } from './mcp/server.js';
 
 // Package-manager caches use container-local /tmp; the working tree stays on the
 // session mount so cache growth cannot consume space needed for durable changes.
@@ -47,6 +48,34 @@ export const OFF_MOUNT_CACHE_ENV = {
 const mcpRoleFor = (role) => (role === 'reviewer' ? 'reviewer' : 'author');
 
 const roleLabel = (role) => role.charAt(0).toUpperCase() + role.slice(1);
+
+// What the session's MCP ROLE can actually do — asked of `toolsForRole`, the
+// function that really registers the tools, rather than restated here. A role
+// whose surface has no checkpoint tool even with a policy that demands both, and
+// no `ask_question`, must never be told to call one, whatever the caller passed:
+// the reviewer role is exactly that case, and its live dispatch used the
+// defaults rather than the helper that knew better.
+const CHECKPOINT_DEMANDING_POLICY = Object.freeze({
+  summaryConfirmation: 'required',
+  planApproval: 'required',
+});
+
+const roleToolFacts = (mcpRole, stageId, policy, checkpointOwner, canAsk) => {
+  const withEveryCheckpoint = toolsForRole(mcpRole, stageId, CHECKPOINT_DEMANDING_POLICY, {
+    checkpointOwner: true,
+    canAsk: true,
+  });
+  const owns =
+    checkpointOwner && CHECKPOINT_TOOLS.every((tool) => withEveryCheckpoint.includes(tool));
+  return {
+    checkpointOwner: owns,
+    canAsk:
+      canAsk &&
+      toolsForRole(mcpRole, stageId, policy, { checkpointOwner: owns, canAsk }).includes(
+        'ask_question',
+      ),
+  };
+};
 
 // The ONLY place `persona` / `knowledge` reach the rendered prompt: a fixed
 // tail appended after the caller's `brief`. `buildReviewerPrompt`
@@ -67,13 +96,17 @@ export const composePersonaPrompt = ({
   persona,
   knowledge,
   role,
-  // The same three facts the MCP session is built from, so the annex advertises
-  // only the checkpoint tools this persona actually has.
+  stageId = null,
+  // The same facts the MCP session is built from. They are CAPPED by the role's
+  // real tool surface here, so a caller that passes nothing cannot make the
+  // annex advertise a tool this session does not have.
   policy = null,
   checkpointOwner = true,
   canAsk = true,
-}) =>
-  [
+}) => {
+  const mcpRole = mcpRoleFor(role);
+  const facts = roleToolFacts(mcpRole, stageId, policy, checkpointOwner, canAsk);
+  return [
     brief,
     '',
     `## ${roleLabel(role)} role`,
@@ -83,15 +116,16 @@ export const composePersonaPrompt = ({
       ? [
           '',
           invokeDialectAnnex({
-            readOnly: mcpRoleFor(role) === 'reviewer',
+            readOnly: mcpRole === 'reviewer',
             policy,
-            checkpointOwner,
-            canAsk,
+            checkpointOwner: facts.checkpointOwner,
+            canAsk: facts.canAsk,
             checkpointLogInvoked: invokesCheckpointLog(persona, knowledge),
           }),
         ]
       : []),
   ].join('\n');
+};
 
 // Spawn one persona's headless CLI session and run it to completion.
 //
@@ -143,7 +177,21 @@ export const dispatchPersona = async ({
   maxTurns = agentBlock?.maxTurns ?? null,
 }) => {
   const mcpRole = mcpRoleFor(role);
-  const { agentRef, policy = null, checkpointOwner = true, canAsk = true } = personaScope ?? {};
+  const {
+    agentRef,
+    policy = null,
+    checkpointOwner: ownerRequested = true,
+    canAsk: askRequested = true,
+  } = personaScope ?? {};
+  // Capped by what this MCP role really registers, so the prompt built below and
+  // the trusted scope the MCP session reads cannot disagree.
+  const { checkpointOwner, canAsk } = roleToolFacts(
+    mcpRole,
+    stageId,
+    policy,
+    ownerRequested,
+    askRequested,
+  );
   try {
     const driver = getDriver(cli);
     const model = resolveStageModel({ cliModels, tierModels, agentBlock, cli, env });
@@ -177,6 +225,7 @@ export const dispatchPersona = async ({
       persona,
       knowledge,
       role,
+      stageId,
       policy,
       checkpointOwner,
       canAsk,

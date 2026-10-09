@@ -104,15 +104,42 @@ const CHECKPOINT_ANNEX_ROW = /^- `engine log answer …` \/ `engine log decision
 const CHECKPOINT_LOG_INVOKE = /\{\{INVOKE\}\}\s+engine\s+log\s+(answer|decision)\b/;
 export const invokesCheckpointLog = (...parts) =>
   parts.some((part) => typeof part === 'string' && CHECKPOINT_LOG_INVOKE.test(part));
-const checkpointRowFor = ({ policy, checkpointOwner, canAsk }) => {
+// A session with NO platform tools at all. The composer's one-shot invocation
+// supplies no MCP configuration, so every answer that names a tool names one it
+// cannot call: its only channel is the JSON proposal it returns, and it raises
+// no checkpoint and changes no state. Carrying the annex is not the same as
+// being able to perform it.
+const TOOLLESS_RECORDING_PREAMBLE = [
+  '> **You have no platform tools in this session.** Every answer below that',
+  '> says to record something with a note tool, to ask or confirm with a',
+  '> checkpoint tool, to request an approval, or to end with an output summary',
+  '> names a tool you cannot call. Your only channel is the JSON proposal you',
+  '> return: put that content in its `rationale`, naming the command and what',
+  '> could not be performed. You raise no checkpoint and you change no state.',
+  '> Every refusal below — never run the engine, never claim you ran it, never',
+  '> invent a value it would have produced — applies to you unchanged.',
+].join('\n');
+
+// Every answer in the annex whose channel is a platform tool, rewritten for a
+// session that has none. The proposal's own fields are the channel.
+const TOOLLESS_SUBSTITUTIONS = Object.freeze([
+  [/`emit_stage_note`/g, 'the `rationale` of the proposal you return'],
+  [/your `send_output` summary/g, 'the `rationale` of the proposal you return'],
+  [/`submit_review`/g, 'the `rationale` of the proposal you return'],
+  [/`request_plan_approval`/g, 'a plan-approval tool this session does not have'],
+]);
+
+const checkpointRowFor = ({ policy, checkpointOwner, canAsk, toolless = false }) => {
   const confirms =
     checkpointOwner &&
     (policy?.summaryConfirmation === 'required' || policy?.summaryConfirmation === 'if-present');
   const asks = checkpointOwner && canAsk;
   if (asks && confirms) return null;
-  const substitute = asks
-    ? "Ask with `ask_question`, which records the human's exact words. There is **no summary confirmation** in this run: no `confirm_summary` tool exists for this session, so do not instruct one — put what you would have confirmed in your output."
-    : "**You cannot raise either checkpoint in this session**: the stage's own session owns them, and neither `ask_question` nor `confirm_summary` is registered here. Say that the checkpoint cannot be raised from this session, record the question or decision you would have put to the human, and defer to the owning session.";
+  const substitute = toolless
+    ? '**You cannot raise either checkpoint in this session**: it registers no tools at all. Put the question or decision you would have put to the human in the `rationale` of the proposal you return, and say plainly that a person must take it on the intent.'
+    : asks
+      ? "Ask with `ask_question`, which records the human's exact words. There is **no summary confirmation** in this run: no `confirm_summary` tool exists for this session, so do not instruct one — put what you would have confirmed in your output."
+      : "**You cannot raise either checkpoint in this session**: the stage's own session owns them, and neither `ask_question` nor `confirm_summary` is registered here. Say that the checkpoint cannot be raised from this session, record the question or decision you would have put to the human, and defer to the owning session.";
   return `- \`engine log answer …\` / \`engine log decision …\`: **An ordinary question and a summary confirmation only.** ${substitute} The protected checkpoints are **unavailable**: this runtime mints no plan-approval fingerprint or receipt and holds no approved verification command. For those, say the checkpoint cannot be recorded here, record what you would have asked, and never invent a receipt, an answer id or an approval.`;
 };
 
@@ -123,17 +150,27 @@ const checkpointRowFor = ({ policy, checkpointOwner, canAsk }) => {
 // so the prompt and the tool surface cannot disagree.
 export const invokeDialectAnnex = ({
   readOnly = false,
+  // A session that registers no platform tools at all (the composer). Its
+  // answers are rewritten onto the proposal it returns, because a channel it
+  // cannot open is not an answer.
+  toolless = false,
   policy = null,
-  checkpointOwner = !readOnly,
-  canAsk = !readOnly,
+  checkpointOwner = !readOnly && !toolless,
+  canAsk = !readOnly && !toolless,
   // Only a prompt whose own bodies invoke `engine log answer` / `log decision`
   // has its mapping adapted; every other prompt keeps the annex verbatim.
   checkpointLogInvoked = false,
 } = {}) => {
-  const row = checkpointLogInvoked ? checkpointRowFor({ policy, checkpointOwner, canAsk }) : null;
-  const annex = row
-    ? INVOKE_DIALECT_ANNEX.replace(CHECKPOINT_ANNEX_ROW, row)
-    : INVOKE_DIALECT_ANNEX;
+  const row = checkpointLogInvoked
+    ? checkpointRowFor({ policy, checkpointOwner, canAsk, toolless })
+    : null;
+  let annex = row ? INVOKE_DIALECT_ANNEX.replace(CHECKPOINT_ANNEX_ROW, row) : INVOKE_DIALECT_ANNEX;
+  if (toolless) {
+    for (const [pattern, replacement] of TOOLLESS_SUBSTITUTIONS) {
+      annex = annex.replace(pattern, replacement);
+    }
+    return `${TOOLLESS_RECORDING_PREAMBLE}\n\n${annex}`;
+  }
   return readOnly ? `${READ_ONLY_RECORDING_PREAMBLE}\n\n${annex}` : annex;
 };
 

@@ -39,7 +39,12 @@ import {
 } from '../../shared/intent-aidlc-settings.js';
 import { resolveCliSelection } from './discussion-assist-start.js';
 import { closeGraphSource } from '../mcp/graph-writer.js';
-import { hasInvokeToken, INVOKE_DIALECT_ANNEX, neutralizeTokens } from '../stage-materializer.js';
+import {
+  hasInvokeToken,
+  invokeDialectAnnex,
+  invokesCheckpointLog,
+  neutralizeTokens,
+} from '../stage-materializer.js';
 
 const logger = new Logger({
   persistentKeys: { component: 'agentcore', module: 'compose-plan-start' },
@@ -250,7 +255,17 @@ const buildComposePrompt = ({
     knowledge ? neutralizeTokens(knowledge) : null,
   ].filter(Boolean);
   const tail = [
-    hasInvokeToken(persona, knowledge) ? INVOKE_DIALECT_ANNEX : null,
+    // The composer runs ONE-SHOT with no MCP configuration, so the annex it
+    // receives is the tool-less form: every answer whose channel is a platform
+    // tool is rewritten onto the proposal it returns, and it raises no
+    // checkpoint. Appending the raw annex told a promoted fork's composer to
+    // call tools its own session does not have.
+    hasInvokeToken(persona, knowledge)
+      ? invokeDialectAnnex({
+          toolless: true,
+          checkpointLogInvoked: invokesCheckpointLog(persona, knowledge),
+        })
+      : null,
     PLATFORM_ENVIRONMENT,
     MODE_TASKS[mode],
     `Intent:\n${intentPrompt || '(none provided)'}`,

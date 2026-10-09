@@ -8,7 +8,11 @@ import {
   buildScopeGrounding,
   scopeGridFor,
 } from '../commands/compose-plan-start.js';
-import { INVOKE_DIALECT_ANNEX } from '../stage-materializer.js';
+import { INVOKE_DIALECT_ANNEX, invokeDialectAnnex } from '../stage-materializer.js';
+
+// The annex the COMPOSER receives: it registers no platform tools, so every
+// answer whose channel is one is rewritten onto the proposal it returns.
+const TOOLLESS_ANNEX = invokeDialectAnnex({ toolless: true });
 import { PROPOSAL_CONTRACT } from '../../shared/compose-match.js';
 
 // A minimal three-stage workflow: init (initialization) → analyze → build.
@@ -308,7 +312,47 @@ describe('compose-plan-start', () => {
     expect(prompt).not.toContain('{{INVOKE}}');
     expect(prompt).toContain('<runtime-managed-engine> engine graph ars --iae <s>');
     expect(prompt).toContain('<runtime-managed-engine> engine graph validate-grid');
-    expect(prompt).toContain(INVOKE_DIALECT_ANNEX);
+    expect(prompt).toContain(TOOLLESS_ANNEX);
+  });
+
+  // The composer's one-shot invocation supplies NO MCP configuration, so every
+  // answer that names a platform tool names one it cannot call. Carrying the
+  // annex is not the same as being able to perform it: a promoted fork whose
+  // composer invokes an audit or a checkpoint command must get the form this
+  // session can actually use — its own proposal — and must not be told to call
+  // `emit_stage_note`, `ask_question` or `confirm_summary`.
+  it('answers a tool-less composer in the only channel it has', async () => {
+    const deps = makeDeps({
+      oneShotText:
+        '```json\n{"mode":"matched","scope":"bugfix","rationale":["fits"],"confidence":0.8}\n```',
+    });
+    deps.loadBlockBodyFn = vi.fn(async (b) =>
+      b?.bodyRef?.s3Key === 'persona'
+        ? 'Record it: {{INVOKE}} engine audit append-raw --text <t>.'
+        : 'And log it: {{INVOKE}} engine log decision --summary <s>.',
+    );
+    const start = createComposePlanStart(deps);
+    await start(basePayload);
+    await waitForFinish(deps.store);
+
+    const prompt = deps.oneShot.mock.calls[0][0].prompt;
+    expect(prompt).toContain('**You have no platform tools in this session.**');
+    expect(prompt).toContain('`rationale`');
+    expect(prompt).not.toContain('`emit_stage_note`');
+    expect(prompt).not.toContain('Ask with `ask_question`');
+    expect(prompt).not.toContain('confirm with `confirm_summary`');
+    expect(prompt).toContain('raise no checkpoint');
+  });
+
+  // A stage session keeps the tool-bearing answers: the redirect is a property
+  // of the receiving session, not of the release.
+  it('keeps the tool-bearing answers for a session that has the tools', () => {
+    expect(
+      invokeDialectAnnex({
+        checkpointLogInvoked: true,
+        policy: { summaryConfirmation: 'required' },
+      }),
+    ).toContain('`emit_stage_note`');
   });
 
   // The release guard answers a command in the composer's knowledge as it does in
@@ -323,7 +367,7 @@ describe('compose-plan-start', () => {
 
     expect(prompt).not.toContain('{{INVOKE}}');
     expect(prompt).toContain('<runtime-managed-engine> engine graph validate-grid');
-    expect(prompt).toContain(INVOKE_DIALECT_ANNEX);
+    expect(prompt).toContain(TOOLLESS_ANNEX);
   });
 
   // The 2.6.18+ composer persona alone is ~46-48 KB, the whole compose budget.
@@ -343,7 +387,7 @@ describe('compose-plan-start', () => {
 
     const prompt = deps.oneShot.mock.calls[0][0].prompt;
     expect(prompt.length).toBeLessThanOrEqual(48 * 1024);
-    expect(prompt).toContain(INVOKE_DIALECT_ANNEX);
+    expect(prompt).toContain(TOOLLESS_ANNEX);
     expect(prompt).toContain('Intent:\n');
     expect(prompt).toContain('bugfix: runs 2 of 3 stages');
     expect(prompt).toContain('Respond with EXACTLY ONE fenced JSON block');

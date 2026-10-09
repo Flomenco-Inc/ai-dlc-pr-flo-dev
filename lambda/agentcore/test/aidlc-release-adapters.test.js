@@ -20,6 +20,7 @@ import {
   OPENCODE_DEFAULT_AGENT,
   buildOpenCodeConfig,
   buildStagePrompt,
+  invokeDialectAnnex,
   neutralizeInvoke,
   renderScopePolicy,
 } from '../stage-materializer.js';
@@ -562,6 +563,13 @@ describe('annex reach, against the prompts the runtime really builds', () => {
         knowledge: part === 'knowledge' ? body : '',
       }),
   });
+  // The COMPOSER session registers no platform tools, so the form that has to
+  // reach it is the tool-less one: an answer naming a tool it cannot call would
+  // be reach without delivery (commands/compose-plan-start.js).
+  const TOOLLESS_ANNEX = invokeDialectAnnex({ toolless: true });
+  const expectedAnnex = (session) =>
+    session === 'composer' ? TOOLLESS_ANNEX : INVOKE_DIALECT_ANNEX;
+
   const personaBrief = (role, part, body) =>
     composePersonaPrompt({
       brief: `${role} brief`,
@@ -618,8 +626,12 @@ describe('annex reach, against the prompts the runtime really builds', () => {
               ? buildStagePrompt({ stage: STAGE, stageBody: TOKEN_BODY })
               : PROMPTS[session](part, TOKEN_BODY);
           const where = `${label(block)}:${session}:${part}`;
-          expect(prompt, where).toContain(INVOKE_DIALECT_ANNEX);
+          expect(prompt, where).toContain(expectedAnnex(session));
           expect(prompt, where).not.toContain('{{INVOKE}}');
+          if (session === 'composer') {
+            expect(prompt, where).toContain('**You have no platform tools in this session.**');
+            expect(prompt, where).not.toContain('`emit_stage_note`');
+          }
           checked.push(`${session}:${part}`);
         }
       }

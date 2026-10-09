@@ -654,16 +654,22 @@ const registerCustomRelease = async ({
 // therefore hold `annexed: true` for a body a stage and a rule share, and omit
 // an approximated command whose answer never reached its prompt. Revision 5 adds
 // the execution-relevant fields no mapper consumed, which an earlier build
-// recorded on the closure but never turned into a blocker. Promotion therefore
-// re-evaluates such a list from the immutable closure, exactly like a record
-// with no list at all. Other readers (the intent-creation eligibility check) keep
-// using the stored list: a record can only be selected after a promotion has
-// written current evidence.
+// recorded on the closure but never turned into a blocker. Revision 6 covers the
+// two classification changes made on top of it: `feat/release-scope-policy`
+// judges a scope policy value by its authored type and activates one only from a
+// field a consumer reads, and the fourteen AI-DLC 2.11 engine-command families
+// are each classified in their own right, three approximated and judged by annex
+// reach, eleven refused. A list stored by the previous build therefore looks
+// current at revision 5 while still holding blockers this build has answered.
+// Promotion therefore re-evaluates such a list from the immutable closure,
+// exactly like a record with no list at all. Other readers (the intent-creation
+// eligibility check) keep using the stored list: a record can only be selected
+// after a promotion has written current evidence.
 //
 // Bump this with EVERY change to what the evidence collector decides. Without
 // it, eligibility would depend on when a record was registered or last
 // refreshed rather than on its immutable closure and this runtime.
-const FIDELITY_EVIDENCE_REVISION = 5;
+const FIDELITY_EVIDENCE_REVISION = 6;
 
 const hasCurrentFidelityEvidence = (release) =>
   Array.isArray(release.fidelityGaps) &&

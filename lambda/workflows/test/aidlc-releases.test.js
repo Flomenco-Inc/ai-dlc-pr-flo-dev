@@ -1427,7 +1427,7 @@ describe('GET /aidlc-releases — gap lists stored before protocol evidence', ()
     const readsAfterFirst = s3Mock.commandCalls(GetObjectCommand).length;
     const second = parse(await listReleases());
 
-    expect(rows.get(key).fidelityEvidenceRevision).toBe(5);
+    expect(rows.get(key).fidelityEvidenceRevision).toBe(6);
     expect(rows.get(key).fidelityGaps).not.toEqual(legacy.fidelityGaps);
     expect(s3Mock.commandCalls(GetObjectCommand).length).toBe(readsAfterFirst);
     expect(second.body.releases).toEqual(first.body.releases);

@@ -493,23 +493,25 @@ describe('a release whose stage bodies invoke engine commands', () => {
     expect(unhonouredValues({ fidelityGaps })).toEqual([]);
   });
 
-  // The engine CLI has more `orchestrate` and `state` subcommands than the annex
+  // The engine CLI has more `state` and `worktree` subcommands than the annex
   // answers. One the annex does not name gets only its catch-all, so a release
-  // that invokes it must not be honoured under the family the answered ones share.
-  it('refuses an orchestrate or state subcommand the annex does not answer', () => {
+  // that invokes it must not be honoured under the family the answered ones
+  // share — including the four parked-attempt `worktree` verbs 2.11 added, which
+  // do not drag `worktree remove` in with them.
+  it('refuses a state or worktree subcommand the annex does not answer', () => {
     const fidelityGaps = fidelityGapsFromCatalog({
       catalog: { blocks: {} },
       bodies: [
-        '{{INVOKE}} engine orchestrate report --stage code-generation --result approved',
-        '{{INVOKE}} engine orchestrate next --json',
         '{{INVOKE}} engine state practices-event --type override',
         '{{INVOKE}} engine state approve --stage code-generation',
+        '{{INVOKE}} engine worktree list --json',
+        '{{INVOKE}} engine worktree remove --slug x',
       ],
     });
 
     expect(unhonouredValues({ fidelityGaps }).map((gap) => gap.value)).toEqual([
-      'engine orchestrate next',
       'engine state approve',
+      'engine worktree remove',
     ]);
   });
 

@@ -95,7 +95,38 @@ const UNHANDLED = Object.freeze({ handling: 'unsupported', handler: null });
 // "the platform does not reproduce these semantics", not "this build has no
 // handler". `release_capability_unhandled` means the latter.
 const ANNEX_HANDLED_ENGINE_COMMANDS = Object.freeze(
-  new Set(['engine graph ars', 'engine orchestrate', 'engine recompose', 'engine state']),
+  new Set([
+    'engine graph ars',
+    'engine orchestrate',
+    'engine recompose',
+    'engine state',
+    // AI-DLC 2.11. Every name here is answered BY NAME in the annex with an
+    // answer that forbids fabricating a result, and
+    // `aidlc-release-adapters.test.js` asserts the row exists for each — a name
+    // with no row is a test failure, not a silent pass.
+    //
+    // Only the REFUSED commands are listed. The three the platform has a real
+    // seam for (`audit append-raw`, `config get`, `now`) are classified
+    // `approximated` with `annexed: true` in `aidlc-compatibility.js`, and that
+    // flag is what makes their answer's REACH checkable. This set is consulted
+    // only for a gap that already carries `annexed`, and an approximated family
+    // never produces one, so naming them here would decide nothing. The four
+    // pre-2.11 approximated families (`gen`, `workspace`, `worktree`,
+    // `graph validate-grid`) are absent for the same reason, and the annex row
+    // of every approximated family is asserted from those entries rather than
+    // from this set.
+    'engine config set',
+    'engine log answer',
+    'engine log decision',
+    'engine orchestrate next',
+    'engine state set-construction-execution',
+    'engine state set-construction-verification-command',
+    'engine testing-posture restore',
+    'engine worktree discard',
+    'engine worktree list',
+    'engine worktree purge',
+    'engine worktree restore',
+  ]),
 );
 
 const ENGINE_COMMAND_GAP_FIELD = '{{INVOKE}}';

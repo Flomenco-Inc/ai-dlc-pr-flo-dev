@@ -2371,7 +2371,7 @@ describe('promotion of a record registered before protocol evidence existed', ()
 
     expect(promoted).toMatchObject({ supportState: 'selectable', unhonouredValues: [] });
     expect(rows.get(keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META'))).toMatchObject({
-      fidelityEvidenceRevision: 5,
+      fidelityEvidenceRevision: 6,
     });
   });
 
@@ -2379,7 +2379,7 @@ describe('promotion of a record registered before protocol evidence existed', ()
     await registerRelease(registerArgs(CANDIDATE_PROFILE));
 
     expect(rows.get(keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META'))).toMatchObject({
-      fidelityEvidenceRevision: 5,
+      fidelityEvidenceRevision: 6,
     });
   });
 
@@ -2629,7 +2629,7 @@ describe('promotion of a record whose evidence predates the unmapped-field block
 
     expect(promoted).toMatchObject({ supportState: 'selectable', unhonouredValues: [] });
     expect(rows.get(key).fidelityGaps).not.toContainEqual(STALE_GAP);
-    expect(rows.get(key)).toMatchObject({ fidelityEvidenceRevision: 5 });
+    expect(rows.get(key)).toMatchObject({ fidelityEvidenceRevision: 6 });
   });
 
   it('reports the recomputed answer when an admin lists it', async () => {
@@ -2640,7 +2640,54 @@ describe('promotion of a record whose evidence predates the unmapped-field block
     const listed = releases.find((release) => release.releaseId === CANDIDATE_RELEASE_ID);
     expect(listed.unhonouredValues).toEqual([]);
     expect(listed.fidelityGaps).not.toContainEqual(STALE_GAP);
-    expect(rows.get(key)).toMatchObject({ fidelityEvidenceRevision: 5 });
+    expect(rows.get(key)).toMatchObject({ fidelityEvidenceRevision: 6 });
+  });
+});
+
+// The classification itself changed twice on top of revision 5:
+// `feat/release-scope-policy` judges a scope policy value by its authored type
+// and activates one only from a field a consumer reads, and the fourteen 2.11
+// engine-command families are each classified in their own right. A fork
+// registered while the PREVIOUS build was running holds a current-looking
+// revision-5 list with the old blockers, so promoting that same stored closure
+// after the upgrade has to recollect the evidence rather than trust it.
+describe('promotion of a record whose evidence predates the 2.11 command classification', () => {
+  const registeredAtThePreviousClassification = async () => {
+    await registerRelease(registerArgs(CANDIDATE_PROFILE));
+    const key = keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META');
+    const row = {
+      ...rows.get(key),
+      fidelityGaps: [
+        {
+          kind: 'engine-command',
+          blockType: 'BODY',
+          field: '{{INVOKE}}',
+          value: 'engine state practices-event',
+          annexed: false,
+        },
+      ],
+      fidelityEvidenceRevision: 5,
+    };
+    rows.set(key, row);
+    return { key, row };
+  };
+
+  it('recollects the evidence and stores the current revision', async () => {
+    const { key, row } = await registeredAtThePreviousClassification();
+
+    const promoted = await updateRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      releaseId: CANDIDATE_RELEASE_ID,
+      expectedRevision: row.revision,
+      patch: { supportState: 'selectable' },
+      actor: 'admin-1',
+    });
+
+    expect(promoted).toMatchObject({ supportState: 'selectable', unhonouredValues: [] });
+    expect(rows.get(key).fidelityGaps).not.toContainEqual(row.fidelityGaps[0]);
+    expect(rows.get(key)).toMatchObject({ fidelityEvidenceRevision: 6 });
   });
 });
 
@@ -2784,7 +2831,7 @@ describe('admin listing of a record registered before protocol evidence existed'
     const second = await listReleases({ ...registryArgs(), s3, bucket: BUCKET });
 
     const listed = first.find((release) => release.releaseId === CANDIDATE_RELEASE_ID);
-    expect(cached.fidelityEvidenceRevision).toBe(5);
+    expect(cached.fidelityEvidenceRevision).toBe(6);
     expect(cached.fidelityGaps).toEqual(listed.fidelityGaps);
     expect(cached.fidelityGaps).not.toEqual(legacy.fidelityGaps);
     // Evidence is derived from an immutable closure, never a decision, so the

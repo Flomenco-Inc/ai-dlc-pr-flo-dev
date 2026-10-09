@@ -159,9 +159,9 @@ const INFORMATIONAL_UNMAPPED_FIELDS = new Map([
 // annex names; the per-sensor commands are native (our own sensor runner).
 //
 // Each pattern matches exactly the subcommands the annex answers by name. The
-// engine CLI has others (`orchestrate next`, `state approve`, `worktree remove`,
-// `graph compile`, `gen runners`, …); each of those stays its own unsupported
-// family, so the promotion guard keeps refusing a release that invokes one.
+// engine CLI has others (`state approve`, `worktree remove`, `graph compile`,
+// `gen runners`, …); each of those stays its own unsupported family, so the
+// promotion guard keeps refusing a release that invokes one.
 // `annexed` marks the entries the annex answers by name; only a gap carrying it
 // can be honoured, so a command no pattern matches can never pass under the name
 // it happens to share. It is also what makes the answer's REACH checkable: an
@@ -227,6 +227,104 @@ const INVOKE_FAMILY_FIDELITY = Object.freeze([
     handling: 'unsupported',
     annexed: true,
   }),
+  // ── AI-DLC 2.11 ───────────────────────────────────────────────────────────
+  //
+  // Each new family below is its OWN entry, never folded into an existing one
+  // that happens to share a first word: `orchestrate next` performs upstream's
+  // project-type transition and `orchestrate report` does not, and the four
+  // parked-attempt `worktree` verbs are nothing like `worktree create`. Sharing
+  // a prefix would silently inherit the sibling's `annexed`, which is how a
+  // command would stop blocking promotion without ever being answered.
+  //
+  // THREE are approximated — the platform has a real seam for them, named in
+  // the annex, so they are not gaps for a release whose annex REACHES every
+  // prompt that invokes them. `annexed` is what makes that reach checkable: the
+  // seam is the annex's own answer rather than an always-available engine, so a
+  // prompt carrying one of these commands without the annex is a session with no
+  // answer, and the fidelity report raises it as a gap exactly like a refused
+  // command that went unanswered.
+  Object.freeze({
+    pattern: /^audit append-raw$/,
+    family: 'audit append-raw',
+    handling: 'approximated',
+    annexed: true,
+    note: "Upstream appends a free-form Error / Recovery / Change Request note to its own audit shard with an engine-owned timestamp. The platform binds the note to `emit_stage_note`, which reaches the intent timeline with the platform's own stamp. Not reproduced: the upstream audit shard, its taxonomy events and their authority — the annex forbids claiming either was written.",
+  }),
+  Object.freeze({
+    pattern: /^config get$/,
+    family: 'config get',
+    handling: 'approximated',
+    annexed: true,
+    note: "The effective per-intent settings and the source of each reach the agent IN the prompt (the compose grounding renders them), so the read is answered without any file access. Not reproduced: upstream's kill-switch provenance chain. The annex forbids opening a settings, environment or shell startup file to find a value, which upstream warns can hold credentials.",
+  }),
+  Object.freeze({
+    pattern: /^now$/,
+    family: 'now',
+    handling: 'approximated',
+    annexed: true,
+    note: 'Upstream supplies an authoritative engine UTC timestamp for state, review and audit text. The platform stamps its own events and carries those stamps in the prompt; where a stage asks for a timestamp the platform cannot supply, the annex tells the agent to omit the field and say so rather than fabricate one. Reviewer and support knowledge invoke this too, and a refusal there is the same instruction, so no session is left without an answer.',
+  }),
+  // ELEVEN are refused, each with an answer the annex gives BY NAME. They stay
+  // `unsupported` in the fidelity report, which is what keeps 2.11 promotable
+  // as `selectable` and never as `certified`.
+  Object.freeze({
+    pattern: /^config set$/,
+    family: 'config set',
+    handling: 'unsupported',
+    annexed: true,
+    note: 'Settings belong to the intent and only a human changes them, before the run starts; a started intent refuses the change with `settings_locked`. The agent records the requested change and never reports it as applied.',
+  }),
+  Object.freeze({
+    pattern: /^log answer$/,
+    family: 'log answer',
+    handling: 'unsupported',
+    annexed: true,
+    note: 'An ordinary question and a summary confirmation bind to `ask_question` and `confirm_summary`. The protected checkpoints — the plan-approval receipt and the verification-command approval — have no engine-owned question store, fingerprint or typed receipt here, and the annex names them as unavailable rather than letting the agent mint one.',
+  }),
+  Object.freeze({
+    pattern: /^log decision$/,
+    family: 'log decision',
+    handling: 'unsupported',
+    annexed: true,
+    note: 'Opening an ordinary checkpoint-bound question binds to `ask_question`. The verification-command case needs durable approved-command state, which does not exist here: the proposed command is recorded as a recommendation, never as approved authority.',
+  }),
+  Object.freeze({
+    pattern: /^orchestrate next$/,
+    family: 'orchestrate next',
+    handling: 'unsupported',
+    annexed: true,
+    note: 'In 2.11 this reclassifies the project type, rescans the workspace, reintroduces Reverse Engineering behind the cursor and returns to the interrupted stage. The platform owns stage routing and has no such transaction: the agent records a `RECOMMENDED PROJECT TYPE CHANGE` and a human rewinds and recomposes.',
+  }),
+  Object.freeze({
+    pattern: /^state set-construction-execution$/,
+    family: 'state set-construction-execution',
+    handling: 'unsupported',
+    annexed: true,
+    note: 'Serial / swarm construction scheduling is platform state the agent cannot write. It records the intended value and does not claim it was set.',
+  }),
+  Object.freeze({
+    pattern: /^state set-construction-verification-command$/,
+    family: 'state set-construction-verification-command',
+    handling: 'unsupported',
+    annexed: true,
+    note: 'Upstream stores a human-approved per-Unit verification command as executable authority. There is no approved-command store here, so the command is recorded as a recommendation and never presented as approved or executable.',
+  }),
+  Object.freeze({
+    pattern: /^testing-posture restore$/,
+    family: 'testing-posture restore',
+    handling: 'unsupported',
+    annexed: true,
+    note: 'Upstream restores the exact plan, instructions and Testing Contract a person approved. The platform has no atomic approved-bundle restore: the agent says the restore is unavailable and names what was lost.',
+  }),
+  ...['discard', 'list', 'purge', 'restore'].map((verb) =>
+    Object.freeze({
+      pattern: new RegExp(`^worktree ${verb}$`),
+      family: `worktree ${verb}`,
+      handling: 'unsupported',
+      annexed: true,
+      note: "Upstream parks a stale attempt's working tree and can list, purge or byte-exactly restore it. This runtime has no parked-attempt store — lanes are branches the platform creates and merges — so the agent parks, deletes, restores and purges nothing, and never maps this onto git deletion.",
+    }),
+  ),
 ]);
 
 const sha256 = (value = '') => {
@@ -640,7 +738,9 @@ const INVOKE_COMMAND_RE =
  *
  * `annexReaches: false` says the prompt this body is rendered into does not carry
  * the engine-command annex, so a command found there is not answered even when
- * the annex names it.
+ * the annex names it. An approximated family is judged by the SAME reach as a
+ * refused one: its substitute is named only in the annex, so a session that does
+ * not receive it holds the authored step and no answer either way.
  */
 const invokeCommandCollector = () => {
   const byFamily = new Map();

@@ -826,6 +826,23 @@ describe('AI-DLC 2.11 engine commands, in the real release', () => {
     );
   });
 
+  // Three refusals are engine MACHINERY rather than a command, so no
+  // `{{INVOKE}}` scanner reports them and only the annex can state them.
+  // The generic "never claim you ran it" rules are not those named answers.
+  it('names the engine machinery it refuses, not only the commands', () => {
+    const section = INVOKE_DIALECT_ANNEX.slice(
+      INVOKE_DIALECT_ANNEX.indexOf('Engine-owned machinery this runtime does not have'),
+      INVOKE_DIALECT_ANNEX.indexOf('Rules that override any engine-flavoured prose'),
+    );
+
+    expect(section).toContain('The Plan Approval state machine');
+    expect(section).toMatch(/`plan` \/ `revise` \/ `repair` \/ `approved` states/);
+    expect(section).toContain('The review-finding ledger');
+    expect(section).toMatch(/do not invent an id, a status or a disposition/);
+    expect(section).toContain('Unit-preserving replans');
+    expect(section).toContain('a human decides the rewind target');
+  });
+
   it('answers `doctor` and the CodeKB publication check, which no scanner reports', () => {
     expect(INVOKE_DIALECT_ANNEX).toContain('doctor');
     expect(INVOKE_DIALECT_ANNEX).toMatch(/never emit `VALID`\/`INVALID`|never emit VALID/);

@@ -39,6 +39,12 @@ what you can legitimately do.
 - `engine workspace codekb-scope-diff --check`: **Skip — there is no publication validator here.** No staged Scope of Analysis is parsed and no source fingerprint is compared, so there is no verdict to give: **never emit `VALID`/`INVALID`**. Name the missing prerequisite in your output instead of producing a result, and do not treat the publication as checked.
 - `engine graph ars …`: **Do not run it, and do not compute the composite yourself.** The readiness score is an advisory index for the human; nothing here routes on it. Justify each EXECUTE/SKIP with the evidence for it in your `rationale`, and never present a composite score or band as if it had been computed.
 
+Engine-owned machinery this runtime does not have, whatever a step calls it:
+
+- **The Plan Approval state machine.** The platform owns the plan gate through `request_plan_approval` where the scope asks for one. It mints no plan fingerprint and has no `plan` / `revise` / `repair` / `approved` states: **do not emulate them**, do not report a transition between them, and do not treat an approval as recorded unless the platform's own gate returned it.
+- **The review-finding ledger.** Findings have no engine-owned ids, iteration numbers or dispositions here. Return concrete findings in `submit_review` (or, as an author, in your output) and **do not invent an id, a status or a disposition** for one, or claim a finding was carried, resolved or waived by a ledger.
+- **Unit-preserving replans.** The platform's loop-back is a human-offered bounded jump, not an engine replan that keeps finished Units. Record which Units you believe are unaffected and why; **a human decides the rewind target**, and no replan preserves or discards a Unit on your word.
+
 Rules that override any engine-flavoured prose above:
 
 - **Never claim you ran an engine command**, and never report a result as if the

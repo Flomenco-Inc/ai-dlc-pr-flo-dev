@@ -2244,6 +2244,209 @@ describe('a 2.9.0 whose developer persona carries the engine command', () => {
 // An execution-relevant authored field no adapter consumes is how a future
 // release would silently lose a setting: the closure already records its name,
 // so promotion must name it as a blocker rather than leave it to certification.
+// AI-DLC 2.11.0, end to end on the real release: the exact upstream commit's
+// frontmatter (the pinned compatibility fixture, every blob verified against the
+// upstream git tree when it was generated) plus every `{{INVOKE}} engine` line
+// those files really carry. Publication, registration, promotion and every
+// offered scope's pinned plan all run against that closure.
+//
+// The two halves of the support claim are asserted together, because either one
+// alone would be a misleading result: it PROMOTES as selectable with nothing
+// unhonoured, and it REFUSES to be certified.
+describe('a deployment admitting the real AI-DLC 2.11.0', () => {
+  const PROFILE = 'v2.11.0';
+  const SHA = '6a378b53c0a4fe0641ed7d8de8dfff94264d5b6a';
+  // The eleven engine commands 2.11 invokes that this runtime refuses, each
+  // answered by name in the dialect annex, plus the four families 2.9.0 already
+  // answered. Listed verbatim: a command that stopped being answered, or a new
+  // one that started being honoured without an answer, must fail here.
+  const ANSWERED_ENGINE_COMMANDS = Object.freeze([
+    'engine config set',
+    'engine graph ars',
+    'engine log answer',
+    'engine log decision',
+    'engine orchestrate',
+    'engine orchestrate next',
+    'engine recompose',
+    'engine state',
+    'engine state set-construction-execution',
+    'engine state set-construction-verification-command',
+    'engine testing-posture restore',
+    'engine worktree discard',
+    'engine worktree list',
+    'engine worktree purge',
+    'engine worktree restore',
+  ]);
+  const bundle = buildReleaseBundle({ profileId: PROFILE, files: filesWithInvokeLines(PROFILE) });
+  const { releaseId } = bundle.manifest;
+
+  beforeEach(async () => {
+    installFakes();
+    await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+  });
+
+  const promote = async (supportState) => {
+    const { release } = await registerRelease(registerArgs(PROFILE));
+    return updateRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      releaseId,
+      expectedRevision: release.revision,
+      patch: { supportState },
+      actor: 'admin-1',
+    });
+  };
+
+  it('imports the exact upstream commit under the current importer revision', async () => {
+    const { release } = await registerRelease(registerArgs(PROFILE));
+
+    expect(release).toMatchObject({
+      profileId: PROFILE,
+      sourceSha: SHA,
+      upstreamVersion: '2.11.0',
+      importerRevision: AIDLC_RELEASE_IMPORTER_REVISION,
+      trustTier: 'T1',
+      structurallyValid: true,
+      custom: false,
+    });
+  });
+
+  it('records only engine commands the annex answers, and nothing unhonoured', async () => {
+    const { release } = await registerRelease(registerArgs(PROFILE));
+
+    expect(
+      release.fidelityGaps
+        .filter((gap) => gap.blockType === 'BODY')
+        .map((gap) => ({ value: gap.value, annexed: gap.annexed })),
+    ).toEqual(ANSWERED_ENGINE_COMMANDS.map((value) => ({ value, annexed: true })));
+    // The four settings 2.11 renames or adds are MAPPED, so none is reported as
+    // an unmapped execution-relevant field either.
+    expect(release.unhonouredValues).toEqual([]);
+  });
+
+  it('promotes to selectable, offers it, and resolves all eleven scope plans', async () => {
+    const stated = await promote('selectable');
+    await updateRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      releaseId,
+      expectedRevision: stated.revision,
+      patch: { visible: true },
+      actor: 'admin-1',
+    });
+
+    const selected = await resolveSelectableRelease({ ...registryArgs(), releaseId });
+    expect(selected).toMatchObject({ supportState: 'selectable', visible: true, runnable: true });
+
+    const resolved = await expectPinnedPlansResolve(selected);
+    expect(Object.keys(resolved.library.scopesById)).toHaveLength(11);
+  });
+
+  // The single most important assertion of this change: promotable and usable
+  // must not come to mean certified. The engine families above are ANSWERED,
+  // not reproduced, so the profile declares `selectable` as its ceiling.
+  it('refuses to be certified, naming the withheld claim', async () => {
+    await expect(promote('certified')).rejects.toMatchObject({
+      code: 'release_certification_withheld',
+      details: { maxSupportState: 'selectable' },
+    });
+
+    expect(AIDLC_COMPATIBILITY_PROFILES[PROFILE].maxSupportState).toBe('selectable');
+    // Every other release keeps its own ceiling, which is no ceiling at all.
+    for (const [id, profile] of Object.entries(AIDLC_COMPATIBILITY_PROFILES)) {
+      if (id !== PROFILE) expect(profile.maxSupportState ?? null).toBeNull();
+    }
+  });
+
+  it('still refuses an intermediate release nobody onboarded', async () => {
+    await expect(registerRelease(registerArgs('v2.10.0'))).rejects.toMatchObject({
+      code: 'release_profile_unknown',
+    });
+  });
+
+  // A fork of a 2.11-shaped body goes through the SAME guard, borrowing only the
+  // parsing dialect: it stays T0, it is `custom`, and it is never admitted under
+  // the official repository slug.
+  describe('a fork whose body is 2.11-shaped', () => {
+    const FORK_SHA = 'fedcba9876543210fedcba9876543210fedcba98';
+    const FORK_REPOSITORY = 'acme/aidlc-211-fork';
+    const forkProfile = customProfile({
+      repository: FORK_REPOSITORY,
+      sha: FORK_SHA,
+      baseProfileId: PROFILE,
+    });
+    const forkBundle = buildReleaseBundle({
+      profile: forkProfile,
+      files: filesWithInvokeLines(PROFILE),
+    });
+
+    const registerFork = async () => {
+      await publishReleaseBundle({ s3, bucket: BUCKET, bundle: forkBundle });
+      return registerCustomRelease({
+        ...registryArgs(),
+        s3,
+        bucket: BUCKET,
+        repository: FORK_REPOSITORY,
+        sha: FORK_SHA,
+        baseProfileId: PROFILE,
+        actor: 'admin-1',
+      });
+    };
+
+    it('promotes through the same guard, stays T0, and is marked custom', async () => {
+      const { release } = await registerFork();
+
+      expect(release).toMatchObject({
+        custom: true,
+        trustTier: 'T0',
+        sourceRepository: FORK_REPOSITORY,
+        runnable: false,
+      });
+      // The fork borrows the 2.11 PARSING dialect and nothing else: not the
+      // trust tier, not the support state, not the certification ceiling.
+      expect(forkProfile).toMatchObject({
+        baseProfileId: PROFILE,
+        frontmatterDialect: AIDLC_COMPATIBILITY_PROFILES[PROFILE].frontmatterDialect,
+        trustTier: 'T0',
+      });
+      expect(forkProfile.maxSupportState ?? null).toBeNull();
+      expect(release.unhonouredValues).toEqual([]);
+
+      const promoted = await updateRelease({
+        ...registryArgs(),
+        s3,
+        bucket: BUCKET,
+        releaseId: release.releaseId,
+        expectedRevision: release.revision,
+        patch: { supportState: 'selectable' },
+        actor: 'admin-1',
+      });
+
+      expect(promoted).toMatchObject({ supportState: 'selectable', runnable: true });
+      expect(promoted.trustTier).toBe('T0');
+      // The fork resolves only through a pin that names it as a fork; the
+      // official 2.11 identity is a different release id entirely.
+      expect(promoted.releaseId).not.toBe(releaseId);
+    });
+
+    it('is never admitted under the official repository slug', () => {
+      expect(() =>
+        customProfile({
+          repository: 'awslabs/aidlc-workflows',
+          sha: SHA,
+          baseProfileId: PROFILE,
+        }),
+      ).toThrow(expect.objectContaining({ code: 'custom_repository_official' }));
+    });
+  });
+});
+
+// An execution-relevant authored field no adapter consumes is how a future
+// release would silently lose a setting: the closure already records its name,
+// so promotion must name it as a blocker rather than leave it to certification.
+
 describe('a release authoring an execution-relevant field no adapter consumes', () => {
   const SCOPE_PATH = 'core/scopes/aidlc-bugfix.md';
   const FUTURE_FIELD = { blockType: 'SCOPE', field: 'future_switch', value: 'unmapped' };

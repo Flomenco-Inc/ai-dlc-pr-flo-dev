@@ -1392,6 +1392,11 @@ const mapIntent = (meta) => ({
   stageSkipping: meta.stageSkipping ?? null,
   skipStageIds: meta.skipStageIds ?? null,
   composedGrid: meta.composedGrid ?? null,
+  // The stock scope a composed grid runs on, so a reopened draft resolves the
+  // same policy and settings context the save verified. OMITTED, not nulled,
+  // for every selection that names its scope directly — which is every intent
+  // created before this field existed.
+  ...(meta.policyScope ? { policyScope: meta.policyScope } : {}),
   // The per-intent AI-DLC settings: the OVERRIDES recorded for this intent, as
   // plain values. OMITTED, not nulled, for an intent that has none: every
   // unpinned, 2.3.3, 2.8.2 and 2.9.0 intent falls in that case, and their DTOs
@@ -3963,6 +3968,17 @@ export const handler = async (event, context) => {
         if (gridError) return response(400, { error: gridError });
         patch.composedGrid = value; // null clears
       }
+      // The stock scope a composed grid runs on. Verified against the pinned
+      // workflow's own scope vocabulary below, together with the grid itself.
+      if (data.policyScope !== undefined) {
+        if (
+          data.policyScope !== null &&
+          (typeof data.policyScope !== 'string' || !data.policyScope)
+        ) {
+          return response(400, { error: 'policyScope must be a non-empty scope name or null' });
+        }
+        patch.policyScope = data.policyScope || null; // null clears
+      }
       if (data.skipStageIds !== undefined) {
         if (data.skipStageIds !== null && !Array.isArray(data.skipStageIds)) {
           return response(400, { error: 'skipStageIds must be an array of stage ids or null' });
@@ -4005,6 +4021,7 @@ export const handler = async (event, context) => {
       if (
         patch.scope !== undefined ||
         patch.composedGrid !== undefined ||
+        patch.policyScope !== undefined ||
         patch.skipStageIds !== undefined ||
         settingsRequested
       ) {
@@ -4031,6 +4048,24 @@ export const handler = async (event, context) => {
             });
           }
         }
+        // A base scope belongs to a GRID, so clearing the grid clears it in the
+        // SAME write. A row that kept the previous base would apply it to no
+        // grid: every later save and Start would be refused, and no client
+        // could repair it, because the field only travels with a grid. An
+        // explicitly sent base scope without a grid is still a 400, because
+        // that is a caller describing a selection that names its scope
+        // directly.
+        let effPolicyScope =
+          patch.policyScope !== undefined ? patch.policyScope : (meta.policyScope ?? null);
+        if (!effGrid && effPolicyScope) {
+          if (patch.policyScope) {
+            return response(400, {
+              error: 'policyScope applies to a composed stage grid; send the scope itself instead',
+            });
+          }
+          effPolicyScope = null;
+          patch.policyScope = null;
+        }
         // Which settings EXIST is decided by the selection, so the authored map
         // is resolved from the selection in THIS body — never from a stored
         // snapshot that may describe a different one — and the settings are
@@ -4040,13 +4075,17 @@ export const handler = async (event, context) => {
         // ones too, in the same write: the run honours whatever META holds, so
         // a scope that does not author a recorded override must not leave it
         // there to be honoured. The withdrawal is recorded by the same write.
-        const selectionChanged = patch.scope !== undefined || patch.composedGrid !== undefined;
+        const selectionChanged =
+          patch.scope !== undefined ||
+          patch.composedGrid !== undefined ||
+          patch.policyScope !== undefined;
         settingsChanged = settingsRequested || (selectionChanged && Boolean(meta.aidlcSettings));
         if (settingsChanged) {
           const authoredCheck = await intentMethodology.loadPlan(meta, {
             scope: effScope,
             skipStageIds: effSkips ?? null,
             composedGrid: effGrid ?? null,
+            policyScope: effPolicyScope,
             intentSettings: null,
           });
           if (!authoredCheck.valid) {
@@ -4068,6 +4107,7 @@ export const handler = async (event, context) => {
           scope: effScope,
           skipStageIds: effSkips ?? null,
           composedGrid: effGrid ?? null,
+          policyScope: effPolicyScope,
           ...(patch.aidlcSettings !== undefined ? { intentSettings: patch.aidlcSettings } : {}),
         });
         if (!planCheck.valid) {
@@ -4076,8 +4116,31 @@ export const handler = async (event, context) => {
             errors: planCheck.errors ?? [],
           });
         }
+        // The base is honoured ONLY on a catalog that authors the per-intent
+        // settings, so the catalog's own answer — carried beside the plan this
+        // resolution already produced — decides what happens to it here.
+        //
+        // On any other library the base resolves nothing the run reads, so it
+        // is DROPPED rather than refused and rather than stored: the page
+        // records the base for every stock scope, and an unpinned, 2.3.3,
+        // 2.8.2 or 2.9.0 draft must keep both the save it always made and the
+        // row it always had. Dropping it also repairs a row an older bundle
+        // left behind. Where the base IS honoured it has to name a real scope
+        // block, or a customized grid would quietly run with no policy at all.
+        if (effPolicyScope && !planCheck.aidlcSettingsAware) {
+          effPolicyScope = null;
+          patch.policyScope = null;
+        } else if (effPolicyScope) {
+          const scopes = await intentMethodology.loadScopes(meta);
+          if (!scopes.includes(effPolicyScope)) {
+            return response(400, {
+              error: `Unknown policyScope "${effPolicyScope}" for workflow "${meta.workflowId}"`,
+              scopes,
+            });
+          }
+        }
         patch.planWarnings = planCheck.warnings?.length ? planCheck.warnings : null;
-        settingsScope = effScope;
+        settingsScope = effPolicyScope ?? effScope;
       }
       if (!Number.isSafeInteger(data.ifDraftRevision) || data.ifDraftRevision < 0) {
         return response(428, {
@@ -5525,6 +5588,17 @@ export const handler = async (event, context) => {
       if (composedGridError) {
         return response(400, { error: composedGridError });
       }
+      // The stock scope the grid was built from. A grid's own `scope` is a
+      // provenance label that names no SCOPE block, so this is what carries the
+      // per-scope policy and the settings a member may choose. Verified against
+      // the pinned release's own scope vocabulary below, never taken on trust.
+      let policyScope = null;
+      if (data.policyScope !== undefined && data.policyScope !== null) {
+        if (typeof data.policyScope !== 'string' || !data.policyScope) {
+          return response(400, { error: 'policyScope must be a non-empty scope name or null' });
+        }
+        policyScope = data.policyScope;
+      }
       // Per-intent release selection. The registry is the
       // ONLY selection gate; it is consulted here and nowhere in the execution
       // path, so demoting a release never changes what an existing intent runs.
@@ -5614,6 +5688,26 @@ export const handler = async (event, context) => {
       } else if (!scope) {
         scope = 'composed';
       }
+      if (policyScope) {
+        if (!composedGrid) {
+          return response(400, {
+            error: 'policyScope applies to a composed stage grid; send the scope itself instead',
+          });
+        }
+        const scopes = await loadWorkflowScopes({
+          ddb,
+          tableName: BLOCKS_TABLE(),
+          workflowId,
+          workflowVersion,
+          ...selectedReleaseOptions,
+        });
+        if (!scopes.includes(policyScope)) {
+          return response(400, {
+            error: `Unknown policyScope "${policyScope}" for workflow "${workflowId}"`,
+            scopes,
+          });
+        }
+      }
       // Per-intent stage deselection (shared/stage-skip.js): only accepted when
       // stage skipping is EFFECTIVELY enabled (project override over platform
       // setting), and validated structurally by the plan resolver below
@@ -5669,6 +5763,7 @@ export const handler = async (event, context) => {
         scope,
         ...(skipStageIds ? { skipStageIds } : {}),
         ...(composedGrid ? { composedGrid } : {}),
+        ...(policyScope ? { policyScope } : {}),
         ...selectedReleaseOptions,
       });
       // A stable channel is an implicit default, so an overlay it cannot apply
@@ -5751,6 +5846,7 @@ export const handler = async (event, context) => {
           scope,
           ...(skipStageIds ? { skipStageIds } : {}),
           ...(composedGrid ? { composedGrid } : {}),
+          ...(policyScope ? { policyScope } : {}),
           intentSettings: aidlcSettings,
           ...selectedReleaseOptions,
         });
@@ -6088,6 +6184,7 @@ export const handler = async (event, context) => {
         stageSkipping,
         skipStageIds,
         composedGrid,
+        policyScope,
         aidlcSettings,
         source,
         planWarnings,

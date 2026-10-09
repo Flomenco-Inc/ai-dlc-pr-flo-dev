@@ -262,6 +262,7 @@ const loadReleaseExecutionPlan = async ({
   scope,
   skipStageIds,
   composedGrid,
+  policyScope,
   strict,
   intentSettings,
   methodologyPins,
@@ -301,6 +302,7 @@ const loadReleaseExecutionPlan = async ({
     library: resolved.library,
     skipStageIds,
     composedGrid,
+    policyScope,
     strict,
     intentSettings,
   });
@@ -320,6 +322,10 @@ const loadExecutionPlan = async ({
   scope,
   skipStageIds = null,
   composedGrid = null,
+  // The stock scope a composed grid runs on, carrying its policy and the
+  // settings a member may choose (see buildExecutionPlan). Release mode only:
+  // a legacy plan resolves no policy at all.
+  policyScope = null,
   strict = false,
   // Per-intent AI-DLC settings (shared/intent-aidlc-settings.js). Only a
   // release-pinned plan can resolve a policy, so only that branch forwards
@@ -342,6 +348,7 @@ const loadExecutionPlan = async ({
       scope,
       skipStageIds,
       composedGrid,
+      policyScope,
       strict,
       intentSettings,
       methodologyPins,

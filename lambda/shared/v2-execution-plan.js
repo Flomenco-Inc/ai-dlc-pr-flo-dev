@@ -38,6 +38,16 @@ import { stageSkipBlockReason } from './stage-skip.js';
 import { SYSTEM_TENANT } from './tenant.js';
 import { scopeAidlcSettings } from './intent-aidlc-settings.js';
 
+// Whether a pinned catalog AUTHORS the per-intent settings at all, from its
+// SCOPE blocks. This is the ONE question that decides whether a recorded base
+// scope means anything: the base exists so a member who customizes the stages
+// keeps the switches the scope offers, so a catalog that offers none has no
+// base to honour, and no caller may be refused for sending one.
+const catalogAuthorsAidlcSettings = (scopesById) =>
+  Object.values(scopesById ?? {}).some(
+    (block) => Object.keys(scopeAidlcSettings(block)).length > 0,
+  );
+
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
 // this module implements. Checked against the registry by a test, so a
 // capability cannot be declared handled without the code that handles it.
@@ -680,6 +690,13 @@ const buildExecutionPlan = ({
   // dry run stays lenient (stock scopes legitimately shortcut); a mid-run
   // reshape must never park a stage waiting for an input nothing will write.
   strict = false,
+  // The STOCK scope a composed grid was built from, when the caller recorded
+  // one. A grid's `scope` is a display label (`bugfix-custom`, a composer's
+  // proposal name) that names no SCOPE block, so without this the whole
+  // per-scope policy — and the settings a member may choose — silently vanished
+  // the moment a run was customized. Absent for every selection that names its
+  // scope directly, which keeps those plans byte-for-byte unchanged.
+  policyScope = null,
   // The per-intent AI-DLC settings a project member recorded on this intent
   // (shared/intent-aidlc-settings.js), as a plain `{ settingKey: scalar }` map
   // of OVERRIDES. They override the pinned scope's defaults for the four 2.11
@@ -896,10 +913,21 @@ const buildExecutionPlan = ({
   const namespace = settings.executionId ?? `${workflowId}@${workflowVersion}`;
 
   // The SCOPE block backing this run: the source of the per-scope execution
-  // policy. Only consulted in release mode (PROVENANCE GATE); absent (an older
-  // catalog, or a composed grid whose provenance label names no scope block)
-  // leaves every stage on the legacy path.
-  const scopeBlock = policyEnabled && scope ? (scopesById[scope] ?? null) : null;
+  // policy. A composed grid's own `scope` is a provenance label, so the base
+  // scope the caller recorded is what carries the policy; everything else reads
+  // its own scope. Only consulted in release mode (PROVENANCE GATE); absent (an
+  // older catalog, or a customized run with no recorded base scope) leaves
+  // every stage on the legacy path.
+  //
+  // The recorded base is honoured ONLY on a catalog that authors the per-intent
+  // settings. The base exists so a member who customizes the stages keeps the
+  // switches the scope offers; a catalog that offers none has no reason to
+  // resolve a policy for a customized grid that resolved none before, and
+  // honouring it there would change what an existing 2.8.2 or 2.9.0 custom grid
+  // runs.
+  const settingsAwareCatalog = catalogAuthorsAidlcSettings(scopesById);
+  const policyScopeId = (settingsAwareCatalog ? policyScope : null) ?? scope;
+  const scopeBlock = policyEnabled && policyScopeId ? (scopesById[policyScopeId] ?? null) : null;
   const authoredAidlcSettings = scopeAidlcSettings(scopeBlock);
   const policyEffects = [];
   // Resolved ONCE per plan (release mode only): the version-agnostic capability
@@ -1249,7 +1277,17 @@ const buildExecutionPlan = ({
       outOfScopeStages: outOfScopeStageIds.length,
     },
   };
-  return { valid: errors.length === 0, errors, warnings, plan };
+  // Beside the plan, never inside it: the plan document's shape stays exactly
+  // what it was, and a caller that has to decide what to do with a recorded
+  // base scope (the draft API, validate-grid) reads the catalog's answer from
+  // the resolution it already paid for instead of re-deriving it.
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+    plan,
+    ...(settingsAwareCatalog ? { aidlcSettingsAware: true } : {}),
+  };
 };
 
 // Split an ordered plan-stage list into an alternating sequence of segments the
@@ -1274,6 +1312,7 @@ const planSegments = (stages) => {
 
 export {
   buildExecutionPlan,
+  catalogAuthorsAidlcSettings,
   planSegments,
   stageInstanceId,
   workflowScopes,
@@ -1285,6 +1324,7 @@ export {
 };
 export default {
   buildExecutionPlan,
+  catalogAuthorsAidlcSettings,
   planSegments,
   stageInstanceId,
   workflowScopes,

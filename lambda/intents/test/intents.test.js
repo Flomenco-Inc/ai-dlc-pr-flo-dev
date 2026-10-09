@@ -10436,3 +10436,282 @@ describe('per-intent AI-DLC settings', () => {
     expect(metaFor(intent.id).aidlcSettings).toBeUndefined();
   });
 });
+
+// The stock scope a composed grid runs on. The grid's own `scope` is a label,
+// so this field is what carries the policy and the settings a member may
+// choose; it belongs to the grid and must leave with it.
+describe('the policy scope a composed grid runs on', () => {
+  const SCOPE_FIXTURE = JSON.parse(
+    readFileSync(
+      new URL('../../shared/test/fixtures/aidlc-211-scopes.json', import.meta.url),
+      'utf8',
+    ),
+  );
+  const PROFILE = 'v2.9.0';
+
+  const compatibilityFiles = () =>
+    filesFromCompatibilityFixture({
+      profileId: PROFILE,
+      fixture: JSON.parse(
+        readFileSync(
+          new URL(
+            `../../shared/test/fixtures/aidlc-compatibility/${PROFILE}.json`,
+            import.meta.url,
+          ),
+          'utf8',
+        ),
+      ),
+    });
+
+  const filesWithSettingsScopes = () => {
+    const files = compatibilityFiles();
+    for (const path of files.keys()) {
+      if (path.startsWith('core/scopes/')) files.delete(path);
+    }
+    for (const [path, entry] of Object.entries(SCOPE_FIXTURE.scopes)) {
+      files.set(path, `---\n${entry.frontmatter}\n---\n[BODY OMITTED]\n`);
+    }
+    return files;
+  };
+
+  const bundle = buildReleaseBundle({ profileId: PROFILE, files: filesWithSettingsScopes() });
+  const pin = methodologyReleasePinFromManifest(bundle.manifest);
+  const releaseStore = new Map();
+
+  const installReleaseObjects = () => {
+    releaseStore.clear();
+    releaseStore.set(pin.manifestKey, JSON.stringify(bundle.manifest, null, 2));
+    releaseStore.set(pin.catalogKey, JSON.stringify(bundle.catalog, null, 2));
+    s3Mock.on(GetObjectCommand).callsFake((input) => {
+      if (!releaseStore.has(input.Key)) {
+        const error = new Error('missing');
+        error.name = 'NoSuchKey';
+        error.$metadata = { httpStatusCode: 404 };
+        throw error;
+      }
+      return { Body: Buffer.from(releaseStore.get(input.Key)) };
+    });
+  };
+
+  const seedRegistryRecord = () => {
+    procStore.set(keyOf(`AIDLC_RELEASE#${pin.releaseId}`, 'META'), {
+      pk: `AIDLC_RELEASE#${pin.releaseId}`,
+      sk: 'META',
+      type: 'AidlcRelease',
+      ...pin,
+      profileId: PROFILE,
+      upstreamVersion: '2.9.0',
+      upstreamChannel: 'stable',
+      trustTier: 'T1',
+      supportState: 'selectable',
+      fidelityGaps: [],
+      structurallyValid: true,
+      visible: true,
+      runnable: true,
+      notes: null,
+      revision: 1,
+      GSI1PK: 'AIDLC_RELEASES',
+    });
+  };
+
+  const metaFor = (intentId) => procStore.get(keyOf(`EXEC#${intentId}`, 'META'));
+
+  const fixture = async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    procStore.delete(keyOf('WF#default#aidlc-v2', 'V#4#SCOPEREF#feature'));
+    seedRegistryRecord();
+    return { sub, projectId };
+  };
+
+  const GRID = Object.fromEntries(
+    bundle.catalog.workflow.placements.map((placement) => [placement.stageId, 'EXECUTE']),
+  );
+
+  const gridFor = async (sub, projectId) =>
+    JSON.parse(
+      (
+        await createIntent(sub, projectId, {
+          title: 'I',
+          prompt: 'Build X',
+          scope: 'enterprise',
+          methodologyReleaseId: pin.releaseId,
+        })
+      ).body,
+    );
+
+  const patch = (sub, projectId, intentId, body) =>
+    handler({
+      httpMethod: 'PATCH',
+      path: `/projects/${projectId}/intents/${intentId}`,
+      pathParameters: { projectId, intentId },
+      body: JSON.stringify({
+        ifDraftRevision: metaFor(intentId)?.draftRevision ?? 0,
+        ...body,
+      }),
+      ...claims(sub),
+    });
+
+  beforeEach(() => {
+    vi.stubEnv('AIDLC_RELEASE_PINNING', 'on');
+    releaseResolverTest.releaseClosureCache.clear();
+    installReleaseObjects();
+  });
+
+  it('keeps the base scope with the grid and offers its settings', async () => {
+    const { sub, projectId } = await fixture();
+    const intent = await gridFor(sub, projectId);
+
+    const saved = await patch(sub, projectId, intent.id, {
+      scope: 'enterprise-custom',
+      composedGrid: GRID,
+      policyScope: 'enterprise',
+      aidlcSettings: { guardPolicy: 'off' },
+    });
+
+    expect(saved.statusCode).toBe(200);
+    const body = JSON.parse(saved.body);
+    expect(body.policyScope).toBe('enterprise');
+    // `enterprise` authors guard_policy strict, so `off` is a real override and
+    // is kept — which it could not be if the label carried the policy.
+    expect(body.aidlcSettings).toEqual({ guardPolicy: 'off' });
+    expect(metaFor(intent.id).policyScope).toBe('enterprise');
+  });
+
+  it('clears the base scope in the same write that clears the grid', async () => {
+    const { sub, projectId } = await fixture();
+    const intent = await gridFor(sub, projectId);
+    await patch(sub, projectId, intent.id, {
+      scope: 'enterprise-custom',
+      composedGrid: GRID,
+      policyScope: 'enterprise',
+    });
+    expect(metaFor(intent.id).policyScope).toBe('enterprise');
+
+    const cleared = await patch(sub, projectId, intent.id, {
+      scope: 'enterprise',
+      composedGrid: null,
+    });
+
+    expect(cleared.statusCode).toBe(200);
+    expect(JSON.parse(cleared.body)).not.toHaveProperty('policyScope');
+    expect(metaFor(intent.id).policyScope).toBeUndefined();
+  });
+
+  it('refuses a base scope for a selection that names its scope directly', async () => {
+    const { sub, projectId } = await fixture();
+    const intent = await gridFor(sub, projectId);
+
+    const res = await patch(sub, projectId, intent.id, {
+      scope: 'enterprise',
+      composedGrid: null,
+      policyScope: 'enterprise',
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/applies to a composed stage grid/);
+  });
+
+  it('refuses a base scope the pinned workflow does not have', async () => {
+    const { sub, projectId } = await fixture();
+    const intent = await gridFor(sub, projectId);
+
+    const res = await patch(sub, projectId, intent.id, {
+      scope: 'enterprise-custom',
+      composedGrid: GRID,
+      policyScope: 'not-a-scope',
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/Unknown policyScope "not-a-scope"/);
+  });
+
+  it('omits the field entirely for an intent that names its scope directly', async () => {
+    const { sub, projectId } = await fixture();
+    const intent = await gridFor(sub, projectId);
+
+    expect(intent).not.toHaveProperty('policyScope');
+    expect(metaFor(intent.id).policyScope).toBeUndefined();
+  });
+
+  // The same field against a library whose scopes author none of these
+  // settings. The base resolves no policy there, so it is IGNORED: accepted,
+  // never stored and never a refusal. The page records the base for every
+  // stock scope, so this is the save a 2.3.3, 2.8.2 or 2.9.0 draft now makes,
+  // and its row has to stay the row it had before this field existed.
+  describe('against a library that authors no settings', () => {
+    const legacyBundle = buildReleaseBundle({ profileId: PROFILE, files: compatibilityFiles() });
+    const legacyPin = methodologyReleasePinFromManifest(legacyBundle.manifest);
+
+    const legacyFixture = async () => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      procStore.delete(keyOf('WF#default#aidlc-v2', 'V#4#SCOPEREF#feature'));
+      procStore.set(keyOf(`AIDLC_RELEASE#${legacyPin.releaseId}`, 'META'), {
+        pk: `AIDLC_RELEASE#${legacyPin.releaseId}`,
+        sk: 'META',
+        type: 'AidlcRelease',
+        ...legacyPin,
+        profileId: PROFILE,
+        upstreamVersion: '2.9.0',
+        upstreamChannel: 'stable',
+        trustTier: 'T1',
+        supportState: 'selectable',
+        fidelityGaps: [],
+        structurallyValid: true,
+        visible: true,
+        runnable: true,
+        notes: null,
+        revision: 1,
+        GSI1PK: 'AIDLC_RELEASES',
+      });
+      releaseStore.set(legacyPin.manifestKey, JSON.stringify(legacyBundle.manifest, null, 2));
+      releaseStore.set(legacyPin.catalogKey, JSON.stringify(legacyBundle.catalog, null, 2));
+      const intent = JSON.parse(
+        (
+          await createIntent(sub, projectId, {
+            title: 'I',
+            prompt: 'Build X',
+            scope: 'enterprise',
+            methodologyReleaseId: legacyPin.releaseId,
+          })
+        ).body,
+      );
+      return { sub, projectId, intent };
+    };
+
+    const LEGACY_GRID = Object.fromEntries(
+      legacyBundle.catalog.workflow.placements.map((placement) => [placement.stageId, 'EXECUTE']),
+    );
+
+    it('accepts a base scope and stores nothing for it', async () => {
+      const { sub, projectId, intent } = await legacyFixture();
+
+      const saved = await patch(sub, projectId, intent.id, {
+        scope: 'enterprise-custom',
+        composedGrid: LEGACY_GRID,
+        policyScope: 'enterprise',
+      });
+
+      expect(saved.statusCode).toBe(200);
+      expect(JSON.parse(saved.body)).not.toHaveProperty('policyScope');
+      expect(Object.hasOwn(metaFor(intent.id), 'policyScope')).toBe(false);
+    });
+
+    // Not a refusal either when the name resolves to nothing: an older bundle
+    // sent the display label here, and the member who is still running it must
+    // not have a save rejected for a field this library never reads.
+    it('ignores a base scope it cannot resolve instead of refusing the save', async () => {
+      const { sub, projectId, intent } = await legacyFixture();
+
+      const saved = await patch(sub, projectId, intent.id, {
+        scope: 'enterprise-custom',
+        composedGrid: LEGACY_GRID,
+        policyScope: 'enterprise-custom',
+      });
+
+      expect(saved.statusCode).toBe(200);
+      expect(Object.hasOwn(metaFor(intent.id), 'policyScope')).toBe(false);
+    });
+  });
+});

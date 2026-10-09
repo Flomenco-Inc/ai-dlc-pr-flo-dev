@@ -84,7 +84,7 @@ import {
 } from '../shared/workflows.js';
 import { blockPk, catalogGsi1Pk, LATEST, RULE_LAYERS, versionSk } from '../shared/blocks.js';
 import { compileWorkflow } from '../shared/compile.js';
-import { buildExecutionPlan } from '../shared/v2-execution-plan.js';
+import { buildExecutionPlan, catalogAuthorsAidlcSettings } from '../shared/v2-execution-plan.js';
 import { normalizeComposedGrid } from '../shared/composed-grid.js';
 import { Logger } from '@aws-lambda-powertools/logger';
 
@@ -1014,9 +1014,12 @@ const getExecutionPreview = async (event, res, tenant, workflowId) => {
 
 // POST /workflows/{id}/validate-grid — dry-run a composed EXECUTE/SKIP grid
 // against the pinned workflow (upstream's validate-grid). Body:
-//   { composedGrid: {stageId: EXECUTE|SKIP}, scope?, skipStageIds?, strict? }
-// `scope` is the provenance label only (defaults to "composed"); `strict`
-// promotes starved required inputs to errors (the in-flight recompose rule).
+//   { composedGrid: {stageId: EXECUTE|SKIP}, scope?, policyScope?,
+//     skipStageIds?, strict? }
+// `scope` is the provenance label only (defaults to "composed"); `policyScope`
+// names the stock scope the grid was built from, which is what carries the
+// per-scope policy and the settings a member may choose; `strict` promotes
+// starved required inputs to errors (the in-flight recompose rule).
 // Read-only despite the verb — a grid over 30+ stages does not fit a query
 // string — so it is exempted from the admin guard in the router.
 const validateGrid = async (event, res, tenant, workflowId) => {
@@ -1037,12 +1040,32 @@ const validateGrid = async (event, res, tenant, workflowId) => {
   const inputs = await loadPlanInputs(event, tenant, workflowId);
   if (inputs.status) return res(inputs.status, inputs.body);
 
+  // The stock scope the grid was built from, when the caller names one: the
+  // preview must resolve the SAME policy and settings context the save and the
+  // run will, or a member is offered settings the API then drops.
+  //
+  // IGNORED, never refused, on a catalog that authors no per-intent settings:
+  // the base resolves no policy there, so the preview of an unpinned, 2.3.3,
+  // 2.8.2 or 2.9.0 grid is exactly the preview it was before this field
+  // existed — and a page that records the base for every stock scope does not
+  // have its preview rejected by a legacy library. Where the base IS honoured
+  // it has to name a real scope block, or the grid would quietly preview with
+  // no policy at all.
+  const requestedPolicyScope =
+    typeof data.policyScope === 'string' && data.policyScope ? data.policyScope : null;
+  const policyScope = catalogAuthorsAidlcSettings(inputs.library?.scopesById)
+    ? requestedPolicyScope
+    : null;
+  if (policyScope && !inputs.library?.scopesById?.[policyScope]) {
+    return res(400, { error: `Unknown policyScope "${policyScope}" for this workflow` });
+  }
   const result = buildExecutionPlan({
     workflow: inputs.workflow,
     scope: typeof data.scope === 'string' && data.scope ? data.scope : 'composed',
     library: inputs.library,
     compiled: inputs.compiled,
     composedGrid,
+    ...(policyScope ? { policyScope } : {}),
     ...(skipStageIds ? { skipStageIds } : {}),
     strict: data.strict === true,
   });

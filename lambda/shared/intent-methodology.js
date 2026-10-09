@@ -5,7 +5,14 @@ import { loadExecutionPlan, loadWorkflowScopes } from './v2-workflow-plan.js';
 // resolution all build their projection from this one list, so a new projection
 // field cannot reach one caller and silently miss another — which is exactly how
 // a validated setting ended up never reaching the run.
-const PROJECTION_FIELDS = ['scope', 'skipStageIds', 'composedGrid', 'strict', 'intentSettings'];
+const PROJECTION_FIELDS = [
+  'scope',
+  'skipStageIds',
+  'composedGrid',
+  'policyScope',
+  'strict',
+  'intentSettings',
+];
 
 // META records the per-intent settings under their own name; the plan resolver
 // calls them `intentSettings`. One mapping here reaches every plan caller.
@@ -40,6 +47,7 @@ const planProjectionOptions = (meta, overrides) => {
     // argument unless a caller explicitly supplies one to clear a snapshot.
     if (field === 'skipStageIds' && (!Array.isArray(value) || value.length === 0)) continue;
     if (field === 'composedGrid' && value == null) continue;
+    if (field === 'policyScope' && value == null) continue;
     if (field === 'intentSettings' && value == null) continue;
     options[field] = value;
   }

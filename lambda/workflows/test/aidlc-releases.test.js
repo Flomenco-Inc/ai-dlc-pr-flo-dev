@@ -1495,3 +1495,50 @@ describe('GET /aidlc-releases — gap lists stored before protocol evidence', ()
     });
   });
 });
+
+// ── `policyScope` on a library whose scopes author no per-intent settings ──
+//
+// The base scope a composed grid was built from resolves a policy only where
+// the catalog authors those settings. This candidate closure is a 2.9.0 one and
+// authors none, so the field changes nothing the preview computes — and the
+// compose page records the base for every stock scope. A preview that refused
+// it would make the grid editor unusable on every release before 2.11.
+describe('POST /workflows/{id}/validate-grid — a base scope the library never reads', () => {
+  beforeEach(async () => {
+    await register(CANDIDATE_PROFILE);
+    seedWorkflowMeta();
+    await promote(CANDIDATE_RELEASE_ID, 'selectable');
+  });
+
+  const validateWithBase = (policyScope) =>
+    handler({
+      ...releaseEvent({
+        method: 'POST',
+        resource: '/workflows/{workflowId}/validate-grid',
+        body: {
+          composedGrid: { 'requirements-elaboration': 'EXECUTE' },
+          scope: 'mvp-custom',
+          policyScope,
+        },
+      }),
+      pathParameters: { workflowId: 'aidlc-v2' },
+      queryStringParameters: { release: CANDIDATE_RELEASE_ID },
+    });
+
+  it('previews the grid instead of refusing a stock base scope', async () => {
+    const res = parse(await validateWithBase('mvp'));
+
+    expect(res.status).toBe(200);
+    // Nothing is resolved FROM the base: a library that authors no settings
+    // reports none, exactly as it did before the field existed.
+    expect(res.body.plan?.aidlcSettingsAuthored).toBeUndefined();
+    expect(res.body.aidlcSettingsAware).toBeUndefined();
+  });
+
+  it('previews the grid instead of refusing a base scope it cannot resolve', async () => {
+    const res = parse(await validateWithBase('mvp-custom'));
+
+    expect(res.status).toBe(200);
+    expect(res.body.plan?.aidlcSettingsAuthored).toBeUndefined();
+  });
+});

@@ -413,6 +413,11 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     // override) and by the recompose path (which retires + relaunches the
     // run). Validated shape only — the plan resolver owns grid policy.
     composedGrid,
+    // The stock scope a composed grid runs on (see buildExecutionMeta). DRAFT
+    // only, routed by the intents API, which verifies it against the pinned
+    // workflow's scope vocabulary; the store validates shape, like every field
+    // here.
+    policyScope,
     // Per-intent AI-DLC settings (shared/intent-aidlc-settings.js). DRAFT-only,
     // routed by the intents API, which owns the lifecycle rule and the value
     // normalisation; the store validates shape, like every field here.
@@ -622,6 +627,17 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       sets.push('composedGrid = :cgr');
       values[':cgr'] = composedGrid && Object.keys(composedGrid).length ? composedGrid : null;
     }
+    if (policyScope !== undefined) {
+      if (policyScope !== null && typeof policyScope !== 'string') {
+        throw new Error('policyScope must be a scope name or null');
+      }
+      if (policyScope) {
+        sets.push('policyScope = :pscope');
+        values[':pscope'] = policyScope;
+      } else {
+        removes.push('policyScope');
+      }
+    }
     if (aidlcSettings !== undefined) {
       if (
         aidlcSettings !== null &&
@@ -694,7 +710,7 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       sets.push('draftRevision = :nextDraftRevision');
       values[':nextDraftRevision'] = ifDraftRevision + 1;
     } else if (
-      [title, prompt, scope, composedGrid, skipStageIds, aidlcSettings].some(
+      [title, prompt, scope, composedGrid, policyScope, skipStageIds, aidlcSettings].some(
         (value) => value !== undefined,
       )
     ) {

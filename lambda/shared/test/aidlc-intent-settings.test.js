@@ -484,3 +484,111 @@ describe('the gate notice when Plan Approval is off', () => {
     }
   });
 });
+
+// A composed grid's `scope` is a DISPLAY LABEL. `bugfix-custom` names no SCOPE
+// block, so the moment a run was customized the whole per-scope policy — and
+// every setting a member could choose — silently vanished. The base scope the
+// caller records is what carries them.
+describe('the policy scope a customized selection runs on', () => {
+  const customGrid = async ({ policyScope = null, intentSettings = null } = {}) => {
+    const { workflow, library } = await releaseContext();
+    const base = buildExecutionPlan({ workflow, scope: 'enterprise', library });
+    expect(base.valid).toBe(true);
+    const grid = Object.fromEntries(base.plan.stages.map((stage) => [stage.stageId, 'EXECUTE']));
+    const { plan, valid, errors } = buildExecutionPlan({
+      workflow,
+      scope: 'enterprise-custom',
+      library,
+      composedGrid: grid,
+      ...(policyScope ? { policyScope } : {}),
+      ...(intentSettings ? { intentSettings } : {}),
+    });
+    expect({ valid, errors }).toEqual({ valid: true, errors: [] });
+    return plan;
+  };
+
+  it('offers nothing and resolves no scope policy for a label that names no block', async () => {
+    const plan = await customGrid();
+
+    expect(plan).not.toHaveProperty('aidlcSettingsAuthored');
+    for (const stage of plan.stages) {
+      expect({
+        stageId: stage.stageId,
+        guardPolicy: stage.policy?.guardPolicy ?? null,
+        collaborators: stage.policy?.collaborators ?? null,
+      }).toEqual({ stageId: stage.stageId, guardPolicy: null, collaborators: null });
+    }
+  });
+
+  it('resolves the recorded base scope’s policy and the settings it authors', async () => {
+    const plan = await customGrid({ policyScope: 'enterprise' });
+
+    expect(plan.aidlcSettingsAuthored).toEqual({
+      guardPolicy: 'strict',
+      planApproval: 'on',
+      collaborators: 'on',
+    });
+    for (const stage of plan.stages) {
+      expect(stage.policy?.guardPolicy).toBe('strict');
+      expect(stage.policy?.collaborators).toBe('on');
+    }
+  });
+
+  it('lets a per-intent override beat the recorded base scope', async () => {
+    const plan = await customGrid({
+      policyScope: 'enterprise',
+      intentSettings: { guardPolicy: 'off' },
+    });
+
+    for (const stage of plan.stages) {
+      expect(stage.policy?.guardPolicy).toBe('off');
+      expect(stage.policy?.changeControl).toBeNull();
+    }
+  });
+
+  // The base scope exists so a member who customizes the stages keeps the
+  // switches the scope offers. A catalog that offers NONE — every release before
+  // 2.11 — has no reason to resolve a policy for a customized grid that
+  // resolved none before, so the recorded base is ignored there and the plan of
+  // an existing 2.8.2 or 2.9.0 custom grid is byte-for-byte what it was.
+  it('ignores a recorded base scope on a catalog that authors no settings', async () => {
+    const { workflow, library } = await releaseContext({ scopes: 'upstream-base' });
+    const base = buildExecutionPlan({ workflow, scope: 'enterprise', library });
+    expect(base.valid).toBe(true);
+    expect(base.plan).not.toHaveProperty('aidlcSettingsAuthored');
+    const grid = Object.fromEntries(base.plan.stages.map((stage) => [stage.stageId, 'EXECUTE']));
+
+    const withoutBase = buildExecutionPlan({
+      workflow,
+      scope: 'enterprise-custom',
+      library,
+      composedGrid: grid,
+    });
+    const withBase = buildExecutionPlan({
+      workflow,
+      scope: 'enterprise-custom',
+      library,
+      composedGrid: grid,
+      policyScope: 'enterprise',
+    });
+
+    expect(withoutBase.valid).toBe(true);
+    expect(JSON.stringify(withBase.plan)).toBe(JSON.stringify(withoutBase.plan));
+    expect(withBase.plan).not.toHaveProperty('aidlcSettingsAuthored');
+  });
+
+  // A selection that names its scope directly must resolve exactly what it
+  // resolved before: the base scope defaults to the scope itself.
+  it('changes nothing for a selection that names its scope directly', async () => {
+    const { workflow, library } = await releaseContext();
+    const direct = buildExecutionPlan({ workflow, scope: 'enterprise', library });
+    const withBase = buildExecutionPlan({
+      workflow,
+      scope: 'enterprise',
+      library,
+      policyScope: 'enterprise',
+    });
+
+    expect(JSON.stringify(withBase.plan)).toBe(JSON.stringify(direct.plan));
+  });
+});

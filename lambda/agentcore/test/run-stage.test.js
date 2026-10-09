@@ -1147,6 +1147,63 @@ describe('runStage — per-intent AI-DLC settings', () => {
   });
 });
 
+// A composed grid's `scope` is a label that names no SCOPE block, so a dispatch
+// that omits the recorded base scope resolves NO policy in the container.
+describe('runStage — the composed policy scope', () => {
+  const okSpawn = () => ({
+    on: (event, callback) => event === 'close' && setImmediate(() => callback(0)),
+    stdin: { end() {} },
+  });
+
+  const materializedPolicy = async (args) => {
+    const releaseLibrary = library();
+    releaseLibrary.fromRelease = true;
+    releaseLibrary.scopesById = {
+      feature: { id: 'feature', guardPolicy: 'strict', collaborators: 'on' },
+    };
+    const seen = [];
+    const deps = baseDeps({
+      spawnFn: okSpawn,
+      loadLibrary: async () => ({ workflow: workflow(), library: releaseLibrary }),
+      materializeStage: async ({ stage }) => {
+        seen.push(stage.policy);
+        return { prompt: 'PROMPT', mcpConfigPath: '/ws/.aidlc/mcp.json' };
+      },
+    });
+
+    const res = await runStage(
+      {
+        ...baseArgs,
+        scope: 'feature-custom',
+        composedGrid: { 'requirements-analysis': 'EXECUTE' },
+        methodologyRelease: { releaseId: 'aidlc:abc' },
+        ...args,
+      },
+      deps,
+    );
+
+    expect(res).toMatchObject({ ok: true });
+    return seen[0];
+  };
+
+  it('resolves the recorded base scope’s policy for a customized run', async () => {
+    expect(await materializedPolicy({ policyScope: 'feature' })).toMatchObject({
+      guardPolicy: 'strict',
+      changeControl: 'strict',
+      collaborators: 'on',
+    });
+  });
+
+  it('resolves no scope policy for a customized run with no recorded base scope', async () => {
+    const policy = await materializedPolicy({});
+
+    expect({
+      guardPolicy: policy?.guardPolicy ?? null,
+      collaborators: policy?.collaborators ?? null,
+    }).toEqual({ guardPolicy: null, collaborators: null });
+  });
+});
+
 describe('runStage — MCP secret resolution + child-env injection', () => {
   it.each([
     ['global', undefined],

@@ -267,3 +267,164 @@ describe('the recorded AI-DLC settings reach the running plan', () => {
     expect(materialized[0]).toMatchObject({ guardPolicy: 'off', changeControl: null });
   });
 });
+
+// A composed grid's `scope` names no SCOPE block, so a dispatch that omits the
+// recorded base scope materializes NO policy in the container while the walk
+// resolved the base scope's. Asserted connected:
+// the dispatch payload the orchestrator really produced is handed to the real
+// container entry point, with a no-base control on the same fixture.
+describe('the composed policy scope reaches the running plan', () => {
+  const CUSTOM_META = {
+    ...META,
+    scope: 'enterprise-custom',
+    policyScope: 'enterprise',
+    composedGrid: { 'requirements-analysis': 'EXECUTE' },
+    aidlcSettings: undefined,
+  };
+
+  const containerFixture = () => {
+    const stage = {
+      id: 'requirements-analysis',
+      version: 1,
+      phase: 'inception',
+      mode: 'inline',
+      leadAgent: 'aidlc-product-agent',
+      produces: ['requirements-analysis'],
+      consumes: [],
+      sensors: [],
+      humanValidation: 'required',
+      bodyRef: { s3Key: 'blocks/bodies/sha256/stage' },
+    };
+    const library = {
+      fromRelease: true,
+      stagesById: { 'requirements-analysis': stage },
+      agentsById: {
+        'aidlc-product-agent': {
+          id: 'aidlc-product-agent',
+          modelOverride: null,
+          bodyRef: { s3Key: 'blocks/bodies/sha256/agent' },
+        },
+      },
+      sensorsById: {},
+      rulesById: {},
+      artifactsById: { 'requirements-analysis': { id: 'requirements-analysis', terminal: true } },
+      knowledgeById: {},
+      scopesById: {
+        enterprise: {
+          id: 'enterprise',
+          guardPolicy: 'strict',
+          planApproval: 'on',
+          collaborators: 'on',
+        },
+      },
+    };
+    const workflow = {
+      id: 'aidlc-v2',
+      version: 1,
+      placements: [
+        {
+          stageId: 'requirements-analysis',
+          order: 0,
+          scopeMembership: { enterprise: 'EXECUTE' },
+        },
+      ],
+      ruleRefs: [],
+      scopeRefs: [{ scopeId: 'enterprise' }],
+    };
+    const materialized = [];
+    const deps = {
+      store: {
+        putStage: async () => ({}),
+        updateExecution: async () => ({}),
+        updateStageState: async () => ({}),
+        appendEvent: async () => ({}),
+        appendOutput: async () => ({ seq: 1, timestamp: 'T' }),
+        recordSensorRun: async () => ({}),
+        recordMetric: async () => ({ metricId: 'm' }),
+        listPendingSteering: async () => [],
+        getHumanTask: async () => null,
+        getStage: async () => null,
+        getExecution: async () => CUSTOM_META,
+        getUnitPlan: async () => null,
+      },
+      loadLibrary: async () => ({ workflow, library }),
+      loadBlockBody: async () => '',
+      clock: () => 'T',
+      availableClis: ['claude'],
+      env: { BEDROCK_MODEL: 'us.anthropic.claude-sonnet-4-6' },
+      materializeMcpConfig: async () => '/ws/.aidlc/mcp.json',
+      renderRulesDoc: () => '',
+      materializeStage: async ({ stage: resolvedStage }) => {
+        materialized.push(resolvedStage.policy);
+        return { prompt: 'PROMPT', mcpConfigPath: '/ws/.aidlc/mcp.json' };
+      },
+      spawnFn: () => ({
+        on: (event, callback) => event === 'close' && setImmediate(() => callback(0)),
+        stdin: { end() {} },
+      }),
+    };
+    return { deps, materialized };
+  };
+
+  it('carries the base scope on the walk and on every dispatch', async () => {
+    const { deps, invokes } = await runStart(CUSTOM_META);
+
+    for (const [args] of deps.loadPlan.mock.calls) {
+      expect(args.policyScope).toBe('enterprise');
+    }
+    const dispatches = invokes.filter((payload) => payload.command === 'run-stage-start');
+    expect(dispatches.length).toBeGreaterThan(0);
+    for (const payload of dispatches) {
+      expect(payload.policyScope).toBe('enterprise');
+    }
+  });
+
+  it('adds no key for a selection that names its scope directly', async () => {
+    const { deps, invokes } = await runStart(META);
+
+    for (const [args] of deps.loadPlan.mock.calls) {
+      expect(args).not.toHaveProperty('policyScope');
+    }
+    for (const payload of invokes.filter((item) => item.command === 'run-stage-start')) {
+      expect(payload).not.toHaveProperty('policyScope');
+    }
+  });
+
+  it('materializes the stage under the base scope the dispatch carried', async () => {
+    const { invokes } = await runStart(CUSTOM_META);
+    const dispatch = invokes.find((payload) => payload.command === 'run-stage-start');
+    expect(dispatch.policyScope).toBe('enterprise');
+
+    const { deps, materialized } = containerFixture();
+    const args = {
+      projectId: dispatch.projectId,
+      intentId: dispatch.intentId,
+      executionId: dispatch.executionId,
+      workflowId: dispatch.workflowId,
+      workflowVersion: dispatch.workflowVersion,
+      scope: dispatch.scope,
+      stageId: 'requirements-analysis',
+      composedGrid: dispatch.composedGrid,
+      policyScope: dispatch.policyScope,
+      methodologyRelease: dispatch.methodologyRelease,
+      workspaceDir: '/ws',
+    };
+
+    expect(await runStage(args, deps)).toMatchObject({ ok: true });
+    expect(materialized[0]).toMatchObject({
+      guardPolicy: 'strict',
+      changeControl: 'strict',
+      collaborators: 'on',
+    });
+
+    // The discriminating control: the same customized dispatch WITHOUT the
+    // recorded base scope resolves no scope policy at all, which is the
+    // behaviour this commit removes.
+    materialized.length = 0;
+    await runStage({ ...args, policyScope: null }, deps);
+    expect({
+      guardPolicy: materialized[0]?.guardPolicy ?? null,
+      collaborators: materialized[0]?.collaborators ?? null,
+    }).toEqual({ guardPolicy: null, collaborators: null });
+  });
+});

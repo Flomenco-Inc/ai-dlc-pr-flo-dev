@@ -879,13 +879,16 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         ...(meta.aidlcRepoRef ? { aidlcRepoRef: meta.aidlcRepoRef } : {}),
         ...(meta.methodologyPins ? { methodologyPins: meta.methodologyPins } : {}),
         ...(meta.methodologyRelease ? { methodologyRelease: meta.methodologyRelease } : {}),
-        scope,
-        ...(allSkipIds.length ? { skipStageIds: allSkipIds } : {}),
-        ...(composedGrid ? { composedGrid } : {}),
-        // The container resolves its OWN plan, so the projection has to ride the
-        // dispatch too or the stage would materialize under the scope defaults
-        // while the walk gated on the member's recorded choices.
-        ...(meta.aidlcSettings ? { intentSettings: meta.aidlcSettings } : {}),
+        // The container resolves its OWN plan, so the WHOLE projection rides
+        // the dispatch — built from the same shared contract the walk and the
+        // intents API use (shared/intent-methodology.js), not from a parallel
+        // argument list. That list is how the base scope of a customized run,
+        // and the settings before it, reached the walk and missed the stage.
+        ...planProjectionOptions(meta, {
+          scope,
+          ...(allSkipIds.length ? { skipStageIds: allSkipIds } : {}),
+          ...(composedGrid ? { composedGrid } : {}),
+        }),
         cliModels,
         tierModels,
         requestedCli,
@@ -2251,6 +2254,11 @@ const runStage = async (
     // Per-intent AI-DLC settings — forwarded for the same plan-parity reason:
     // the container resolves its own plan and must resolve the same policy.
     intentSettings = null,
+    // The stock scope a composed grid runs on — forwarded for the same reason.
+    // A grid's `scope` names no SCOPE block, so a dispatch without this
+    // resolves no policy at all in the container while the walk resolved the
+    // base scope's.
+    policyScope = null,
     cliModels,
     tierModels = null,
     requestedCli,
@@ -2321,6 +2329,7 @@ const runStage = async (
         scope,
         ...(skipStageIds?.length ? { skipStageIds } : {}),
         ...(composedGrid ? { composedGrid } : {}),
+        ...(policyScope ? { policyScope } : {}),
         ...(intentSettings ? { intentSettings } : {}),
         ...(cliModels ? { cliModels } : {}),
         ...(tierModels ? { tierModels } : {}),

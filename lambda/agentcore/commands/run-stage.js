@@ -257,6 +257,7 @@ const resolveStage = ({
   stageId,
   skipStageIds = [],
   composedGrid = null,
+  policyScope = null,
   intentSettings = null,
 }) => {
   const { valid, errors, plan } = buildExecutionPlan({
@@ -265,6 +266,7 @@ const resolveStage = ({
     library,
     ...(skipStageIds.length ? { skipStageIds } : {}),
     ...(composedGrid ? { composedGrid } : {}),
+    ...(policyScope ? { policyScope } : {}),
     ...(intentSettings ? { intentSettings } : {}),
   });
   if (!valid) return { error: 'plan_invalid', detail: errors };
@@ -1641,6 +1643,11 @@ const runStageAttempt = async (
     // stage without them would run it under the scope defaults while the walk
     // gated on the choices.
     intentSettings = null,
+    // The stock scope a composed grid runs on, forwarded for the same reason: a
+    // grid's own `scope` names no SCOPE block, so resolving the stage without
+    // the recorded base scope materializes NO policy while the walk resolved
+    // the base scope's.
+    policyScope = null,
     requestedCli,
     cliModels = {},
     // Tier-model config (shared/tier-models.js flat-row shape), snapshotted on
@@ -1951,6 +1958,7 @@ const runStageAttempt = async (
     stageId,
     skipStageIds,
     composedGrid,
+    policyScope,
     intentSettings,
   });
   if (probe.error) return fail(null, probe.error, JSON.stringify(probe.detail));
@@ -1975,6 +1983,7 @@ const runStageAttempt = async (
     stageId,
     skipStageIds,
     composedGrid,
+    policyScope,
     intentSettings,
   });
   if (resolved.error) return fail(null, resolved.error, JSON.stringify(resolved.detail));

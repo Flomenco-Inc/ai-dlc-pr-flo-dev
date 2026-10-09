@@ -662,6 +662,7 @@ describe('runStageSensors — the stage budget bounds every child', () => {
       result: 'BLOCKED',
       detail: { error: expect.stringContaining('stage budget was exhausted') },
     });
+    expect(verdict.detail).toMatchObject({ timeoutMs: 300000, boundedBy: 'stage-deadline' });
   });
 
   it('launches nothing at all once the stage deadline has already passed', async () => {
@@ -670,6 +671,17 @@ describe('runStageSensors — the stage budget bounds every child', () => {
     expect(verdict.result).toBe('BLOCKED');
     expect(verdict.detail).toMatchObject({ stageBudgetExhausted: true });
     expect(verdict.detail.files.map((f) => f.result)).toEqual(['BLOCKED', 'BLOCKED']);
+    expect(verdict.detail).not.toHaveProperty('timeoutMs');
+    expect(verdict.detail).not.toHaveProperty('boundedBy');
+  });
+
+  it('reports exhaustion without a launch bound when the earlier child kept its authored budget', async () => {
+    const { calls, verdict } = await runWith({ remaining: [900000, 0] });
+    expect(calls).toHaveLength(1);
+    expect(verdict.detail).toMatchObject({ stageBudgetExhausted: true });
+    expect(verdict.detail.files.map((f) => f.result)).toEqual(['PASS', 'BLOCKED']);
+    expect(verdict.detail).not.toHaveProperty('timeoutMs');
+    expect(verdict.detail).not.toHaveProperty('boundedBy');
   });
 
   it('holds the stage on an exhausted budget when the sensor is blocking', async () => {

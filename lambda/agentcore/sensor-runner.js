@@ -241,10 +241,10 @@ export const createSensorRunner = ({
   substitutions = {},
   spawnFn = spawn,
   childEnv = process.env,
-  // Milliseconds left of the stage's wall-clock budget, read per sensor. The
+  // Milliseconds left of the stage's wall-clock budget, read per child. The
   // stage deadline — not the contract's ceiling — is what keeps a long sensor
-  // from outliving the container. Absent (unpinned, or a caller with no
-  // deadline) leaves the authored budget alone.
+  // from outliving the container. Absent (unpinned, a policy-free release, or a
+  // caller with no deadline) leaves the authored budget alone.
   remainingStageMs = null,
 } = {}) => {
   const readRemainingStageMs = () =>
@@ -420,11 +420,11 @@ export const createSensorRunner = ({
     let exhausted = false;
     for (const rel of matched) {
       const bound = scriptTimeoutBound(spec.timeoutSeconds, readRemainingStageMs());
-      if (tightest === null || bound.timeoutMs < tightest.timeoutMs) tightest = bound;
       if (bound.exhausted) {
         exhausted = true;
         break;
       }
+      if (tightest === null || bound.timeoutMs < tightest.timeoutMs) tightest = bound;
       const run = await runChild({
         file,
         args: [...args, '--stage', stageId ?? '', spec.pathFlag, rel],
@@ -456,8 +456,8 @@ export const createSensorRunner = ({
         files: fileResults,
         // A budget the stage deadline shortened is reported, so a run cut short
         // does not read as the sensor's own timeout. The narrowest bound any
-        // launch got is the one reported. Absent outside release mode, where no
-        // deadline is read at all.
+        // launch got is the one reported; exhaustion without a launch contributes
+        // no bound. Callers with no deadline retain their legacy detail.
         ...(tightest?.boundedBy === 'stage-deadline'
           ? { timeoutMs: tightest.timeoutMs, boundedBy: tightest.boundedBy }
           : {}),

@@ -77,6 +77,7 @@ const setSkipStageIds = vi.fn();
 const setScope = vi.fn();
 const setComposedGrid = vi.fn();
 const setAidlcSetting = vi.fn();
+const applyComposedSelection = vi.fn();
 const pruneAidlcSettings = vi.fn((..._a: unknown[]) => [] as string[]);
 const flushDraft = vi.fn();
 vi.mock('@/hooks/useCollaborativeIntentDraft', () => ({
@@ -85,6 +86,7 @@ vi.mock('@/hooks/useCollaborativeIntentDraft', () => ({
     prompt: (draftState.prompt as string) ?? '',
     scope: (draftState.scope as string) ?? null,
     composedGrid: (draftState.composedGrid as Record<string, 'EXECUTE' | 'SKIP'>) ?? null,
+    policyScope: (draftState.policyScope as string) ?? null,
     skipStageIds: (draftState.skipStageIds as string[]) ?? null,
     aidlcSettings: (draftState.aidlcSettings as Record<string, string | boolean>) ?? null,
     synced: true,
@@ -100,6 +102,7 @@ vi.mock('@/hooks/useCollaborativeIntentDraft', () => ({
     setAidlcSetting: (...a: unknown[]) => setAidlcSetting(...a),
     setAidlcSettings: vi.fn(),
     pruneAidlcSettings: (...a: unknown[]) => pruneAidlcSettings(...a),
+    applyComposedSelection: (...a: unknown[]) => applyComposedSelection(...a),
     flushDraft: (...a: unknown[]) => flushDraft(...a),
   }),
 }));
@@ -201,6 +204,7 @@ describe('IntentComposePage', () => {
     setSkipStageIds.mockReset();
     setScope.mockReset();
     setComposedGrid.mockReset();
+    applyComposedSelection.mockReset();
     compiled.mockReset().mockResolvedValue({
       scopeGrid: {
         feature: { init: 'EXECUTE', design: 'EXECUTE', build: 'EXECUTE' },
@@ -392,11 +396,14 @@ describe('IntentComposePage', () => {
     expect(designBox.checked).toBe(false);
     // Editing any stage folds the deselection into the grid and clears the overlay.
     await user.click(screen.getByTestId('grid-stage-build').querySelector('input')!);
-    expect(setComposedGrid).toHaveBeenCalledWith({
-      init: 'EXECUTE',
-      design: 'SKIP',
-      build: 'SKIP',
-    });
+    expect(setComposedGrid).toHaveBeenCalledWith(
+      { init: 'EXECUTE', design: 'SKIP', build: 'SKIP' },
+      // The stock scope the grid was built from, recorded on every release:
+      // this one authors no per-intent setting, so the plan, the preview and
+      // the save all ignore the base and the grid resolves exactly the policy
+      // it resolved before.
+      'feature',
+    );
     expect(setSkipStageIds).toHaveBeenCalledWith(null);
   });
 
@@ -524,8 +531,14 @@ describe('IntentComposePage', () => {
     expect(await screen.findByTestId('compose-proposal')).toBeInTheDocument();
     expect(screen.getByTestId('proposal-summary').textContent).toContain('Runs 2 of 3 stages');
     await user.click(screen.getByTestId('proposal-apply'));
-    expect(setScope).toHaveBeenCalledWith('bugfix');
-    expect(setComposedGrid).toHaveBeenCalledWith(null);
+    // ONE transaction, not a scope write and a grid write a peer could observe
+    // between.
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'bugfix',
+      aidlcSettings: null,
+    });
+    expect(setScope).not.toHaveBeenCalled();
+    expect(setComposedGrid).not.toHaveBeenCalled();
   });
 
   it('applying a custom proposal writes the grid + label into the shared draft', async () => {
@@ -552,11 +565,13 @@ describe('IntentComposePage', () => {
     renderPage();
     await screen.findByTestId('compose-proposal');
     await user.click(screen.getByTestId('proposal-apply'));
-    expect(setScope).toHaveBeenCalledWith('lean-fix');
-    expect(setComposedGrid).toHaveBeenCalledWith({
-      init: 'EXECUTE',
-      design: 'SKIP',
-      build: 'EXECUTE',
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'lean-fix',
+      composedGrid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      // No base scope on a release that authors no setting, so the save of a
+      // classic draft carries exactly the fields it always carried.
+      policyScope: null,
+      aidlcSettings: null,
     });
   });
 
@@ -590,11 +605,10 @@ describe('IntentComposePage', () => {
     expect(initBox.disabled).toBe(true);
     // Toggling design flips the materialized feature projection to a grid.
     await user.click(screen.getByTestId('grid-stage-design').querySelector('input')!);
-    expect(setComposedGrid).toHaveBeenCalledWith({
-      init: 'EXECUTE',
-      design: 'SKIP',
-      build: 'EXECUTE',
-    });
+    expect(setComposedGrid).toHaveBeenCalledWith(
+      { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      'feature',
+    );
     expect(setScope).toHaveBeenCalledWith('feature-custom');
   });
 
@@ -761,6 +775,391 @@ describe('IntentComposePage — the per-intent AI-DLC settings', () => {
 
     await screen.findByTestId('aidlc-settings');
     expect(screen.queryByTestId('aidlc-settings-dropped')).not.toBeInTheDocument();
+  });
+});
+
+// Accepting a composed plan's settings on the real page. One call, carrying the
+// whole selection, so the card is Applied because a local transaction committed.
+describe('IntentComposePage — applying a composed plan with its settings', () => {
+  // The release of this describe authors the per-intent settings, which is the
+  // only case in which a base scope resolves a policy or a setting can be
+  // stored at all.
+  const AUTHORED = { guardPolicy: 'off', planApproval: 'on', collaborators: 'off' };
+
+  beforeEach(() => {
+    for (const k of Object.keys(draftState)) delete draftState[k];
+    draftState.prompt = 'Build X';
+    draftState.scope = 'feature';
+    get.mockReset().mockResolvedValue(draftIntent());
+    start.mockReset().mockResolvedValue({});
+    update.mockReset().mockResolvedValue({});
+    compose.mockReset().mockResolvedValue({ composeId: 'c1', state: 'PENDING', mode: 'front' });
+    composeReportUpload.mockReset();
+    attachments.mockReset().mockResolvedValue({ attachments: [], attachmentRevision: 0 });
+    getProjectCapabilities.mockReset().mockResolvedValue({ available: ['kiro'], runtimeClis: [] });
+    flushDraft.mockReset().mockResolvedValue(undefined);
+    reloadIntent.mockReset().mockResolvedValue(undefined);
+    setAssistAgentCli.mockReset();
+    applyComposedSelection.mockReset();
+    setScope.mockReset();
+    setComposedGrid.mockReset();
+    setSkipStageIds.mockReset();
+    pruneAidlcSettings.mockReset().mockReturnValue([]);
+    compiled.mockReset().mockResolvedValue({
+      scopeGrid: { feature: { init: 'EXECUTE', design: 'EXECUTE', build: 'EXECUTE' } },
+      autonomy: { perStage: {}, rollup: { selfHalting: 0, mixed: 0, humanGated: 0, total: 0 } },
+      graph: {
+        nodes: [
+          { stageId: 'init', phasePath: '01', order: 0 },
+          { stageId: 'design', phasePath: '04', order: 1 },
+          { stageId: 'build', phasePath: '04', order: 2 },
+        ],
+        edges: [],
+        cycles: [],
+        danglingConsumes: [],
+        orphanProduces: [],
+        unknownArtifacts: [],
+        acyclic: true,
+      },
+      rules: { universal: [], phaseRules: {}, pairings: [], perStage: {}, unresolved: [] },
+      stages: {
+        init: { id: 'init', phase: 'initialization' },
+        design: { id: 'design', phase: 'construction' },
+        build: { id: 'build', phase: 'construction' },
+      },
+    });
+    getWorkflow.mockReset().mockResolvedValue({ phases: [] });
+    executionPreview.mockReset().mockResolvedValue({
+      valid: true,
+      errors: [],
+      summary: null,
+      plan: { stages: [], summary: null, aidlcSettingsAuthored: AUTHORED },
+    });
+    validateGrid.mockReset().mockResolvedValue({
+      valid: true,
+      errors: [],
+      summary: null,
+      plan: { stages: [], summary: null, aidlcSettingsAuthored: AUTHORED },
+    });
+    useProjectCache.mockReset();
+    useProjectCache.mockReturnValue({ project: baseProject(), loading: false });
+  });
+
+  const withProposal = (proposal: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    listComposes.mockReset().mockResolvedValue({
+      composes: [
+        {
+          composeId: 'c9',
+          mode: 'front',
+          state: 'COMPLETED',
+          source: 'llm',
+          proposal: { grid: null, rationale: [], confidence: 0.8, ...proposal },
+          validation: { valid: true, errors: [], warnings: [], summary: null },
+          failureReason: null,
+          ...extra,
+        },
+      ],
+    });
+
+  it('applies a matched proposal and its settings in one call', async () => {
+    const user = userEvent.setup();
+    withProposal(
+      {
+        mode: 'matched',
+        scope: 'bugfix',
+        guardPolicy: 'strict',
+        scopeSettings: { collaborators: 'on' },
+      },
+      { settingsScope: 'bugfix' },
+    );
+
+    renderPage();
+    await user.click(await screen.findByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'bugfix',
+      aidlcSettings: { guardPolicy: 'strict', collaborators: 'on' },
+    });
+  });
+
+  it('applies a custom proposal with the settings scope it was validated against', async () => {
+    const user = userEvent.setup();
+    withProposal(
+      {
+        mode: 'custom',
+        scope: 'lean-fix',
+        grid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+        guardPolicy: 'relaxed',
+        baseScope: 'bugfix',
+      },
+      { settingsScope: 'bugfix' },
+    );
+
+    renderPage();
+    await user.click(await screen.findByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'lean-fix',
+      composedGrid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      policyScope: 'bugfix',
+      aidlcSettings: { guardPolicy: 'relaxed' },
+    });
+  });
+
+  // A proposal that omits the base scope keeps the one the selection already
+  // runs on — never the display label, which names no scope block.
+  it('keeps the current base scope when the proposal omits it', async () => {
+    const user = userEvent.setup();
+    draftState.scope = 'feature-custom';
+    draftState.policyScope = 'feature';
+    draftState.composedGrid = { init: 'EXECUTE', design: 'EXECUTE', build: 'EXECUTE' };
+    withProposal({
+      mode: 'custom',
+      scope: 'leaner',
+      grid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+    });
+
+    renderPage();
+    await user.click(await screen.findByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'leaner',
+      composedGrid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      policyScope: 'feature',
+      aidlcSettings: null,
+    });
+  });
+
+  it('sends no settings for a proposal that proposed none', async () => {
+    const user = userEvent.setup();
+    withProposal({ mode: 'matched', scope: 'bugfix' });
+
+    renderPage();
+    await user.click(await screen.findByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'bugfix',
+      aidlcSettings: null,
+    });
+  });
+
+  // The first customization of a STOCK selection records the scope it was built
+  // from: the display label it is about to take names no scope block, so
+  // without this the whole policy and every settable switch would vanish on the
+  // first toggle.
+  it('records the stock scope a first customization was built from', async () => {
+    const user = userEvent.setup();
+    listComposes.mockReset().mockResolvedValue({ composes: [] });
+
+    renderPage();
+    await user.click(await screen.findByTestId('grid-editor-toggle'));
+    await user.click(screen.getByTestId('grid-stage-design').querySelector('input')!);
+
+    expect(setComposedGrid).toHaveBeenCalledWith(
+      { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      'feature',
+    );
+    expect(setScope).toHaveBeenCalledWith('feature-custom');
+  });
+
+  // A selection that is ALREADY a customization has a display label, not a
+  // scope. Recording that label would record a base no catalog resolves, and
+  // every later save — a title edit, a prompt edit, the Start flush — would be
+  // refused for naming a scope that does not exist.
+  it('records no base scope for a draft that is already customized', async () => {
+    const user = userEvent.setup();
+    listComposes.mockReset().mockResolvedValue({ composes: [] });
+    draftState.scope = 'feature-custom';
+    draftState.composedGrid = { init: 'EXECUTE', design: 'EXECUTE', build: 'EXECUTE' };
+
+    renderPage();
+    await user.click(await screen.findByTestId('grid-editor-toggle'));
+    await user.click(screen.getByTestId('grid-stage-design').querySelector('input')!);
+
+    expect(setComposedGrid).toHaveBeenCalledWith(
+      { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      null,
+    );
+    expect(setScope).not.toHaveBeenCalled();
+  });
+
+  // A second Apply onto an already-customized selection keeps the base the
+  // compose was validated against; it never promotes the previous display
+  // label, which is what made the next save refuse the whole draft.
+  it('never promotes a display label to the base scope on a second apply', async () => {
+    const user = userEvent.setup();
+    draftState.scope = 'leaner';
+    draftState.composedGrid = { init: 'EXECUTE', design: 'EXECUTE', build: 'EXECUTE' };
+    withProposal({
+      mode: 'custom',
+      scope: 'leanest',
+      grid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+    });
+
+    renderPage();
+    await user.click(await screen.findByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'leanest',
+      composedGrid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      policyScope: null,
+      aidlcSettings: null,
+    });
+  });
+
+  // A release that authors no setting stores no setting, whatever a model
+  // volunteered: the compose job records no settings scope there, which is the
+  // catalog's own answer and the only one the page may trust.
+  it('records nothing from a proposal on a release that authors no setting', async () => {
+    const user = userEvent.setup();
+    executionPreview.mockReset().mockResolvedValue({
+      valid: true,
+      errors: [],
+      summary: null,
+      plan: { stages: [], summary: null },
+    });
+    withProposal({
+      mode: 'custom',
+      scope: 'lean-fix',
+      grid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      guardPolicy: 'strict',
+      baseScope: 'bugfix',
+    });
+
+    renderPage();
+    await user.click(await screen.findByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'lean-fix',
+      composedGrid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      policyScope: null,
+      aidlcSettings: null,
+    });
+  });
+
+  // The preview is what tells the page which settings a selection AUTHORS, and
+  // it has not answered yet. The compose job already validated this proposal
+  // against a settings scope, which only a settings-aware catalog has — so the
+  // accepted values and their base land, instead of being dropped because a
+  // request was still in flight.
+  it('applies the proposed settings while the preview is still pending', async () => {
+    const user = userEvent.setup();
+    executionPreview.mockReset().mockReturnValue(new Promise(() => {}));
+    validateGrid.mockReset().mockReturnValue(new Promise(() => {}));
+    withProposal(
+      {
+        mode: 'custom',
+        scope: 'lean-fix',
+        grid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+        guardPolicy: 'relaxed',
+        baseScope: 'bugfix',
+      },
+      { settingsScope: 'bugfix' },
+    );
+
+    renderPage();
+    await user.click(await screen.findByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'lean-fix',
+      composedGrid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      policyScope: 'bugfix',
+      aidlcSettings: { guardPolicy: 'relaxed' },
+    });
+  });
+
+  // The same, after the preview FAILED: a transport error must not silently
+  // turn an accepted policy into the scope default.
+  it('applies the proposed settings after the preview failed', async () => {
+    const user = userEvent.setup();
+    executionPreview.mockReset().mockRejectedValue(new Error('offline'));
+    withProposal(
+      {
+        mode: 'matched',
+        scope: 'bugfix',
+        guardPolicy: 'relaxed',
+        scopeSettings: { collaborators: 'off' },
+      },
+      { settingsScope: 'bugfix' },
+    );
+
+    renderPage();
+    await user.click(await screen.findByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'bugfix',
+      aidlcSettings: { guardPolicy: 'relaxed', collaborators: 'off' },
+    });
+  });
+
+  // A 2.11 draft customized before the base was recorded — a fork draft, or one
+  // that went through the pending-preview window above. The base is taken from
+  // the proposal the job validated, so Apply does not store a value the server
+  // would then resolve against a different scope.
+  it('applies a proposal onto a customized draft that has no recorded base', async () => {
+    const user = userEvent.setup();
+    draftState.scope = 'feature-custom';
+    draftState.policyScope = null;
+    draftState.composedGrid = { init: 'EXECUTE', design: 'EXECUTE', build: 'EXECUTE' };
+    withProposal(
+      {
+        mode: 'custom',
+        scope: 'enterprise-custom',
+        grid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+        guardPolicy: 'relaxed',
+        baseScope: 'enterprise',
+      },
+      { settingsScope: 'enterprise' },
+    );
+
+    renderPage();
+    await user.click(await screen.findByTestId('proposal-apply'));
+
+    expect(applyComposedSelection).toHaveBeenCalledWith({
+      scope: 'enterprise-custom',
+      composedGrid: { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      policyScope: 'enterprise',
+      aidlcSettings: { guardPolicy: 'relaxed' },
+    });
+  });
+
+  // The toggle in the same window. The base comes from the SELECTION — a stock
+  // scope is a stock scope whatever a preview says — so the first toggle cannot
+  // withdraw the whole policy because a request had not come back.
+  it('records the base scope on a first toggle while the preview is pending', async () => {
+    const user = userEvent.setup();
+    listComposes.mockReset().mockResolvedValue({ composes: [] });
+    executionPreview.mockReset().mockReturnValue(new Promise(() => {}));
+    validateGrid.mockReset().mockReturnValue(new Promise(() => {}));
+
+    renderPage();
+    await user.click(await screen.findByTestId('grid-editor-toggle'));
+    await user.click(screen.getByTestId('grid-stage-design').querySelector('input')!);
+
+    expect(setComposedGrid).toHaveBeenCalledWith(
+      { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      'feature',
+    );
+  });
+
+  // An older bundle cleared the grid without clearing the base it belonged to,
+  // so the shared document can still hold one. Reading it without a grid would
+  // run a feature-derived grid on Classic's policy and settings.
+  it('ignores a base left in the document when the selection has no grid', async () => {
+    const user = userEvent.setup();
+    listComposes.mockReset().mockResolvedValue({ composes: [] });
+    draftState.scope = 'feature';
+    draftState.policyScope = 'classic';
+    draftState.composedGrid = null;
+
+    renderPage();
+    await user.click(await screen.findByTestId('grid-editor-toggle'));
+    await user.click(screen.getByTestId('grid-stage-design').querySelector('input')!);
+
+    expect(setComposedGrid).toHaveBeenCalledWith(
+      { init: 'EXECUTE', design: 'SKIP', build: 'EXECUTE' },
+      'feature',
+    );
   });
 });
 

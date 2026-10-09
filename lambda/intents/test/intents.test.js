@@ -10634,6 +10634,43 @@ describe('the policy scope a composed grid runs on', () => {
     expect(metaFor(intent.id).policyScope).toBeUndefined();
   });
 
+  it('records the base scope a grid is created with', async () => {
+    const { sub, projectId } = await fixture();
+
+    const created = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'enterprise-custom',
+      composedGrid: GRID,
+      policyScope: 'enterprise',
+      methodologyReleaseId: pin.releaseId,
+    });
+
+    expect(created.statusCode).toBe(201);
+    const intent = JSON.parse(created.body);
+    expect(intent.policyScope).toBe('enterprise');
+    expect(metaFor(intent.id).policyScope).toBe('enterprise');
+  });
+
+  // Where the base IS honoured it has to name a real scope block, at create as
+  // on the save: a grid created with a base that resolves to nothing would run
+  // with no policy at all.
+  it('refuses a base scope the pinned workflow does not have at create', async () => {
+    const { sub, projectId } = await fixture();
+
+    const created = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'enterprise-custom',
+      composedGrid: GRID,
+      policyScope: 'not-a-scope',
+      methodologyReleaseId: pin.releaseId,
+    });
+
+    expect(created.statusCode).toBe(400);
+    expect(JSON.parse(created.body).error).toMatch(/Unknown policyScope "not-a-scope"/);
+  });
+
   // The same field against a library whose scopes author none of these
   // settings. The base resolves no policy there, so it is IGNORED: accepted,
   // never stored and never a refusal. The page records the base for every
@@ -10712,6 +10749,44 @@ describe('the policy scope a composed grid runs on', () => {
 
       expect(saved.statusCode).toBe(200);
       expect(Object.hasOwn(metaFor(intent.id), 'policyScope')).toBe(false);
+    });
+
+    // Create answers the same way, so the field is ignored on every route this
+    // library has. A member who composes a grid before the first save sends the
+    // base at create, and the row create writes has to be the row it has always
+    // written.
+    it('creates a grid intent with nothing stored for its base scope', async () => {
+      const { sub, projectId } = await legacyFixture();
+
+      const created = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        scope: 'enterprise-custom',
+        composedGrid: LEGACY_GRID,
+        policyScope: 'enterprise',
+        methodologyReleaseId: legacyPin.releaseId,
+      });
+
+      expect(created.statusCode).toBe(201);
+      const intent = JSON.parse(created.body);
+      expect(intent).not.toHaveProperty('policyScope');
+      expect(Object.hasOwn(metaFor(intent.id), 'policyScope')).toBe(false);
+    });
+
+    it('creates a grid intent with a base scope it cannot resolve', async () => {
+      const { sub, projectId } = await legacyFixture();
+
+      const created = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        scope: 'enterprise-custom',
+        composedGrid: LEGACY_GRID,
+        policyScope: 'enterprise-custom',
+        methodologyReleaseId: legacyPin.releaseId,
+      });
+
+      expect(created.statusCode).toBe(201);
+      expect(Object.hasOwn(metaFor(JSON.parse(created.body).id), 'policyScope')).toBe(false);
     });
   });
 });

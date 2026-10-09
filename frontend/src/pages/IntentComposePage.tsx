@@ -18,7 +18,11 @@ import { useDiscussions } from '@/components/discussion/DiscussionProvider';
 import { CollaborativeTextarea } from '@/components/CollaborativeTextarea';
 import { ComposePanel } from '@/components/intent/ComposePanel';
 import { AidlcSettingsPanel } from '@/components/AidlcSettingsPanel';
-import { AIDLC_SETTING_LABELS, type AidlcSettingValue } from '@/lib/aidlcSettings';
+import {
+  aidlcSettingsFromComposeProposal,
+  AIDLC_SETTING_LABELS,
+  type AidlcSettingValue,
+} from '@/lib/aidlcSettings';
 import { StageGridEditor } from '@/components/intent/StageGridEditor';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
@@ -431,6 +435,36 @@ function IntentComposePageContent() {
     string,
     AidlcSettingValue
   > | null>(null);
+  // Whether the pinned catalog authors the per-intent settings at all, which is
+  // also the only case in which a base scope resolves a policy.
+  //
+  // This is the PREVIEWED SELECTION's answer, so it is null while a preview is
+  // in flight, after a preview error, and for any stock scope whose plan
+  // authors nothing. It may therefore gate what the page SHOWS, but never what
+  // it RECORDS: the server and the compose job answer the same question from
+  // the catalog, so a selection-shaped answer would drop a base — and with it
+  // the whole policy — in exactly those three windows.
+  const settingsAware = authoredSettings !== null;
+
+  // The base scope a customization of the CURRENT selection runs on.
+  //
+  // A selection that already has a grid keeps the base recorded with it: the
+  // base belongs to the grid, and reading `policyScope` without one would adopt
+  // a value an older bundle left in the shared document after clearing the grid
+  // — a feature-derived grid would then run Classic's policy.
+  //
+  // A stock selection records its own scope, on EVERY release: the plan,
+  // validate-grid and the save all ignore a base on a catalog that authors no
+  // scope policy, so there is nothing to lose by recording it and a whole
+  // policy to lose by waiting for a preview to say whether it matters. A
+  // selection that is already a customization has a display LABEL for a scope,
+  // not a scope, and recording that would record a base no catalog can resolve.
+  const customizationBaseScope =
+    (draft.composedGrid
+      ? draft.policyScope
+      : scope && scopeOptions.includes(scope)
+        ? scope
+        : null) ?? null;
 
   const toggleGridStage = (stageId: string) => {
     if (!draftReady || lockedStageIds.has(stageId)) return;
@@ -441,7 +475,11 @@ function IntentComposePageContent() {
     const base: Record<string, 'EXECUTE' | 'SKIP'> = { ...effectiveGrid };
     for (const id of lockedStageIds) base[id] = 'EXECUTE';
     base[stageId] = base[stageId] === 'EXECUTE' ? 'SKIP' : 'EXECUTE';
-    draft.setComposedGrid(base);
+    // Customizing the stages does not change the methodology the run follows,
+    // so the scope the grid was built from stays its policy context — the
+    // display label alone names no scope block, which would withdraw the whole
+    // policy and every settable switch on the first stage toggle.
+    draft.setComposedGrid(base, customizationBaseScope);
     if (skipSelections.size) draft.setSkipStageIds(null);
     if (!draft.composedGrid && scope) {
       // Label the customization after its origin so provenance stays readable.
@@ -456,15 +494,48 @@ function IntentComposePageContent() {
     draft.setSkipStageIds(null);
   };
 
-  const applyProposal = (proposal: NonNullable<ComposeSession['proposal']>) => {
+  // Accepting a composed plan is ONE local transaction: the scope, the grid,
+  // the base scope its policy comes from and the settings it proposed all land
+  // together, and the whole selection reaches the server in one body under one
+  // CAS. There is no asynchronous result to inspect and nothing partial to
+  // recover from.
+  const applyProposal = (
+    proposal: NonNullable<ComposeSession['proposal']>,
+    settingsScope: string | null,
+  ) => {
     if (!draftReady) return;
+    // Only a catalog that authors these settings can store one, so a value a
+    // model volunteered on an older pin is not written into the selection — it
+    // would be dropped by the save and would change the request shape of a
+    // draft that has no settings at all.
+    //
+    // A settings scope on the proposal PROVES the catalog is settings-aware:
+    // the compose job records one only there. That is the catalog's own answer,
+    // so it stands in for a preview that has not landed, failed, or described a
+    // scope that authors nothing — without it, accepting a proposal in any of
+    // those windows dropped every value the job had already validated.
+    const catalogSettingsAware = settingsAware || settingsScope !== null;
+    const proposed = catalogSettingsAware ? aidlcSettingsFromComposeProposal(proposal) : {};
+    const aidlcSettings = Object.keys(proposed).length > 0 ? proposed : null;
     if (proposal.mode === 'matched') {
-      resetGridToScope(proposal.scope);
-    } else if (proposal.grid) {
-      draft.setScope(proposal.scope);
-      draft.setComposedGrid(proposal.grid);
-      setShowGridEditor(true);
+      draft.applyComposedSelection({ scope: proposal.scope, aidlcSettings });
+      return;
     }
+    if (!proposal.grid) return;
+    // The composer names the stock scope its grid runs on and the proposal was
+    // validated against it. A proposal that omits the optional member keeps the
+    // base scope this selection ALREADY runs on, or the stock scope it is
+    // replacing — never a display label, which names no scope block and would
+    // resolve nothing.
+    draft.applyComposedSelection({
+      scope: proposal.scope,
+      composedGrid: proposal.grid,
+      policyScope: catalogSettingsAware
+        ? (settingsScope ?? proposal.baseScope ?? customizationBaseScope)
+        : null,
+      aidlcSettings,
+    });
+    setShowGridEditor(true);
   };
 
   // Run-shape preview: authoritative counts for the current selection,
@@ -476,7 +547,7 @@ function IntentComposePageContent() {
   const [withdrawnSettings, setWithdrawnSettings] = useState<string[]>([]);
   const [previewNote, setPreviewNote] = useState<string | null>(null);
   const [previewErrors, setPreviewErrors] = useState<string[]>([]);
-  const gridKey = JSON.stringify(draft.composedGrid ?? null);
+  const gridKey = JSON.stringify([draft.composedGrid ?? null, draft.policyScope ?? null]);
   const skipsKey = JSON.stringify([...skipSelections].toSorted());
   useEffect(() => {
     if (!workflowId || !scope || !intentReady) return;
@@ -486,6 +557,7 @@ function IntentComposePageContent() {
       ? workflowsService.validateGrid(workflowId, {
           composedGrid: draft.composedGrid,
           scope,
+          ...(draft.policyScope ? { policyScope: draft.policyScope } : {}),
           skipStageIds: skips.length ? skips : undefined,
           version: workflowVersion,
           release: releaseId,

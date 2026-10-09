@@ -32,6 +32,10 @@ export interface IntentDraftState {
   prompt: string;
   scope: string | null;
   composedGrid: Record<string, 'EXECUTE' | 'SKIP'> | null;
+  // The stock scope a composed grid runs on. Collaborative like the grid
+  // itself: it decides which settings the whole team is offered, and the API
+  // verifies it before any plan reads it.
+  policyScope: string | null;
   skipStageIds: string[] | null;
   // The per-intent AI-DLC settings the TEAM has chosen: the overrides on top of
   // the pinned scope's defaults. Ordinary collaborative selection state, like
@@ -62,9 +66,11 @@ const readConfig = (
   config: Y.Map<unknown>,
 ): Omit<IntentDraftState, 'title' | 'prompt' | 'aidlcSettings'> => {
   const scope = config.get('scope');
+  const policyScope = config.get('policyScope');
   return {
     scope: typeof scope === 'string' && scope ? scope : null,
     composedGrid: parseJson<Record<string, 'EXECUTE' | 'SKIP'>>(config.get('composedGrid')),
+    policyScope: typeof policyScope === 'string' && policyScope ? policyScope : null,
     skipStageIds: parseJson<string[]>(config.get('skipStageIds')),
   };
 };
@@ -94,6 +100,7 @@ export function useCollaborativeIntentDraft(
     prompt: '',
     scope: null,
     composedGrid: null,
+    policyScope: null,
     skipStageIds: null,
     aidlcSettings: null,
   });
@@ -151,6 +158,7 @@ export function useCollaborativeIntentDraft(
         if (intent.scope) config.set('scope', intent.scope);
         if (intent.composedGrid) {
           config.set('composedGrid', JSON.stringify(intent.composedGrid));
+          if (intent.policyScope) config.set('policyScope', intent.policyScope);
         }
         if (intent.skipStageIds?.length) {
           config.set('skipStageIds', JSON.stringify(intent.skipStageIds));
@@ -203,13 +211,17 @@ export function useCollaborativeIntentDraft(
     },
     [doc],
   );
+  // The grid and the scope whose policy it keeps are set TOGETHER, in one
+  // transaction: a grid without its base scope resolves no policy and no
+  // settings at all, so a peer must never observe that intermediate state.
   const setComposedGrid = useCallback(
-    (grid: Record<string, 'EXECUTE' | 'SKIP'> | null) => {
+    (grid: Record<string, 'EXECUTE' | 'SKIP'> | null, policyScope: string | null = null) => {
       if (!doc) return;
       const config = doc.getMap('config');
       doc.transact(() => {
         if (grid && Object.keys(grid).length) {
           config.set('composedGrid', JSON.stringify(grid));
+          if (policyScope) config.set('policyScope', policyScope);
           // The grid absorbs redundant overlay skips (mirrors the server's
           // pruneSkipsForGrid): a skip of a stage the grid already excludes
           // would fail plan validation on every later recompute.
@@ -223,6 +235,7 @@ export function useCollaborativeIntentDraft(
           }
         } else {
           config.delete('composedGrid');
+          config.delete('policyScope');
         }
       });
     },
@@ -287,6 +300,65 @@ export function useCollaborativeIntentDraft(
     [doc, setAidlcSettings],
   );
 
+  // Accept a composed plan: the scope, the grid, the base scope its policy
+  // comes from and the settings it proposed, in ONE local transaction. There is
+  // nothing asynchronous to inspect and nothing partial to recover from — the
+  // card is Applied when this commits, and the whole selection reaches the
+  // server in one body under one CAS, so there is no ordering between
+  // "persist the selection" and "record the settings".
+  const applyComposedSelection = useCallback(
+    ({
+      scope,
+      composedGrid = null,
+      policyScope = null,
+      aidlcSettings = null,
+    }: {
+      scope: string;
+      composedGrid?: Record<string, 'EXECUTE' | 'SKIP'> | null;
+      policyScope?: string | null;
+      aidlcSettings?: Record<string, AidlcSettingValue> | null;
+    }) => {
+      if (!doc) return;
+      const config = doc.getMap('config');
+      const settings = doc.getMap<AidlcSettingValue>(AIDLC_SETTINGS_MAP);
+      doc.transact(() => {
+        config.set('scope', scope);
+        if (composedGrid && Object.keys(composedGrid).length) {
+          config.set('composedGrid', JSON.stringify(composedGrid));
+          if (policyScope) config.set('policyScope', policyScope);
+          else config.delete('policyScope');
+          // The grid does not replace the per-intent skip overlay, so the
+          // overlay is PRUNED against it rather than dropped — exactly what
+          // `setComposedGrid` does, and the mirror of the server's
+          // `pruneSkipsForGrid`. Dropping it made a stage the team had
+          // excluded (an API-created deselection, or a gate-time skip) start
+          // running again the moment a custom plan was accepted.
+          const skips = parseJson<string[]>(config.get('skipStageIds'));
+          if (skips?.length) {
+            const pruned = skips.filter((id) => composedGrid[id] === 'EXECUTE');
+            if (pruned.length !== skips.length) {
+              if (pruned.length) config.set('skipStageIds', JSON.stringify(pruned));
+              else config.delete('skipStageIds');
+            }
+          }
+        } else {
+          config.delete('composedGrid');
+          config.delete('policyScope');
+          // A proposal that MATCHES a stock scope replaces the whole selection
+          // with that scope, so an overlay the member built on the selection
+          // they just replaced goes back to the scope's own stage set.
+          config.delete('skipStageIds');
+        }
+        for (const key of AIDLC_SETTING_KEYS) {
+          const value = aidlcSettings?.[key];
+          if (value === undefined) settings.delete(key);
+          else settings.set(key, value);
+        }
+      });
+    },
+    [doc],
+  );
+
   const setSkipStageIds = useCallback(
     (ids: string[] | null) => {
       if (!doc) return;
@@ -308,6 +380,12 @@ export function useCollaborativeIntentDraft(
       prompt: doc.getText('prompt').toString().trim() || null,
       ...(cfg.scope ? { scope: cfg.scope } : {}),
       composedGrid: cfg.composedGrid,
+      // Only ever sent WITH a grid, and only when the selection actually has
+      // one: the API refuses a base scope for a selection that names its scope
+      // directly. A release that authors no setting has no base to resolve, so
+      // it ignores the field on save instead of refusing it. Clearing the grid
+      // clears the stored base in the same write.
+      ...(cfg.composedGrid && cfg.policyScope ? { policyScope: cfg.policyScope } : {}),
       skipStageIds: cfg.skipStageIds,
       // Sent WITH the selection, never alone: the API validates the settings
       // against the selection in the same body and refuses a body that carries
@@ -362,6 +440,7 @@ export function useCollaborativeIntentDraft(
     setAidlcSetting,
     setAidlcSettings,
     pruneAidlcSettings,
+    applyComposedSelection,
     // Awaitable flush so Start can guarantee the last edits are persisted
     // before launching (the launch reads the META row, not the Yjs doc).
     flushDraft: flushLatest,

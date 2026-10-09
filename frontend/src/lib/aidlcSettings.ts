@@ -134,6 +134,30 @@ export const aidlcSettingOptionLabel = (key: string, value: AidlcSettingValue | 
   );
 };
 
+// The per-intent settings a composer proposal proposes, keyed as the intent API
+// keys them. Guard Policy and two of the scope settings are choices a person can
+// make for one intent here; the rest are shown as what the plan follows, so a
+// proposed value is never silently absent from what the member reads before
+// accepting. The compose job has already proved every key here is authored by
+// the proposal's own settings scope.
+export const CHOOSABLE_SCOPE_SETTINGS: Record<string, string> = {
+  plan_approval: 'planApproval',
+  collaborators: 'collaborators',
+};
+
+export function aidlcSettingsFromComposeProposal(proposal: {
+  guardPolicy?: AidlcSettingValue;
+  scopeSettings?: Record<string, string>;
+}): Record<string, AidlcSettingValue> {
+  const settings: Record<string, AidlcSettingValue> = {};
+  if (proposal.guardPolicy != null) settings.guardPolicy = proposal.guardPolicy;
+  for (const [authored, key] of Object.entries(CHOOSABLE_SCOPE_SETTINGS)) {
+    const value = proposal.scopeSettings?.[authored];
+    if (value != null) settings[key] = value;
+  }
+  return settings;
+}
+
 export interface NormalizedAidlcSettings {
   value: Record<string, AidlcSettingValue> | null;
   dropped: string[];

@@ -141,6 +141,10 @@ export interface Intent {
   // Per-intent composed EXECUTE/SKIP grid (Adaptive Workflows): when set it
   // replaces the named-scope projection and `scope` is the provenance label.
   composedGrid?: Record<string, 'EXECUTE' | 'SKIP'> | null;
+  // The stock scope a composed grid was built from: the grid's `scope` is only
+  // a label, so this is what carries the per-scope policy and the settings a
+  // member may choose. Absent for a selection that names its scope directly.
+  policyScope?: string | null;
   // The per-intent AI-DLC settings chosen for this intent: the OVERRIDES on top
   // of the pinned scope's own defaults, as plain values. Absent for an intent
   // with none, which is every intent on a release that authors no such setting.
@@ -246,6 +250,15 @@ export interface ComposeSession {
     grid: Record<string, 'EXECUTE' | 'SKIP'> | null;
     rationale: string[];
     confidence: number | null;
+    // The composer's settings proposal (AI-DLC 2.11). Present only when it
+    // proposed one, and a PROPOSAL throughout: a member accepts it on the
+    // compose page, and the accepted values are written into the shared draft
+    // selection by that member's own save.
+    guardPolicy?: AidlcSettingValue;
+    scopeSettings?: Record<string, string>;
+    // The stock scope the proposed grid runs on, validated with the proposal.
+    baseScope?: string;
+    creationDepth?: string;
   } | null;
   /** The plan resolver's authoritative verdict — render THESE numbers. */
   validation: {
@@ -261,6 +274,10 @@ export interface ComposeSession {
       outOfScopeStages: number;
     } | null;
   } | null;
+  // The scope whose authored settings this proposal was validated against, so
+  // Apply writes values that scope really authors. Absent for a proposal that
+  // resolved none.
+  settingsScope?: string;
   failureReason: string | null;
   createdAt: string | null;
   updatedAt: string | null;
@@ -1112,6 +1129,9 @@ export const intentsService = {
       scope?: string;
       composedGrid?: Record<string, 'EXECUTE' | 'SKIP'> | null;
       skipStageIds?: string[] | null;
+      // The stock scope the grid runs on. The server verifies it against the
+      // pinned workflow's own scope vocabulary before it reaches a plan.
+      policyScope?: string | null;
       // The per-intent AI-DLC settings, which the API only accepts in the same
       // body as the selection they belong to (400
       // `selection_required_with_settings` otherwise). `null` clears them.

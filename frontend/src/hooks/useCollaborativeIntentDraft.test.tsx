@@ -322,3 +322,185 @@ describe('useCollaborativeIntentDraft — pruning the settings a selection drops
     expect(a.result.current.aidlcSettings).toBeNull();
   });
 });
+
+// Accepting a composed plan: Apply is ONE local transaction, so there is no
+// asynchronous result to inspect, nothing partial to recover from, and no
+// ordering between persisting the selection and recording the settings.
+describe('useCollaborativeIntentDraft — applying a composed plan', () => {
+  it('writes the scope, the grid, its base scope and the settings in one transaction', () => {
+    const { a, b } = bothSeeded();
+    let updates = 0;
+    a.doc.on('update', () => {
+      updates += 1;
+    });
+
+    act(() => {
+      a.result.current.applyComposedSelection({
+        scope: 'enterprise-custom',
+        composedGrid: { init: 'EXECUTE', build: 'SKIP' },
+        policyScope: 'enterprise',
+        aidlcSettings: { guardPolicy: 'relaxed' },
+      });
+    });
+
+    expect(updates).toBe(1);
+    expect(a.result.current.scope).toBe('enterprise-custom');
+    expect(a.result.current.composedGrid).toEqual({ init: 'EXECUTE', build: 'SKIP' });
+    expect(a.result.current.policyScope).toBe('enterprise');
+    expect(a.result.current.aidlcSettings).toEqual({ guardPolicy: 'relaxed' });
+
+    act(() => sync(a.doc, b.doc));
+    expect(b.result.current.policyScope).toBe('enterprise');
+    expect(b.result.current.aidlcSettings).toEqual({ guardPolicy: 'relaxed' });
+  });
+
+  it('sends the whole accepted selection in one save body', async () => {
+    const { a } = bothSeeded();
+
+    act(() => {
+      a.result.current.applyComposedSelection({
+        scope: 'enterprise-custom',
+        composedGrid: { init: 'EXECUTE' },
+        policyScope: 'enterprise',
+        aidlcSettings: { guardPolicy: 'relaxed' },
+      });
+    });
+    await act(async () => {
+      await a.result.current.flushDraft();
+    });
+
+    expect(api.update).toHaveBeenCalledTimes(1);
+    expect(api.update.mock.calls[0][2]).toMatchObject({
+      scope: 'enterprise-custom',
+      composedGrid: { init: 'EXECUTE' },
+      policyScope: 'enterprise',
+      aidlcSettings: { guardPolicy: 'relaxed' },
+    });
+  });
+
+  // A matched proposal replaces the selection with a stock scope, so the grid
+  // and the base scope it belonged to both go.
+  it('clears the grid and its base scope for a matched proposal', () => {
+    const { a } = bothSeeded();
+    act(() => {
+      a.result.current.applyComposedSelection({
+        scope: 'enterprise-custom',
+        composedGrid: { init: 'EXECUTE' },
+        policyScope: 'enterprise',
+      });
+    });
+
+    act(() => {
+      a.result.current.applyComposedSelection({ scope: 'classic' });
+    });
+
+    expect(a.result.current.scope).toBe('classic');
+    expect(a.result.current.composedGrid).toBeNull();
+    expect(a.result.current.policyScope).toBeNull();
+  });
+
+  // A matched proposal also drops the per-intent skip overlay: the stock scope
+  // it names describes the whole run, so an overlay built on the selection the
+  // member just replaced goes with it.
+  it('drops the skip overlay for a matched proposal', () => {
+    const { a } = bothSeeded();
+    act(() => {
+      a.result.current.setSkipStageIds(['build']);
+    });
+
+    act(() => {
+      a.result.current.applyComposedSelection({ scope: 'classic' });
+    });
+
+    expect(a.result.current.skipStageIds).toBeNull();
+  });
+
+  // A CUSTOM proposal does not: the overlay and the grid are different
+  // mechanisms, so the overlay is pruned against the grid exactly as
+  // `setComposedGrid` prunes it. Dropping it instead would make a stage the
+  // team had excluded run again as soon as a custom plan was accepted.
+  it('keeps the skips a custom proposal still executes and prunes the rest', () => {
+    const { a, b } = bothSeeded();
+    act(() => {
+      a.result.current.setSkipStageIds(['build', 'design']);
+    });
+
+    act(() => {
+      a.result.current.applyComposedSelection({
+        scope: 'enterprise-custom',
+        composedGrid: { init: 'EXECUTE', build: 'EXECUTE', design: 'SKIP' },
+        policyScope: 'enterprise',
+      });
+    });
+
+    expect(a.result.current.skipStageIds).toEqual(['build']);
+
+    act(() => sync(a.doc, b.doc));
+    expect(b.result.current.skipStageIds).toEqual(['build']);
+  });
+
+  // The overlay goes only when the grid excludes every entry in it, so the
+  // draft never carries a skip the resolver would reject.
+  it('clears the overlay when the accepted grid excludes every skip', () => {
+    const { a } = bothSeeded();
+    act(() => {
+      a.result.current.setSkipStageIds(['build']);
+    });
+
+    act(() => {
+      a.result.current.applyComposedSelection({
+        scope: 'enterprise-custom',
+        composedGrid: { init: 'EXECUTE', build: 'SKIP' },
+        policyScope: 'enterprise',
+      });
+    });
+
+    expect(a.result.current.skipStageIds).toBeNull();
+  });
+
+  // An override the proposal does not carry goes back to the scope default:
+  // accepting a whole plan must not leave a setting from the selection the
+  // member just replaced.
+  it('withdraws an override the accepted plan does not carry', () => {
+    const { a } = bothSeeded();
+    act(() => {
+      a.result.current.setAidlcSetting('collaborators', 'on');
+    });
+
+    act(() => {
+      a.result.current.applyComposedSelection({
+        scope: 'classic',
+        aidlcSettings: { guardPolicy: 'strict' },
+      });
+    });
+
+    expect(a.result.current.aidlcSettings).toEqual({ guardPolicy: 'strict' });
+  });
+
+  // A scope change the member makes right after Apply simply wins, because both
+  // are local writes to the same document. There is no in-flight acceptance for
+  // it to corrupt.
+  it('lets a later scope change win with no in-flight acceptance to corrupt', () => {
+    const { a } = bothSeeded();
+
+    act(() => {
+      a.result.current.applyComposedSelection({
+        scope: 'enterprise-custom',
+        composedGrid: { init: 'EXECUTE' },
+        policyScope: 'enterprise',
+        aidlcSettings: { guardPolicy: 'relaxed' },
+      });
+      a.result.current.setScope('express');
+    });
+
+    expect(a.result.current.scope).toBe('express');
+    expect(a.result.current.aidlcSettings).toEqual({ guardPolicy: 'relaxed' });
+
+    // The preview for the new selection prunes what it does not author, which
+    // is the only correction path and it is local.
+    act(() => {
+      a.result.current.pruneAidlcSettings({ planApproval: 'off' });
+    });
+    expect(a.result.current.aidlcSettings).toBeNull();
+  });
+});

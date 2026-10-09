@@ -5688,25 +5688,15 @@ export const handler = async (event, context) => {
       } else if (!scope) {
         scope = 'composed';
       }
-      if (policyScope) {
-        if (!composedGrid) {
-          return response(400, {
-            error: 'policyScope applies to a composed stage grid; send the scope itself instead',
-          });
-        }
-        const scopes = await loadWorkflowScopes({
-          ddb,
-          tableName: BLOCKS_TABLE(),
-          workflowId,
-          workflowVersion,
-          ...selectedReleaseOptions,
+      // A base scope describes a GRID, so a caller that names its scope directly
+      // is describing a selection that has no base — refused here, before any
+      // catalog is consulted, because that is the body being wrong rather than
+      // the library having nothing to resolve. Whether the base means anything
+      // at all is the catalog's answer, so it is decided after the plan below.
+      if (policyScope && !composedGrid) {
+        return response(400, {
+          error: 'policyScope applies to a composed stage grid; send the scope itself instead',
         });
-        if (!scopes.includes(policyScope)) {
-          return response(400, {
-            error: `Unknown policyScope "${policyScope}" for workflow "${workflowId}"`,
-            scopes,
-          });
-        }
       }
       // Per-intent stage deselection (shared/stage-skip.js): only accepted when
       // stage skipping is EFFECTIVELY enabled (project override over platform
@@ -5825,6 +5815,34 @@ export const handler = async (event, context) => {
         });
       }
       workflowVersion = planCheck.workflowVersion ?? workflowVersion;
+      // The base is honoured ONLY on a catalog that authors the per-intent
+      // settings, and that catalog's own answer travels beside the plan this
+      // resolution already produced — the same gate the save and `validate-grid`
+      // apply, read from the resolution rather than re-derived.
+      //
+      // On any other library the base resolves nothing the run reads, so it is
+      // DROPPED rather than refused and rather than stored: the page records a
+      // base for every stock scope, and an unpinned, 2.3.3, 2.8.2 or 2.9.0
+      // intent must be created with the row it always had. Where the base IS
+      // honoured it has to name a real scope block, or a customized grid would
+      // quietly run with no policy at all.
+      if (policyScope && !planCheck.aidlcSettingsAware) {
+        policyScope = null;
+      } else if (policyScope) {
+        const scopes = await loadWorkflowScopes({
+          ddb,
+          tableName: BLOCKS_TABLE(),
+          workflowId,
+          workflowVersion,
+          ...selectedReleaseOptions,
+        });
+        if (!scopes.includes(policyScope)) {
+          return response(400, {
+            error: `Unknown policyScope "${policyScope}" for workflow "${workflowId}"`,
+            scopes,
+          });
+        }
+      }
       // Per-intent AI-DLC settings at create. The selection they are validated
       // against is in this same body, so they are normalised against the plan
       // just resolved from it: a setting the pinned release's chosen scope does

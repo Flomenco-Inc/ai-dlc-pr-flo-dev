@@ -309,6 +309,9 @@ export const workflowsService = {
     input: {
       composedGrid: Record<string, 'EXECUTE' | 'SKIP'>;
       scope?: string;
+      // The stock scope the grid was built from, so the preview resolves the
+      // same policy and settings context the save and the run will.
+      policyScope?: string;
       skipStageIds?: string[];
       strict?: boolean;
       version?: number;

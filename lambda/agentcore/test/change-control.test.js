@@ -355,6 +355,43 @@ describe('runStage — change_control: absent (the inert path)', () => {
   });
 });
 
+// A value the plan admits and this runtime has no branch for must not reach the
+// agent: the entry below tested truthiness, so a third value fell through every
+// implemented outcome and ran the stage with no comparison at all while the
+// prompt said nothing about it.
+describe('runStage — change_control: a value this runtime cannot interpret', () => {
+  it('fails the stage closed instead of running it', async () => {
+    const store = harnessStore({ receipts: [APPROVAL] });
+    const capture = promptCapture();
+
+    const res = await runStage(
+      args,
+      deps(store, { scopeFm: { changeControl: 'off' }, deps: { spawnFn: capture.spawnFn } }),
+    );
+
+    expect(res.ok).toBe(false);
+    expect(capture.seen.prompt).toBe('');
+    expect(
+      store.of('updateStageState').map((call) => [call.state, call.runtimeError ?? null]),
+    ).toContainEqual(['FAILED', 'change_control_uninterpreted']);
+    expect(store.of('createHumanTask')).toEqual([]);
+    expect(store.of('appendEvent').map((event) => event.type)).not.toContain('v2.change.accepted');
+  });
+
+  it('still runs the two values it does interpret', async () => {
+    for (const changeControl of ['strict', 'relaxed']) {
+      const store = harnessStore({ receipts: [APPROVAL] });
+
+      const res = await runStage(args, deps(store, { scopeFm: { changeControl } }));
+
+      expect(store.of('updateStageState').map((call) => call.runtimeError ?? null)).not.toContain(
+        'change_control_uninterpreted',
+      );
+      expect(res.ok).toBe(true);
+    }
+  });
+});
+
 describe('runStage — change_control: relaxed', () => {
   it('records ONE deduplicated v2.change.accepted and continues', async () => {
     const store = harnessStore({

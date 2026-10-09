@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { filesFromCompatibilityFixture } from '../aidlc-compatibility.js';
 import { buildFromFiles, mapAgent, mapScope, mapSensor, mapStage } from '../block-mappers.js';
 import { buildExecutionPlan, resolveStagePolicy } from '../v2-execution-plan.js';
-import { resolveCapabilities } from '../aidlc-capabilities.js';
+import { POLICY_ENUMS, resolveCapabilities } from '../aidlc-capabilities.js';
 import { canonicalJson } from '../workflow-checkpoint.js';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
@@ -58,11 +58,16 @@ const planFor = ({
   sensorFm = null,
   scope = 'feature',
   releaseMode = true,
+  // A saved user SCOPE overlay row, as `release-resolver.js` merges it into the
+  // library: the only thing distinguishing it from a closure block is the tenant
+  // it carries.
+  scopeTenant = null,
 }) => {
   const stage = { ...mapStage(stageFm, 'body'), version: 1 };
   const scopeBlock = {
     ...mapScope({ name: scope, depth: 'standard', ...scopeFm }, '', scope),
     version: 1,
+    ...(scopeTenant ? { tenantId: scopeTenant } : {}),
   };
   const sensors = sensorFm
     ? { [sensorFm.id]: { ...mapSensor(sensorFm, '', sensorFm.id), version: 1 } }
@@ -479,6 +484,75 @@ describe('Per-release adapters: an unsupported-only field activates no policy', 
   it('still resolves the policy when a supported field is authored alongside', () => {
     const { plan } = planFor({ scopeFm: { change_control: 'relaxed', collaborators: 'off' } });
     expect(plan.stages[0].policy).toMatchObject({ changeControl: 'relaxed' });
+  });
+});
+
+// A field with a consumer can still carry a VALUE that consumer does not
+// implement, and the entry-level handling check cannot see it. `change_control`
+// has run since 2.6.18, so authoring it activates the policy — but its third
+// value `off` asks for a removal no runtime branch performs yet. A release
+// authoring it is held by the promotion guard, so it stays importable and
+// inspectable; a user SCOPE overlay row is stored verbatim and meets no guard at
+// all, so the plan is the only judge it ever meets and must fail it closed.
+describe('Per-release adapters: an uninterpreted VALUE from a user overlay fails closed', () => {
+  const OVERLAY = { scopeTenant: 'default' };
+
+  const refused = (scopeFm, field) => {
+    const result = planFor({ ...OVERLAY, scopeFm });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContainEqual(
+      expect.objectContaining({ code: 'policy_value_uninterpreted', ref: field }),
+    );
+    expect(result.plan.stages[0].policy).toBeUndefined();
+  };
+
+  it('refuses a change control the runtime cannot interpret, authored alone', () => {
+    refused({ change_control: 'off' }, 'change_control');
+  });
+
+  it('refuses it alongside another policy activator too', () => {
+    refused({ change_control: 'off', review_cap: 'advisory' }, 'change_control');
+    refused({ change_control: 'off', sensors: 'off' }, 'change_control');
+  });
+
+  it('refuses it through the renamed field the mapper reads first', () => {
+    refused({ guard_policy: 'off' }, 'change_control');
+  });
+
+  it('keeps the two interpreted controls resolvable from the same overlay', () => {
+    for (const [scopeFm, expected] of [
+      [{ change_control: 'strict' }, 'strict'],
+      [{ change_control: 'relaxed' }, 'relaxed'],
+      [{ guard_policy: 'strict' }, 'strict'],
+      [{ guard_policy: 'relaxed' }, 'relaxed'],
+    ]) {
+      const result = planFor({ ...OVERLAY, scopeFm });
+      expect(result.valid).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.plan.stages[0].policy).toMatchObject({ changeControl: expected });
+    }
+  });
+
+  // The guard is the OVERLAY boundary, not the adapter vocabulary: a release
+  // closure's own scope still imports and still plans, and the promotion guard
+  // that named the value is what keeps it from being selected. Refusing it here
+  // as well would stop the 2.11 body being importable at all.
+  it('leaves the same value from a release closure block planned as before', () => {
+    const result = planFor({ scopeFm: { guard_policy: 'off' } });
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.plan.stages[0].policy).toMatchObject({ changeControl: 'off' });
+  });
+
+  // Derived from the registry, not from a second list naming the field: every
+  // legal value of a handled policy field whose own handling is `unsupported`
+  // is refused, and nothing else is.
+  it('derives the refused values from the registry alone', () => {
+    expect(
+      POLICY_ENUMS.filter(([, , , , , uninterpreted]) => uninterpreted.length > 0).map(
+        ([, , field, , , uninterpreted]) => [field, uninterpreted],
+      ),
+    ).toEqual([['change_control', ['off']]]);
   });
 });
 

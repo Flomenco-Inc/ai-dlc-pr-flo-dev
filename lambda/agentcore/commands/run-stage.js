@@ -120,6 +120,7 @@ import {
   UNIT_FOR_EACH,
 } from '../../shared/v2-execution-plan.js';
 import { humanTaskMatchesOwner, isHumanTaskAnswerStatus } from '../../shared/v2-process-keys.js';
+import { policyValueUninterpreted } from '../../shared/aidlc-capabilities.js';
 import { credentialProviderForCli } from '../../shared/agent-auth-contracts.js';
 import { eventTypeOf } from '../../shared/v2-process-keys.js';
 import { pruneOutputArtifactsForUnit } from '../../shared/unit-kind-pruning.js';
@@ -2601,6 +2602,19 @@ const runStageAttempt = async (
   let changedInputs = [];
   let changeControlFindings = [];
   let changeControlMessage = '';
+  // Three outcomes and no fourth means a FOURTH VALUE has nowhere to go: it
+  // would fall through every branch below and run the stage with no comparison
+  // at all — the one outcome this section exists to prevent. The plan refuses
+  // such a value from a user overlay, so arriving here means a release the
+  // promotion guard holds; fail the stage rather than run it as the absence of
+  // change control.
+  if (policyValueUninterpreted('changeControl', stage.policy?.changeControl)) {
+    return fail(
+      stageInstanceId,
+      'change_control_uninterpreted',
+      `scope declares change_control "${stage.policy.changeControl}", which this platform does not interpret`,
+    );
+  }
   if (stage.policy?.changeControl && openGraph) {
     const ccRow = await store.getStage(executionId, stageInstanceId).catch(() => null);
     const ccAttempt = Number(ccRow?.attempt ?? priorStageRow?.attempt ?? 0);

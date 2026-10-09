@@ -639,12 +639,29 @@ const FRONTMATTER_ENUM_TYPES = Object.freeze(
   ),
 );
 
+const isHandled = (entry) => entry.handling !== 'unsupported';
+
 // The plan's policy vocabulary: [owner, planKey, authored field, allowed values,
-// authored type]. Scope-owned rows first, then stage-owned, so a catalog with
-// several invalid policy values reports them in the order the pre-registry table
-// did. The authored type rides along because the plan boundary also sees blocks
-// the import analyzer never judged (a user SCOPE overlay is stored verbatim), so
-// it must check the parsed type against the same single declaration.
+// authored type, uninterpreted values]. Scope-owned rows first, then
+// stage-owned, so a catalog with several invalid policy values reports them in
+// the order the pre-registry table did. The authored type rides along because
+// the plan boundary also sees blocks the import analyzer never judged (a user
+// SCOPE overlay is stored verbatim), so it must check the parsed type against
+// the same single declaration.
+//
+// The last member is the subset of the field's own legal values whose handling
+// is still `unsupported`, and it is only ever nonempty for a field that HAS a
+// consumer: a fully unsupported field activates no policy at all, so none of its
+// values reaches a handler, while a handled field's unsupported value reaches
+// one that implements no branch for it.
+const uninterpretedValues = (entry) =>
+  Object.freeze(
+    isHandled(entry)
+      ? Object.entries(entry.values)
+          .filter(([, value]) => value?.handling === 'unsupported')
+          .map(([name]) => name)
+      : [],
+  );
 const policyRows = (owner) =>
   AIDLC_CAPABILITIES.filter((entry) => entry.policy === owner && entry.values).map((entry) =>
     Object.freeze([
@@ -653,6 +670,7 @@ const policyRows = (owner) =>
       entry.field,
       Object.keys(entry.values),
       entry.authoredType ?? 'string',
+      uninterpretedValues(entry),
     ]),
   );
 const POLICY_ENUMS = Object.freeze([...policyRows('scope'), ...policyRows('stage')]);
@@ -677,11 +695,26 @@ const policyKeys = (owner, predicate = () => true) =>
       (entry) => entry.policy === owner && entry.planKey && predicate(entry),
     ).map((entry) => entry.planKey),
   );
-const isHandled = (entry) => entry.handling !== 'unsupported';
 const SCOPE_POLICY_KEYS = policyKeys('scope');
 const STAGE_POLICY_KEYS = policyKeys('stage');
 const SCOPE_RUNTIME_POLICY_KEYS = policyKeys('scope', isHandled);
 const STAGE_RUNTIME_POLICY_KEYS = policyKeys('stage', isHandled);
+
+// The point query of the fact the policy rows carry per field: is THIS authored
+// value of THIS policy field one the platform has no interpretation for? The
+// plan refuses such a value from a user overlay, and the runtime consumer of a
+// field with several outcomes asks again before acting — so a value that
+// reached a `stage.policy` by another route still cannot run as one of the
+// outcomes it is not.
+const POLICY_VALUES_UNINTERPRETED = Object.freeze(
+  Object.fromEntries(
+    POLICY_ENUMS.filter(([, , , , , uninterpreted]) => uninterpreted.length > 0).map(
+      ([, planKey, , , , uninterpreted]) => [planKey, uninterpreted],
+    ),
+  ),
+);
+const policyValueUninterpreted = (planKey, value) =>
+  value != null && (POLICY_VALUES_UNINTERPRETED[planKey] ?? []).includes(String(value));
 
 // ── Capability presence ─────────────────────────────────────────────────────
 // Version-agnostic presence tests over the resolved release catalog. Evaluated
@@ -836,6 +869,7 @@ export {
   defaultWhenAbsent,
   isQuestionChannelOutput,
   planApprovalApplies,
+  policyValueUninterpreted,
   resolveCapabilities,
   unhandledCapabilities,
   unhonouredValues,
@@ -862,6 +896,7 @@ export default {
   defaultWhenAbsent,
   isQuestionChannelOutput,
   planApprovalApplies,
+  policyValueUninterpreted,
   resolveCapabilities,
   unhandledCapabilities,
   unhonouredValues,

@@ -35,6 +35,7 @@ import {
 import { compileStageGraph, compileRules } from './compile.js';
 import { isLoopBackRecommenderStage, loopBackApplies } from './stage-loopback.js';
 import { stageSkipBlockReason } from './stage-skip.js';
+import { SYSTEM_TENANT } from './tenant.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
 // this module implements. Checked against the registry by a test, so a
@@ -331,13 +332,19 @@ const REVIEW_CLASS_RANK = Object.freeze({ none: 0, advisory: 1, adversarial: 2 }
 
 const hasAnyKey = (block, keys) => keys.some((key) => block?.[key] != null);
 
+// A block the import analyzer never judged and the promotion guard never held.
+// Release catalog blocks carry no tenant — they are the verified closure's own
+// rows — and `loadUserOverlay` refuses a SYSTEM pin outright, so a tenant other
+// than SYSTEM is exactly the verbatim user-authored overlay row.
+const isUserAuthored = (block) => block?.tenantId != null && block.tenantId !== SYSTEM_TENANT;
+
 // Reject an out-of-vocabulary policy value instead of guessing a default: an
 // unrecognized value means the release drifted from what this adapter models,
 // and running it as "probably the default" is exactly the silent-divergence
 // failure the release contract exists to prevent.
 const validatePolicyEnums = ({ scopeBlock, stage, stageId, errors }) => {
   let ok = true;
-  for (const [owner, key, field, allowed, authoredType] of POLICY_ENUMS) {
+  for (const [owner, key, field, allowed, authoredType, uninterpreted] of POLICY_ENUMS) {
     const block = owner === 'scope' ? scopeBlock : stage;
     const value = block?.[key];
     if (value == null) continue;
@@ -369,6 +376,25 @@ const validatePolicyEnums = ({ scopeBlock, stage, stageId, errors }) => {
         err(
           'policy_enum_invalid',
           `${owner} ${where} declares ${field} "${value}"; allowed: ${allowed.join(' | ')}`,
+          at,
+        ),
+      );
+      continue;
+    }
+    // Legal, and still not runnable. The ACTIVATION gate below reads the FIELD's
+    // handling, so a field with a consumer switches the policy on for every one
+    // of its legal values — including a value that consumer implements no branch
+    // for, which would then reach runtime as neither of the outcomes it does
+    // implement. A RELEASE authoring such a value is held by the promotion
+    // guard and stays importable and inspectable; a user overlay row is stored
+    // verbatim and meets no guard at all, so this is the only boundary that can
+    // refuse it. Fail closed here until the value's interpretation ships.
+    if (uninterpreted.includes(String(value)) && isUserAuthored(block)) {
+      ok = false;
+      errors.push(
+        err(
+          'policy_value_uninterpreted',
+          `${owner} ${where} declares ${field} "${value}"; this platform has no runtime interpretation for it`,
           at,
         ),
       );

@@ -524,6 +524,13 @@ const buildExecutionMeta = ({
   // create/start like the skip overlay and threaded identically; mutable only
   // through the recompose path, which retires + relaunches the run.
   composedGrid = null,
+  // Per-intent AI-DLC settings (shared/intent-aidlc-settings.js): the OVERRIDES
+  // a project member chose for THIS intent, as a plain `{ settingKey: scalar }`
+  // map. Written only by the authenticated intent API, only while the intent is
+  // DRAFT, in the same write as the selection they are validated against.
+  // Omitted from the row when unset, so an intent on a release without these
+  // switches keeps exactly the attributes it always had.
+  aidlcSettings = null,
   attachments = [],
   attachmentRevision = 0,
   pendingAttachmentUploads = [],
@@ -587,6 +594,7 @@ const buildExecutionMeta = ({
   stageSkipping,
   skipStageIds,
   composedGrid,
+  ...(aidlcSettings ? { aidlcSettings } : {}),
   attachments,
   attachmentRevision,
   pendingAttachmentUploads,

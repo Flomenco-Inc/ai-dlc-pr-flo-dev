@@ -56,6 +56,10 @@ import { stageInstanceId as planStageInstanceId } from '../shared/v2-execution-p
 import { createIntentMethodologyLoader } from '../shared/intent-methodology.js';
 import { effectiveStageSkipping, normalizeSkipStageIds } from '../shared/stage-skip.js';
 import {
+  describeAidlcSettingsChange,
+  normalizeAidlcSettings,
+} from '../shared/intent-aidlc-settings.js';
+import {
   assertPrStrategySupported,
   draftlessProviders,
   effectivePrStrategy,
@@ -1377,6 +1381,11 @@ const mapIntent = (meta) => ({
   stageSkipping: meta.stageSkipping ?? null,
   skipStageIds: meta.skipStageIds ?? null,
   composedGrid: meta.composedGrid ?? null,
+  // The per-intent AI-DLC settings: the OVERRIDES recorded for this intent, as
+  // plain values. OMITTED, not nulled, for an intent that has none: every
+  // unpinned, 2.3.3, 2.8.2 and 2.9.0 intent falls in that case, and their DTOs
+  // stay byte-identical to what a deployed client already parses.
+  ...(meta.aidlcSettings ? { aidlcSettings: meta.aidlcSettings } : {}),
   source: meta.source ?? null,
   planWarnings: meta.planWarnings ?? null,
   attachments: Array.isArray(meta.attachments) ? meta.attachments : [],
@@ -3873,17 +3882,53 @@ export const handler = async (event, context) => {
     // immutable through this route (its plan is pinned by the running/finished
     // execution).
     if (intentId && httpMethod === 'PATCH') {
-      const meta = await store.getExecution(intentId);
+      let meta = await store.getExecution(intentId);
       if (!meta || meta.projectId !== projectId) {
         return response(404, { error: 'Intent not found' });
       }
+      const data = body ? JSON.parse(body) : {};
+      // The settings path normalises against this row and diffs the timeline
+      // against it, so on that path the row has to be the exact pre-image this
+      // write replaces — it is re-read CONSISTENTLY rather than letting a
+      // replication lag become a refusal. A body that MENTIONS the field pays
+      // for that read whatever it carries: whether `aidlcSettings: null` clears
+      // a recorded override or asks for nothing (see `settingsRequested` below)
+      // is decided by the row, so a lagging read must not be what decides it.
+      // Only this path pays: a save that neither mentions settings nor finds any
+      // recorded keeps the single eventually consistent read it has always made,
+      // which is the save every unpinned, 2.3.3, 2.8.2 and 2.9.0 draft makes.
+      if (data.aidlcSettings !== undefined || meta.aidlcSettings) {
+        meta = (await store.getExecution(intentId, { consistentRead: true })) ?? meta;
+      }
+      // A body that carries `aidlcSettings: null` for an intent that has none
+      // asks for nothing: it is not a settings change, and treating it as one
+      // is what would put every draft that has no settings — every unpinned,
+      // 2.3.3, 2.8.2 and 2.9.0 draft — on the settings path, with its extra
+      // plan resolution, its revision pre-check and an `aidlcSettings`
+      // attribute on a META row that never had one.
+      const settingsRequested =
+        data.aidlcSettings !== undefined && !(data.aidlcSettings === null && !meta.aidlcSettings);
       if (meta.status !== 'DRAFT') {
+        // A settings change after the run started is refused by name: the
+        // dialect annex tells the agent a human changes settings on the intent,
+        // and this is the endpoint saying a human cannot either, once it is
+        // running. Its own code, because "the draft is closed" and "this
+        // setting is now part of a running plan" are different refusals.
+        if (settingsRequested) {
+          return response(409, {
+            error: `Intent is ${meta.status}; its AI-DLC settings were locked when the run started`,
+            code: 'settings_locked',
+          });
+        }
         return response(409, {
           error: `Intent is ${meta.status}, only DRAFT intents are editable`,
         });
       }
-      const data = body ? JSON.parse(body) : {};
       const patch = {};
+      let authoredSettings = null;
+      let settingsDropped = [];
+      let settingsScope = null;
+      let settingsChanged = false;
       if (data.title !== undefined) {
         if (data.title !== null && typeof data.title !== 'string') {
           return response(400, { error: 'title must be a string or null' });
@@ -3919,6 +3964,21 @@ export const handler = async (event, context) => {
         }
         patch.scope = data.scope;
       }
+      // Per-intent AI-DLC settings travel with the selection they belong to, in
+      // this one body, under this one CAS — which is what makes them
+      // unorderable against it. A caller that sends settings WITHOUT the
+      // selection is refused by name rather than having them validated against
+      // a snapshot that may describe a different selection: that is the whole
+      // mechanism by which a stale read could silently authorise a setting the
+      // current scope does not offer. The collaborative page always sends the
+      // full selection, so this is invisible in normal use.
+      if (settingsRequested && data.scope === undefined && data.composedGrid === undefined) {
+        return response(400, {
+          error:
+            'Send the scope or the composed grid in the same request as aidlcSettings — settings are validated against the selection they belong to',
+          code: 'selection_required_with_settings',
+        });
+      }
       if (Object.keys(patch).length === 0) {
         return response(400, { error: 'Nothing to update' });
       }
@@ -3928,7 +3988,8 @@ export const handler = async (event, context) => {
       if (
         patch.scope !== undefined ||
         patch.composedGrid !== undefined ||
-        patch.skipStageIds !== undefined
+        patch.skipStageIds !== undefined ||
+        settingsRequested
       ) {
         const effScope = patch.scope ?? meta.scope;
         const effGrid =
@@ -3953,10 +4014,44 @@ export const handler = async (event, context) => {
             });
           }
         }
+        // Which settings EXIST is decided by the selection, so the authored map
+        // is resolved from the selection in THIS body — never from a stored
+        // snapshot that may describe a different one — and the settings are
+        // normalised against it before anything is stored or re-validated.
+        //
+        // A selection change that carries NO settings normalises the recorded
+        // ones too, in the same write: the run honours whatever META holds, so
+        // a scope that does not author a recorded override must not leave it
+        // there to be honoured. The withdrawal is recorded by the same write.
+        const selectionChanged = patch.scope !== undefined || patch.composedGrid !== undefined;
+        settingsChanged = settingsRequested || (selectionChanged && Boolean(meta.aidlcSettings));
+        if (settingsChanged) {
+          const authoredCheck = await intentMethodology.loadPlan(meta, {
+            scope: effScope,
+            skipStageIds: effSkips ?? null,
+            composedGrid: effGrid ?? null,
+            intentSettings: null,
+          });
+          if (!authoredCheck.valid) {
+            return response(400, {
+              error: `The requested draft changes are not runnable for workflow "${meta.workflowId}"`,
+              errors: authoredCheck.errors ?? [],
+            });
+          }
+          authoredSettings = authoredCheck.plan?.aidlcSettingsAuthored ?? {};
+          const normalized = normalizeAidlcSettings({
+            settings: settingsRequested ? data.aidlcSettings : meta.aidlcSettings,
+            authored: authoredSettings,
+          });
+          if (normalized.error) return response(400, normalized.error);
+          patch.aidlcSettings = normalized.value;
+          settingsDropped = normalized.dropped ?? [];
+        }
         const planCheck = await intentMethodology.loadPlan(meta, {
           scope: effScope,
           skipStageIds: effSkips ?? null,
           composedGrid: effGrid ?? null,
+          ...(patch.aidlcSettings !== undefined ? { intentSettings: patch.aidlcSettings } : {}),
         });
         if (!planCheck.valid) {
           return response(400, {
@@ -3965,11 +4060,24 @@ export const handler = async (event, context) => {
           });
         }
         patch.planWarnings = planCheck.warnings?.length ? planCheck.warnings : null;
+        settingsScope = effScope;
       }
       if (!Number.isSafeInteger(data.ifDraftRevision) || data.ifDraftRevision < 0) {
         return response(428, {
           error: 'Read the edit state before saving',
           code: 'edit_precondition_required',
+        });
+      }
+      // The settings were normalised against the selection in this body and the
+      // timeline diff is taken from the row read above, so that row has to be
+      // the exact pre-image this CAS replaces. The read is consistent on this
+      // path, so this is a real concurrent edit rather than a replication lag,
+      // and it is refused here rather than producing a correct write with a
+      // timeline entry describing a change nobody made.
+      if (settingsChanged && (meta.draftRevision ?? 0) !== data.ifDraftRevision) {
+        return response(409, {
+          error: 'Draft changed while saving — retry from the current document',
+          code: 'edit_conflict',
         });
       }
       let updated;
@@ -3991,7 +4099,41 @@ export const handler = async (event, context) => {
         }
         throw err;
       }
-      return response(200, mapIntent(updated));
+      // One timeline event per changed key, from the pre-image this write
+      // replaced, with the authenticated caller of THIS request as the actor.
+      // Because the diff comes from the row the CAS condition bound, the audit
+      // cannot attribute a change this write did not make. Appended after the
+      // successful write, best-effort with a logged failure — the same contract
+      // the existing event appends have, and not a transactional-durability
+      // claim.
+      if (settingsChanged) {
+        const editor = getResponder(event);
+        for (const summary of describeAidlcSettingsChange({
+          previous: meta.aidlcSettings ?? null,
+          next: patch.aidlcSettings ?? null,
+          authored: authoredSettings,
+          dropped: settingsDropped,
+          scope: settingsScope,
+        })) {
+          await store
+            .appendEvent({
+              executionId: intentId,
+              type: 'v2.intent.settings.changed',
+              actor: editor.displayName || editor.sub,
+              summary,
+            })
+            .catch((err) => logger.error('AI-DLC settings event append failed', err));
+        }
+      }
+      return response(200, {
+        ...mapIntent(updated),
+        // The settings this selection does not author, so the page can say
+        // which choice the scope change withdrew. Omitted when nothing was
+        // dropped, which is every save of every intent that has no settings.
+        ...(settingsDropped.length
+          ? { aidlcSettingsDropped: settingsDropped.map(({ key }) => key) }
+          : {}),
+      });
     }
 
     if (intentId && httpMethod === 'DELETE') {
@@ -5571,7 +5713,38 @@ export const handler = async (event, context) => {
         });
       }
       workflowVersion = planCheck.workflowVersion ?? workflowVersion;
-      const planWarnings = planCheck.warnings?.length ? planCheck.warnings : null;
+      // Per-intent AI-DLC settings at create. The selection they are validated
+      // against is in this same body, so they are normalised against the plan
+      // just resolved from it: a setting the pinned release's chosen scope does
+      // not author is dropped, and a value outside the registry's own value set
+      // is refused by name.
+      const createdSettings = normalizeAidlcSettings({
+        settings: data.aidlcSettings ?? null,
+        authored: planCheck.plan?.aidlcSettingsAuthored ?? {},
+      });
+      if (createdSettings.error) return response(400, createdSettings.error);
+      const aidlcSettings = createdSettings.value;
+      let planWarnings = planCheck.warnings?.length ? planCheck.warnings : null;
+      if (aidlcSettings) {
+        const settingsCheck = await loadExecutionPlan({
+          ddb,
+          tableName: BLOCKS_TABLE(),
+          workflowId,
+          workflowVersion,
+          scope,
+          ...(skipStageIds ? { skipStageIds } : {}),
+          ...(composedGrid ? { composedGrid } : {}),
+          intentSettings: aidlcSettings,
+          ...selectedReleaseOptions,
+        });
+        if (!settingsCheck.valid) {
+          return response(400, {
+            error: `The requested AI-DLC settings are not runnable for workflow "${workflowId}"`,
+            errors: settingsCheck.errors ?? [],
+          });
+        }
+        planWarnings = settingsCheck.warnings?.length ? settingsCheck.warnings : null;
+      }
       let aidlcRepoRef = null;
       // A selected release IS the source of truth for the ref, so the network
       // lookup of the deployment ref is skipped: resolving an unrelated ref
@@ -5898,9 +6071,30 @@ export const handler = async (event, context) => {
         stageSkipping,
         skipStageIds,
         composedGrid,
+        aidlcSettings,
         source,
         planWarnings,
       });
+      if (aidlcSettings) {
+        const creator = getResponder(event);
+        for (const summary of describeAidlcSettingsChange({
+          previous: null,
+          next: aidlcSettings,
+          authored: planCheck.plan?.aidlcSettingsAuthored ?? {},
+          scope,
+        })) {
+          await store
+            .appendEvent({
+              executionId: newIntentId,
+              type: 'v2.intent.settings.changed',
+              actor: creator.displayName || creator.sub,
+              summary,
+            })
+            // Non-fatal, but NOT silent: the event is the audit record of who
+            // changed a setting, so losing it must leave a trace.
+            .catch((err) => logger.error('AI-DLC settings event append failed', err));
+        }
+      }
       return response(201, mapIntent(meta));
     }
 

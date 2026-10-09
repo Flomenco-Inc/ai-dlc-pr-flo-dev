@@ -413,6 +413,10 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
     // override) and by the recompose path (which retires + relaunches the
     // run). Validated shape only — the plan resolver owns grid policy.
     composedGrid,
+    // Per-intent AI-DLC settings (shared/intent-aidlc-settings.js). DRAFT-only,
+    // routed by the intents API, which owns the lifecycle rule and the value
+    // normalisation; the store validates shape, like every field here.
+    aidlcSettings,
     // DRAFT-phase editable header fields (the collaborative draft page's
     // auto-save writes these). The intents API only routes them while the
     // intent is DRAFT; the store validates shape, not lifecycle.
@@ -618,6 +622,20 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       sets.push('composedGrid = :cgr');
       values[':cgr'] = composedGrid && Object.keys(composedGrid).length ? composedGrid : null;
     }
+    if (aidlcSettings !== undefined) {
+      if (
+        aidlcSettings !== null &&
+        (typeof aidlcSettings !== 'object' || Array.isArray(aidlcSettings))
+      ) {
+        throw new Error('aidlcSettings must be a {setting: value} object or null');
+      }
+      if (aidlcSettings && Object.keys(aidlcSettings).length) {
+        sets.push('aidlcSettings = :ads');
+        values[':ads'] = aidlcSettings;
+      } else {
+        removes.push('aidlcSettings');
+      }
+    }
     if (title !== undefined) {
       if (title !== null && typeof title !== 'string') {
         throw new Error('title must be a string or null');
@@ -676,7 +694,9 @@ const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
       sets.push('draftRevision = :nextDraftRevision');
       values[':nextDraftRevision'] = ifDraftRevision + 1;
     } else if (
-      [title, prompt, scope, composedGrid, skipStageIds].some((value) => value !== undefined)
+      [title, prompt, scope, composedGrid, skipStageIds, aidlcSettings].some(
+        (value) => value !== undefined,
+      )
     ) {
       // Composer/orchestrator changes invalidate a browser's preflight too.
       sets.push('draftRevision = if_not_exists(draftRevision, :draftZero) + :draftOne');

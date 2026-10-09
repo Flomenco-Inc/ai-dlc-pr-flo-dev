@@ -69,11 +69,136 @@ const scopeAidlcSettings = (scopeBlock) => {
   return authored;
 };
 
+// THE normalisation, run identically by the client before it writes into the
+// shared document and by the server before it stores anything — the same
+// mirroring `setComposedGrid` already does for the server's skip pruning. Three
+// rules, in this order:
+//
+//   1. a key the EFFECTIVE selection does not author is DROPPED and named, so
+//      the UI can say which choice a scope change withdrew;
+//   2. a value outside the key's vocabulary or authored type is REJECTED, which
+//      is a caller sending something no runtime consumer could act on;
+//   3. a value equal to the authored default is OMITTED — it is not an
+//      override, and storing it is what would later let the platform claim a
+//      value came from a scope that does not supply it.
+//
+// `settings: null` clears every override. An empty result is `null` so an intent
+// with no overrides keeps exactly the attributes it always had.
+const normalizeAidlcSettings = ({ settings, authored = null }) => {
+  if (settings === null || settings === undefined) return { value: null, dropped: [] };
+  if (typeof settings !== 'object' || Array.isArray(settings)) {
+    return {
+      error: {
+        code: 'aidlc_settings_invalid',
+        message: 'aidlcSettings must be an object of setting values or null',
+      },
+    };
+  }
+  const value = {};
+  const dropped = [];
+  for (const [key, raw] of Object.entries(settings)) {
+    if (!AIDLC_SETTING_KEYS.includes(key)) {
+      return {
+        error: {
+          code: 'aidlc_setting_unknown',
+          message: `Unknown AI-DLC setting "${key}"; this intent accepts ${AIDLC_SETTING_KEYS.join(' | ')}`,
+          field: key,
+        },
+      };
+    }
+    if (raw === null || raw === undefined) continue;
+    if (!authored || !Object.hasOwn(authored, key)) {
+      dropped.push({ key, value: raw });
+      continue;
+    }
+    const allowed = aidlcSettingValues(key);
+    const authoredType = aidlcSettingType(key);
+    // The stored value keeps the methodology's own type so the plan reads
+    // exactly what the scope would have given it, which makes the type part of
+    // the contract: every runtime consumer compares with `===`, so a stored
+    // `['off']` matches no branch and `'true'` is not `true`. Comparing the
+    // text alone accepted both.
+    if (typeof raw !== authoredType) {
+      return {
+        error: {
+          code: 'aidlc_setting_invalid',
+          message: `AI-DLC setting "${key}" must be authored as ${authoredType === 'boolean' ? 'true or false' : 'one of ' + allowed.join(' | ')}`,
+          field: key,
+          values: allowed,
+        },
+      };
+    }
+    // Compared as text because one authored value is a YAML boolean
+    // (`existing_code: true`).
+    if (!allowed.includes(String(raw))) {
+      return {
+        error: {
+          code: 'aidlc_setting_invalid',
+          message: `AI-DLC setting "${key}" must be one of ${allowed.join(' | ')}`,
+          field: key,
+          values: allowed,
+        },
+      };
+    }
+    if (String(raw) === String(authored[key])) continue;
+    value[key] = raw;
+  }
+  return { value: Object.keys(value).length > 0 ? value : null, dropped };
+};
+
+// One plain-language line per changed key, for the intent timeline. The actor is
+// supplied by the caller — it is the authenticated member whose write produced
+// the change — and never read out of stored state, which is what stops an old
+// record from attributing a change nobody made.
+//
+// `dropped` is the keys the caller's payload still carried and the new
+// selection does not author. A key the new selection does not author is a
+// WITHDRAWAL however it disappeared — the page prunes it locally before saving,
+// so by the time the write arrives the payload no longer carries it and
+// `dropped` is empty — which is why the authored map, not `dropped` alone,
+// decides which sentence applies. A member whose stricter guard just vanished
+// is told it was withdrawn, not that it returned to a default the scope does
+// not have.
+const describeAidlcSettingsChange = ({
+  previous = null,
+  next = null,
+  authored = null,
+  dropped = [],
+  scope = null,
+}) => {
+  const where = scope ? `the ${scope} scope` : 'the selected scope';
+  const lines = [];
+  const withdrawn = new Set(dropped.map(({ key }) => key));
+  for (const key of AIDLC_SETTING_KEYS) {
+    const field = aidlcSettingField(key);
+    const before = previous?.[key];
+    const after = next?.[key];
+    if (String(before ?? '—') === String(after ?? '—')) continue;
+    if (after === undefined || after === null) {
+      const unauthored = !authored || !Object.hasOwn(authored, key);
+      lines.push(
+        withdrawn.has(key) || unauthored
+          ? `${field} withdrawn: ${where} does not offer it`
+          : `${field} returned to ${where} default (${String(authored?.[key] ?? 'unset')})`,
+      );
+      continue;
+    }
+    lines.push(
+      `${field} set to ${String(after)} for this intent (${where} default: ${String(
+        authored?.[key] ?? 'unset',
+      )})`,
+    );
+  }
+  return lines;
+};
+
 export {
   AIDLC_SETTING_CAPABILITIES,
   AIDLC_SETTING_KEYS,
   aidlcSettingField,
   aidlcSettingType,
   aidlcSettingValues,
+  describeAidlcSettingsChange,
+  normalizeAidlcSettings,
   scopeAidlcSettings,
 };

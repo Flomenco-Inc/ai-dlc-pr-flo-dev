@@ -20,7 +20,10 @@ import {
 import { buildFromFiles } from '../block-mappers.js';
 import { buildExecutionPlan } from '../v2-execution-plan.js';
 import { resolveMethodologyLibrary } from '../release-resolver.js';
-import { resolveEnsembleTopology } from '../../agentcore/ensemble-runner.js';
+import {
+  ENSEMBLE_PROTOCOL_FILE,
+  resolveEnsembleTopology,
+} from '../../agentcore/ensemble-runner.js';
 
 const BASE_PROFILE = 'v2.9.0';
 const LIBRARY_TYPES = ['STAGE', 'AGENT', 'SENSOR', 'RULE', 'ARTIFACT', 'KNOWLEDGE', 'SCOPE'];
@@ -44,7 +47,7 @@ const baseFixture = JSON.parse(
 // The 2.9.0 closure, optionally with its scope files replaced by the real
 // 2.11.0 ones. `scopes: 'upstream-base'` keeps the 2.9.0 scopes, which author no
 // `collaborators` at all — that is the existing-pin path.
-const releaseContext = async ({ scopes = 'upstream-2.11' } = {}) => {
+const releaseContext = async ({ scopes = 'upstream-2.11', dropRuntimeFiles = [] } = {}) => {
   const files = filesFromCompatibilityFixture({
     profileId: BASE_PROFILE,
     fixture: baseFixture,
@@ -80,7 +83,9 @@ const releaseContext = async ({ scopes = 'upstream-2.11' } = {}) => {
         ]),
       ),
       runtimeFiles: new Map(
-        baseFixture.runtimeFiles.map((runtimeFile) => [runtimeFile.path, runtimeFile]),
+        baseFixture.runtimeFiles
+          .filter((runtimeFile) => !dropRuntimeFiles.includes(runtimeFile.path))
+          .map((runtimeFile) => [runtimeFile.path, runtimeFile]),
       ),
     },
     ddb: {
@@ -260,6 +265,41 @@ describe('the 2.11.0 collaborators switch', () => {
         withdrawn: [],
       });
     }
+  });
+
+  // A `subagent` stage gets support SESSIONS only when the closure ships the
+  // hub-and-spoke protocol file; without it the delegated subagent is already
+  // one session, which is why the topology resolver checks for it. The audit has
+  // to share that whole condition, or a fork that imports and promotes cleanly
+  // is told the switch removed three sessions the stage never had. The two
+  // session modes that do not depend on the protocol still report theirs.
+  it('withdraws nothing from a subagent stage whose closure ships no ensemble protocol', async () => {
+    const { plan, library } = await planFor({
+      scope: 'classic',
+      dropRuntimeFiles: [ENSEMBLE_PROTOCOL_FILE],
+    });
+    const subagentStages = ensembleStagesOf(plan).filter((stage) => stage.mode === 'subagent');
+    expect(subagentStages.length).toBeGreaterThan(0);
+
+    for (const stage of subagentStages) {
+      expect(await topologyFor({ stage, library }), stage.stageId).toBeNull();
+      const effect = (plan.policyEffects ?? []).find((item) => item.stageId === stage.stageId);
+      expect({
+        stageId: stage.stageId,
+        withdrawn: effect?.withdrawnSupportAgents ?? [],
+      }).toEqual({ stageId: stage.stageId, withdrawn: [] });
+    }
+    expect(
+      ensembleStagesOf(plan)
+        .filter((stage) => stage.mode !== 'subagent')
+        .every(
+          (stage) =>
+            (
+              (plan.policyEffects ?? []).find((item) => item.stageId === stage.stageId)
+                ?.withdrawnSupportAgents ?? []
+            ).length > 0,
+        ),
+    ).toBe(true);
   });
 
   // The delta for an existing pin is `none`, asserted rather than argued: a

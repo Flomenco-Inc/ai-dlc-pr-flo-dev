@@ -42,7 +42,11 @@
 import { dispatchPersona } from './persona-dispatch.js';
 import { neutralizeTokens } from './stage-materializer.js';
 import { evaluateGatePreconditions } from '../shared/gate-preconditions.js';
-import { SUPPORT_SESSION_MODES } from '../shared/v2-execution-plan.js';
+import {
+  ENSEMBLE_PROTOCOL_FILE,
+  SUPPORT_SESSION_MODES,
+  supportSessionRefs,
+} from '../shared/v2-execution-plan.js';
 import { contributionArtifactId } from '../shared/ensemble-contribution.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
@@ -62,19 +66,9 @@ export { contributionArtifactId };
 // read one definition.
 export const SESSION_ENSEMBLE_MODES = SUPPORT_SESSION_MODES;
 
-// The closure's protocol file distinguishes delegated single-session subagents
-// from hub-and-spoke support sessions without relying on a release version.
-export const ENSEMBLE_PROTOCOL_FILE = 'core/aidlc-common/protocols/stage-protocol-ensemble.md';
-
-const subagentIsHubAndSpoke = (library) => {
-  const paths = library?.runtimeFilePaths;
-  // A library that carries no runtime-file list cannot say; only a release
-  // closure is ever resolved here, and the resolver always stamps the list.
-  if (paths == null) return true;
-  return Array.isArray(paths)
-    ? paths.includes(ENSEMBLE_PROTOCOL_FILE)
-    : typeof paths.has === 'function' && paths.has(ENSEMBLE_PROTOCOL_FILE);
-};
+// Re-exported so the existing callers and tests keep one import site; the
+// predicate that reads it lives with the plan, which is the other caller.
+export { ENSEMBLE_PROTOCOL_FILE };
 
 // Every cap is enforced on PERSISTED state, never an in-memory counter a resume
 // would silently reset.
@@ -483,11 +477,8 @@ export const resolveEnsembleTopology = async ({
   // the lead performs the synthesis and produces every declared output. A
   // shortened roster would instead leave some declared outputs unowned.
   if (stage.policy.collaborators === 'off') return null;
-  if (!SESSION_ENSEMBLE_MODES.includes(stage?.mode)) return null;
-  if (stage.mode === 'subagent' && !subagentIsHubAndSpoke(library)) return null;
-  const refs = (stage.supportAgentRefs ?? []).filter(
-    (ref) => ref && ref !== stage.agentRef && library?.agentsById?.[ref],
-  );
+  // The SAME eligibility question the plan's withdrawal audit asks.
+  const refs = supportSessionRefs({ stage, library });
   if (refs.length === 0) return null;
   const admitted = refs.slice(0, MAX_SUPPORT_PERSONAS);
   const dropped = refs.slice(MAX_SUPPORT_PERSONAS);

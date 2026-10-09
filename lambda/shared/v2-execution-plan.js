@@ -64,6 +64,39 @@ const RELEASE_RUNNABLE_MODES = [...RUNNABLE_MODES, 'pipeline', 'mob'];
 // silent about one that did.
 export const SUPPORT_SESSION_MODES = Object.freeze(['pipeline', 'mob', 'subagent']);
 
+// The closure's protocol file distinguishes a delegated single-session subagent
+// from hub-and-spoke support sessions without relying on a release version.
+export const ENSEMBLE_PROTOCOL_FILE = 'core/aidlc-common/protocols/stage-protocol-ensemble.md';
+
+const hasRuntimeFile = (library, path) => {
+  const paths = library?.runtimeFilePaths;
+  // A library that carries no runtime-file list cannot say; only a release
+  // closure is ever resolved here, and the resolver always stamps the list.
+  if (paths == null) return true;
+  return Array.isArray(paths)
+    ? paths.includes(path)
+    : typeof paths.has === 'function' && paths.has(path);
+};
+
+/**
+ * The support personas a stage would ACTUALLY get their own session for: the
+ * complete eligibility test, mode set and ref filter in one place.
+ *
+ * The ensemble runner's topology gate and the plan's record of what the
+ * collaborators switch withdrew must ask exactly this question. A mode-only test
+ * claims a withdrawal on a stage whose sessions never existed — a `subagent`
+ * without the hub-and-spoke protocol, or a stage whose support refs resolve to no
+ * AGENT block — and that false audit then reaches `v2.policy.applied`.
+ */
+export const supportSessionRefs = ({ stage, library }) => {
+  if (!SUPPORT_SESSION_MODES.includes(stage?.mode)) return [];
+  if (stage.mode === 'subagent' && !hasRuntimeFile(library, ENSEMBLE_PROTOCOL_FILE)) return [];
+  const leadRef = stage.agentRef ?? stage.leadAgent ?? null;
+  return (stage.supportAgentRefs ?? stage.supportAgents ?? []).filter(
+    (ref) => ref && ref !== leadRef && library?.agentsById?.[ref],
+  );
+};
+
 // Reserved lead-agent refs that are NOT domain AGENT blocks and therefore have no
 // library entry to resolve against. Upstream's initialization stages declare
 // `lead_agent: orchestrator`, where "orchestrator" is the conductor / forwarding
@@ -517,7 +550,7 @@ const resolveStagePolicy = ({ scopeBlock, stage, stageId, errors, capabilities =
 // Every reviewer, sensor and support persona the policy REMOVES is recorded on
 // `effects` so the runtime can emit an audit event instead of the downgrade
 // being invisible.
-const applyStagePolicy = (instance, policy, effects = null) => {
+const applyStagePolicy = (instance, policy, effects = null, library = null) => {
   if (!policy) return instance;
   instance.policy = policy;
   const removedSensors = !policy.sensorsEnabled
@@ -528,11 +561,12 @@ const applyStagePolicy = (instance, policy, effects = null) => {
   // `collaborators: off` withdraws the support sessions of a support-bearing
   // stage. The refs stay on the instance (the authored topology is still what
   // the plan document shows); this list is what the withdrawal costs, named so
-  // the runtime can say which personas did not review the lead's draft.
+  // the runtime can say which personas did not review the lead's draft. It is
+  // the SAME eligibility question the topology resolver asks — mode, protocol
+  // presence and resolvable refs — or the audit would claim a cost on a stage
+  // that was already a single session.
   const withdrawnSupportAgents =
-    policy.collaborators === 'off' && SUPPORT_SESSION_MODES.includes(instance.mode)
-      ? (instance.supportAgentRefs ?? []).filter((ref) => ref && ref !== instance.agentRef)
-      : [];
+    policy.collaborators === 'off' ? supportSessionRefs({ stage: instance, library }) : [];
   if (!policy.sensorsEnabled) instance.sensors = [];
   if (policy.reviewClass === 'none') {
     instance.reviewer = null;
@@ -962,6 +996,7 @@ const buildExecutionPlan = ({
           ? resolveStagePolicy({ scopeBlock, stage, stageId, errors, capabilities })
           : null,
         policyEffects,
+        library,
       );
     })
     .filter(Boolean);

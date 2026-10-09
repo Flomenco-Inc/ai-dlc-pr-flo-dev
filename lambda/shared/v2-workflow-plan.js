@@ -263,6 +263,7 @@ const loadReleaseExecutionPlan = async ({
   skipStageIds,
   composedGrid,
   strict,
+  intentSettings,
   methodologyPins,
 }) => {
   let resolved;
@@ -301,6 +302,7 @@ const loadReleaseExecutionPlan = async ({
     skipStageIds,
     composedGrid,
     strict,
+    intentSettings,
   });
   return {
     ...result,
@@ -319,6 +321,10 @@ const loadExecutionPlan = async ({
   skipStageIds = null,
   composedGrid = null,
   strict = false,
+  // Per-intent AI-DLC settings (shared/intent-aidlc-settings.js). Only a
+  // release-pinned plan can resolve a policy, so only that branch forwards
+  // them; a legacy plan is unchanged.
+  intentSettings = null,
   methodologyPins = null,
   methodologyRelease = null,
   s3 = null,
@@ -337,6 +343,7 @@ const loadExecutionPlan = async ({
       skipStageIds,
       composedGrid,
       strict,
+      intentSettings,
       methodologyPins,
     });
   }

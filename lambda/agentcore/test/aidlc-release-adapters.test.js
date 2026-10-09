@@ -237,10 +237,58 @@ describe('scope policy in the stage prompt', () => {
     ).toContain('Project type: BROWNFIELD');
   });
 
+  // An explicit Greenfield choice is a DECISION, not an absence: the member said
+  // there is no existing code. Rendering nothing for it made `false` and "the
+  // release does not author the setting" the same prompt, so the choice had no
+  // consumer at all.
+  it('states the greenfield project type an explicit choice selects', () => {
+    const rendered = renderScopePolicy({ ...POLICY, existingCode: false });
+
+    expect(rendered).toContain('Project type: GREENFIELD');
+    expect(
+      buildStagePrompt({
+        stage: { ...STAGE, policy: { ...POLICY, existingCode: false } },
+        stageBody: 'x',
+      }),
+    ).toContain('Project type: GREENFIELD');
+  });
+
   it('says nothing about the project type when the scope does not author it', () => {
-    for (const existingCode of [null, false]) {
-      expect(renderScopePolicy({ ...POLICY, existingCode })).not.toContain('Project type');
-    }
+    expect(renderScopePolicy({ ...POLICY, existingCode: null })).not.toContain('Project type');
+  });
+
+  // Workspace classification is the agent's own `record_project_type` path. When
+  // the project type is already decided — by the scope or for this intent — that
+  // decision wins: the stage records it instead of scanning and possibly
+  // contradicting it.
+  it('gives a decided project type precedence over the workspace scan', () => {
+    const detection = (policy) =>
+      buildStagePrompt({
+        stage: { ...STAGE, stageId: 'workspace-detection', policy },
+        stageBody: 'x',
+      });
+
+    const chosen = detection({
+      ...POLICY,
+      existingCode: false,
+      existingCodeChoice: { source: 'intent' },
+    });
+    expect(chosen).toContain('`record_project_type`');
+    expect(chosen).toContain('greenfield');
+    expect(chosen).toContain('chosen for this intent by a project member');
+    expect(chosen).not.toContain('deciding its project type');
+
+    const scanned = detection({ ...POLICY, existingCode: null });
+    expect(scanned).toContain('deciding its project type');
+    expect(scanned).not.toContain('already decided');
+
+    const fromScope = detection({
+      ...POLICY,
+      existingCode: true,
+      existingCodeChoice: { source: 'scope-default' },
+    });
+    expect(fromScope).toContain('brownfield');
+    expect(fromScope).toContain("the AI-DLC scope's own setting");
   });
 
   it('says nothing about learnings when the scope turns them off', () => {

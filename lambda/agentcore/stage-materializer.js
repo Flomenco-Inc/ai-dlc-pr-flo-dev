@@ -123,8 +123,33 @@ export const OUTPUT_CONTRACT = [
   '- Do exactly THIS stage. Do not start other stages or invent status.',
 ].join('\n');
 
-const renderWorkspaceDetectionContract = (stageId) => {
+// The classification stage has two shapes, and which one it gets is the whole
+// point of the project-type setting. With no decided type the agent scans and
+// classifies. With one — a scope default or a member's explicit choice for this
+// intent, true OR false — the decision WINS: the stage records the decided value
+// instead of scanning, because a scan that contradicted it would silently
+// overrule the decision and upstream's own mid-run reclassification transaction
+// is refused by name in the annex.
+const renderWorkspaceDetectionContract = (stageId, policy = null) => {
   if (stageId !== 'workspace-detection') return '';
+  const decided = policy?.existingCode;
+  if (decided != null) {
+    const type = decided === true ? 'brownfield' : 'greenfield';
+    const origin =
+      policy.existingCodeChoice?.source === 'intent'
+        ? 'chosen for this intent by a project member'
+        : "the AI-DLC scope's own setting";
+    return [
+      '## Workspace classification contract',
+      '',
+      `The project type for this run is already decided: **${type}** (${origin}).`,
+      `Call \`record_project_type\` exactly once with \`${type}\`. Do NOT re-classify`,
+      'the workspace against that decision; if what you find disagrees, say so in',
+      'your summary and let a human rewind rather than overruling the choice.',
+      'Do this before `send_output`; the structured value is required by later',
+      'workflow stages and native workspace exports.',
+    ].join('\n');
+  }
   return [
     '## Workspace classification contract',
     '',
@@ -262,11 +287,20 @@ export const renderScopePolicy = (policy) => {
       '  human can reopen the affected checkpoint.',
     );
   }
+  // `true` and `false` are both decisions; only absence says nothing. An
+  // explicit Greenfield choice has to reach the agent, or a member's answer to
+  // "is there existing code?" would change no prompt at all.
   if (policy.existingCode === true) {
     lines.push(
-      '- **Project type: BROWNFIELD.** This scope is authored for an existing',
-      '  codebase: read what is already there before proposing anything new, and',
-      '  keep the conventions you find.',
+      '- **Project type: BROWNFIELD.** This run works on an existing codebase:',
+      '  read what is already there before proposing anything new, and keep the',
+      '  conventions you find.',
+    );
+  } else if (policy.existingCode === false) {
+    lines.push(
+      '- **Project type: GREENFIELD.** This run starts from nothing: there is no',
+      '  existing codebase to respect, so do not look for prior conventions to',
+      '  follow and do not report their absence as a problem.',
     );
   }
   if (policy.skeleton === 'on') {
@@ -336,7 +370,7 @@ export const buildStagePrompt = ({
   // worded once-per-workflow) so the agent reads its lane boundary first.
   const unitScope = renderUnitScope(unit);
   if (unitScope) sections.push('', unitScope);
-  const workspaceDetectionContract = renderWorkspaceDetectionContract(stage.stageId);
+  const workspaceDetectionContract = renderWorkspaceDetectionContract(stage.stageId, stage.policy);
   if (workspaceDetectionContract) sections.push('', workspaceDetectionContract);
   const scopePolicy = renderScopePolicy(stage.policy);
   if (scopePolicy) sections.push('', scopePolicy);

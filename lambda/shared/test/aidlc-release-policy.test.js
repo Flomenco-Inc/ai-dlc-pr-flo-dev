@@ -407,6 +407,43 @@ describe('Per-release adapters: effective per-stage policy', () => {
   });
 });
 
+// A SCOPE block does not always come from the importer. A user SCOPE overlay is
+// stored verbatim (the building-block API preserves intrinsic attributes and
+// `release-resolver.js` `loadUserOverlay` reads the pinned row as saved), so the
+// plan boundary is the FIRST place that sees some authored values and must judge
+// their type itself rather than assume the import analyzer already did.
+describe('Per-release adapters: the plan boundary judges the authored type', () => {
+  const invalid = (scopeFm, field) => {
+    const result = planFor({ scopeFm });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContainEqual(
+      expect.objectContaining({ code: 'policy_enum_invalid', ref: field }),
+    );
+    expect(result.plan.stages[0].policy).toBeUndefined();
+  };
+
+  it.each([
+    ['change_control', { change_control: ['strict'] }],
+    ['guard_policy', { guard_policy: ['strict'] }],
+    ['plan_approval', { plan_approval: ['off'] }],
+    ['collaborators', { collaborators: ['off'] }],
+    ['review_cap', { review_cap: ['none'] }],
+  ])('refuses a singleton array for the string-valued %s', (field, scopeFm) => {
+    invalid(scopeFm, field);
+  });
+
+  it('refuses a quoted boolean project type and accepts the real one', () => {
+    invalid({ existing_code: 'true' }, 'existing_code');
+    invalid({ existing_code: 'false' }, 'existing_code');
+    expect(planFor({ scopeFm: { existing_code: true } }).valid).toBe(true);
+    expect(planFor({ scopeFm: { existing_code: false } }).valid).toBe(true);
+  });
+
+  it('still refuses an out-of-vocabulary value of the right type', () => {
+    invalid({ guard_policy: 'paranoid' }, 'guard_policy');
+  });
+});
+
 describe('Per-release adapters: learnings default', () => {
   const fixture = (profileId) =>
     JSON.parse(

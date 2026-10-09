@@ -639,12 +639,21 @@ const FRONTMATTER_ENUM_TYPES = Object.freeze(
   ),
 );
 
-// The plan's policy vocabulary: [owner, planKey, authored field, allowed values].
-// Scope-owned rows first, then stage-owned, so a catalog with several invalid
-// policy values reports them in the order the pre-registry table did.
+// The plan's policy vocabulary: [owner, planKey, authored field, allowed values,
+// authored type]. Scope-owned rows first, then stage-owned, so a catalog with
+// several invalid policy values reports them in the order the pre-registry table
+// did. The authored type rides along because the plan boundary also sees blocks
+// the import analyzer never judged (a user SCOPE overlay is stored verbatim), so
+// it must check the parsed type against the same single declaration.
 const policyRows = (owner) =>
   AIDLC_CAPABILITIES.filter((entry) => entry.policy === owner && entry.values).map((entry) =>
-    Object.freeze([owner, entry.planKey, entry.field, Object.keys(entry.values)]),
+    Object.freeze([
+      owner,
+      entry.planKey,
+      entry.field,
+      Object.keys(entry.values),
+      entry.authoredType ?? 'string',
+    ]),
   );
 const POLICY_ENUMS = Object.freeze([...policyRows('scope'), ...policyRows('stage')]);
 

@@ -335,20 +335,39 @@ const hasAnyKey = (block, keys) => keys.some((key) => block?.[key] != null);
 // failure the release contract exists to prevent.
 const validatePolicyEnums = ({ scopeBlock, stage, stageId, errors }) => {
   let ok = true;
-  for (const [owner, key, field, allowed] of POLICY_ENUMS) {
+  for (const [owner, key, field, allowed, authoredType] of POLICY_ENUMS) {
     const block = owner === 'scope' ? scopeBlock : stage;
     const value = block?.[key];
     if (value == null) continue;
+    const where = owner === 'scope' ? (scopeBlock?.id ?? 'unknown') : stageId;
+    const at = { ...(owner === 'stage' ? { stageId } : {}), ref: field };
+    // The parsed TYPE first. A singleton array stringifies to its only element
+    // and a quoted boolean to the same text as a real one, so comparing text
+    // alone accepts values no consumer can act on: the runtime compares with
+    // `===`, so `['strict']` matches no branch and `'true'` is not `true`. The
+    // import analyzer checks this for a closure, but a user SCOPE overlay never
+    // passes through it — the plan is that block's first and only judge.
+    if (typeof value !== authoredType) {
+      ok = false;
+      errors.push(
+        err(
+          'policy_enum_invalid',
+          `${owner} ${where} declares ${field} as ${Array.isArray(value) ? 'a list' : typeof value}; it must be authored as ${authoredType === 'boolean' ? 'a YAML boolean' : 'text'}`,
+          at,
+        ),
+      );
+      continue;
+    }
     // A registry enum is a list of authored value TEXT, and one authored value
     // is a YAML boolean (`existing_code: true`), so the comparison is on its
-    // text. The parsed type itself is validated at the analyzer boundary.
+    // text once the type is known to be the authored one.
     if (!allowed.includes(String(value))) {
       ok = false;
       errors.push(
         err(
           'policy_enum_invalid',
-          `${owner} ${owner === 'scope' ? (scopeBlock?.id ?? 'unknown') : stageId} declares ${field} "${value}"; allowed: ${allowed.join(' | ')}`,
-          { ...(owner === 'stage' ? { stageId } : {}), ref: field },
+          `${owner} ${where} declares ${field} "${value}"; allowed: ${allowed.join(' | ')}`,
+          at,
         ),
       );
     }

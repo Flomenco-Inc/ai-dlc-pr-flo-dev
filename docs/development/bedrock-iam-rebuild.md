@@ -2,7 +2,7 @@
 
 This replaces the implementation in PR #452 and is based on the authentication foundation in PR #487. The IAM delta is reviewed separately from the foundation.
 
-IAM is a registered provider. Its code lives in provider-owned files, and each deployable adds it with one line in its composition root; no foundation module, foundation test or Terraform file changes. See [Adding an authentication provider](agent-authentication-foundation.md#adding-an-authentication-provider).
+IAM is a registered provider. Its code lives in provider-owned files, registered at each deployable's composition root. The merged foundation's neutral renewal contract remains unchanged. See [Adding an authentication provider](agent-authentication-foundation.md#adding-an-authentication-provider).
 
 | Deployable        | Provider files                                                                                      | Root                                                      |
 | ----------------- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
@@ -13,6 +13,20 @@ IAM is a registered provider. Its code lives in provider-owned files, and each d
 | Frontend          | `components/settings/agent-auth/bedrock-iam/` (wizard, API client, `bedrockIamUi`)                  | `frontend/src/components/settings/agent-auth/registry.ts` |
 
 Wire names that shipped only to the review environment were replaced by the foundation's generic contracts: the wizard calls `POST /agents/authentication-setup` with `mode: 'iam'`, **Test connection** uses the generic `verify-connection` command and grant purpose, and reviews use `connection-draft` and inherited `space-selection` candidates. The IAM renewal protocol (`renew-bedrock-credentials`, `renewalToken`, audience `aidlc-bedrock-credential-renewal-v2`, fixed eight-hour ceiling) and the broker's top-level `iamCredentials`/`renewalToken`/`renewalExpiresAt` fields are unchanged; the foundation broker now signs renewals from IAM's declared policy.
+
+The broker entry composes `bedrock-iam-wire.js` through
+`agent-authentication-entry.js`. This provider-owned adapter accepts the earlier
+`renewalToken` request and adds the earlier top-level response fields. Current
+runtimes use the foundation's `grant` request and `lease.renewal.grant` response.
+Both paths use the same host-signed token and authorization checks; conflicting
+tokens are rejected. No provider wire fields are added to the foundation registry
+or lease schema.
+
+IAM owns `terraform/modules/api/bedrock-iam.tf` and
+`terraform/modules/api/lambda/bedrock-iam.tf`. The root API module and agents
+Lambda environment forward the actual broker role as `CREDENTIAL_BROKER_ROLE_ARN`
+for trust-policy generation. Deploy this wiring with the IAM provider. The
+runtime role's existing denial of direct role assumption remains in force.
 
 ## Feature transfer
 

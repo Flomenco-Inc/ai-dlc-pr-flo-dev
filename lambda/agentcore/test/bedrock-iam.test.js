@@ -42,7 +42,7 @@ const iamLease = ({ iamCredentials, renewalToken, renewalExpiresAt }) => ({
   material: { type: 'bedrock-iam', credentials: iamCredentials },
   expiresAt: Date.parse(iamCredentials.Expiration),
   authorizationExpiresAt: renewalExpiresAt,
-  renewal: { grant: renewalToken, action: 'renew-bedrock-credentials', tokenField: 'renewalToken' },
+  renewal: { grant: renewalToken, action: 'renew-bedrock-credentials' },
 });
 const sessions = [];
 const clock = () => {

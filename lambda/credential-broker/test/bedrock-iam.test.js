@@ -6,6 +6,8 @@ import { BEDROCK_IAM_RENEWAL } from '../bedrock-iam-provider.js';
 import { INFERENCE_SESSION_POLICY } from '../bedrock-iam.js';
 import { normalizeConnection } from '../../shared/agent-auth-catalog.js';
 import { connectionBinding } from '../../shared/agent-binding-selection.js';
+import { legacyConnection } from '../../shared/agent-connection-repository.js';
+import { loggableAgentCredentialErrorCode } from '../agent-provider-registry.js';
 import {
   signAgentCredentialGrant,
   verifyAgentCredentialGrant,
@@ -41,7 +43,11 @@ const fixture = (purpose = 'execution') => {
         };
       if (command.input.Key.pk === 'EXEC#e')
         return { Item: { projectId: 'p', credentialBinding: binding, status: 'RUNNING' } };
-      return { Item: { ...connection, state: command.input.Key.sk === 'META' ? state : 'ready' } };
+      if (command.input.Key.pk === `AGENTAUTH#CONNECTION#${connection.id}`)
+        return {
+          Item: { ...connection, state: command.input.Key.sk === 'META' ? state : 'ready' },
+        };
+      return {};
     }),
   };
   const stsClient = {
@@ -104,6 +110,10 @@ describe('versioned IAM broker authorization', () => {
     expect(policy.Statement[1].Action).toContain('bedrock-mantle:CreateInference');
     expect(policy.Statement[1].Action.every((action) => action.startsWith('bedrock'))).toBe(true);
     expect(result.credentials[0].binding).toEqual(binding);
+    const claims = verifyAgentCredentialGrant(f.grant, SECRET, { now: () => START });
+    expect(command.input.RoleSessionName).toBe(
+      `collaborative-${claims.grantId.replace(/[^a-zA-Z0-9-]/g, '').slice(0, 40)}`,
+    );
     expect(result.credentials[0].iamCredentials).toEqual({
       AccessKeyId: 'TARGET',
       SecretAccessKey: 'inert-secret',
@@ -111,6 +121,102 @@ describe('versioned IAM broker authorization', () => {
       Expiration: new Date(START + HOUR).toISOString(),
     });
   });
+  it('accepts neutral and legacy renewal requests with identical host-owned leases', async () => {
+    const f = fixture();
+    const original = (await authorizeAgentCredentialRequest({ grant: f.grant }, f.deps))
+      .credentials[0];
+    expect(original.lease.renewal).toEqual({
+      action: BEDROCK_IAM_RENEWAL.action,
+      grant: original.renewalToken,
+    });
+    f.advance(HOUR);
+    const neutral = await authorizeAgentCredentialRequest(
+      { action: BEDROCK_IAM_RENEWAL.action, grant: original.renewalToken },
+      f.deps,
+    );
+    const legacy = await authorizeAgentCredentialRequest(
+      { action: BEDROCK_IAM_RENEWAL.action, renewalToken: original.renewalToken },
+      f.deps,
+    );
+    expect(neutral).toEqual(legacy);
+    expect(neutral.credentials[0].lease.authorizationExpiresAt).toBe(START + 8 * HOUR);
+    await expect(
+      authorizeAgentCredentialRequest(
+        {
+          action: BEDROCK_IAM_RENEWAL.action,
+          grant: original.renewalToken,
+          renewalToken: f.grant,
+        },
+        f.deps,
+      ),
+    ).rejects.toMatchObject({ code: 'AGENT_CREDENTIAL_GRANT_INVALID' });
+    expect(f.stsClient.send).toHaveBeenCalledTimes(3);
+  });
+  it('keeps Kiro discovery available when the IAM adapter is denied', async () => {
+    const f = fixture('capabilities');
+    const kiro = connectionBinding(legacyConnection('legacy-space-kiro-p'), 3);
+    const grant = signAgentCredentialGrant(
+      { purpose: 'capabilities', projectId: 'p', bindings: [binding, kiro] },
+      SECRET,
+      { now: () => START },
+    );
+    f.stsClient.send.mockRejectedValue(
+      Object.assign(new Error('private IAM diagnostic'), { name: 'AccessDeniedException' }),
+    );
+    const result = await authorizeAgentCredentialRequest(
+      { grant },
+      {
+        ...f.deps,
+        ssmClient: { send: vi.fn(async () => ({ Parameter: { Value: 'kiro-key' } })) },
+      },
+    );
+    expect(result.credentials[0]).toEqual({ binding, error: 'BEDROCK_IAM_ACCESS_DENIED' });
+    expect(result.credentials[1]).toMatchObject({ binding: kiro, value: 'kiro-key' });
+    expect(result.credentials[1]).not.toHaveProperty('iamCredentials');
+    expect(result.credentials[1]).not.toHaveProperty('renewalToken');
+    expect(JSON.stringify(result)).not.toContain('private IAM diagnostic');
+  });
+  it.each(['grant secret', 'key'])(
+    'keeps %s SSM denial retryable and outside IAM classification',
+    async (source) => {
+      const f = fixture('capabilities');
+      const denied = Object.assign(new Error('private SSM diagnostic'), {
+        name: 'AccessDeniedException',
+      });
+      const key = connectionBinding(legacyConnection('legacy-platform-bedrock'), 3);
+      const grant =
+        source === 'key'
+          ? signAgentCredentialGrant(
+              { purpose: 'capabilities', projectId: 'p', bindings: [key] },
+              SECRET,
+              { now: () => START },
+            )
+          : f.grant;
+      const failure = await authorizeAgentCredentialRequest(
+        { grant },
+        {
+          ...f.deps,
+          ...(source === 'grant secret'
+            ? {
+                secret: null,
+                env: {
+                  ...f.deps.env,
+                  AGENT_CREDENTIAL_GRANT_SECRET_PARAM: '/test/grant-secret',
+                },
+              }
+            : {}),
+          ssmClient: {
+            send: vi.fn(async () => {
+              throw denied;
+            }),
+          },
+        },
+      ).catch((error) => error);
+      expect(failure).toBe(denied);
+      expect(loggableAgentCredentialErrorCode(failure)).toBe('AGENT_CREDENTIAL_BROKER_FAILED');
+      expect(f.stsClient.send).not.toHaveBeenCalled();
+    },
+  );
   it('renews after handoff expiry with the same binding and a non-sliding eight-hour deadline', async () => {
     const f = fixture();
     const original = (await authorizeAgentCredentialRequest({ grant: f.grant }, f.deps))

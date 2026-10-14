@@ -225,5 +225,157 @@ describe.skipIf(!process.env.DYNAMODB_LOCAL_ENDPOINT)(
       });
       expect(receipts.filter((row) => row.kind === 'stage-approval')).toEqual([]);
     }, 60_000);
+
+    // The test above interleaves AFTER the un-park has already committed
+    // RUNNING. The maintainer's report is narrower and lands earlier: the
+    // un-park's own write throttles — a transient error the SDK retries by
+    // default, so this run never observes a lost condition, only a delay —
+    // and the interleaving write lands in that delay, before the SDK's own
+    // retry re-sends the identical conditional write. Reproduced by faulting
+    // the first matching attempt at the client's `deserialize` step, which
+    // sits inside the SDK's retry wrapper: nothing reaches DynamoDB Local on
+    // that attempt, the interleaving write runs for real while the retry is
+    // pending, and the SDK then re-sends the same request against the row
+    // the interleaving write left behind.
+    const throttleUnparkOnce = (client, forExecutionId, onThrottled) => {
+      let fired = false;
+      client.middlewareStack.add(
+        (next) => async (args) => {
+          const input = args.input ?? {};
+          const isUnpark =
+            input.Key?.pk?.S === `EXEC#${forExecutionId}` &&
+            input.ExpressionAttributeValues?.[':fromStatus']?.S === 'WAITING';
+          if (isUnpark && !fired) {
+            fired = true;
+            await onThrottled();
+            throw Object.assign(new Error('simulated DynamoDB throttle'), {
+              name: 'ThrottlingException',
+            });
+          }
+          return next(args);
+        },
+        { name: 'throttle-unpark-once', step: 'deserialize', priority: 'high' },
+      );
+    };
+
+    // A second client against the same table: the fault above is installed
+    // on its middleware stack only, so it cannot affect the interleaving
+    // write, which is issued through the describe block's own `store`.
+    const makeFaultedStore = () => {
+      const raw2 = new DynamoDBClient({
+        endpoint: process.env.DYNAMODB_LOCAL_ENDPOINT,
+        region: process.env.AWS_REGION || 'us-east-1',
+        credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+      });
+      const store2 = createProcessStore({
+        ddb: DynamoDBDocumentClient.from(raw2),
+        tableName: table,
+      });
+      return { raw2, store2 };
+    };
+
+    it('writes no grant when a cancel wins the retry of a throttled un-park', async () => {
+      const executionId = `i-${randomUUID()}`;
+      await seed(executionId);
+      const answeredGates = [];
+      const ctx = makeCtx(executionId, answeredGates);
+      const { raw2, store2 } = makeFaultedStore();
+
+      let cancels = 0;
+      throttleUnparkOnce(raw2, executionId, async () => {
+        cancels += 1;
+        // The real cancel endpoint's own conditional write: META still reads
+        // WAITING, since the un-park's first attempt never reached the table.
+        await store.updateExecution({
+          executionId,
+          status: 'CANCELLED',
+          fromStatus: 'WAITING',
+          completedAt: 'T-cancel',
+          pendingHumanTaskId: null,
+        });
+      });
+
+      try {
+        const result = await __durableHandler(
+          { action: 'start', intentId: executionId, executionId },
+          ctx,
+          makeDeps(executionId, ctx, store2),
+        );
+
+        expect(cancels).toBe(1);
+        expect(answeredGates).toHaveLength(1);
+        expect(result).toMatchObject({ ok: false, reason: 'retired' });
+
+        const meta = await store.getExecution(executionId, { consistentRead: true });
+        expect(meta.status).toBe('CANCELLED');
+        expect(meta.constructionGateAutonomy).toBe('gated');
+        expect(meta.constructionGateAutonomyGrant ?? null).toBeNull();
+
+        const events = await store.listEvents(executionId, { consistentRead: true });
+        expect(events.filter((row) => row.eventType === 'v2.autonomy.mode_set')).toEqual([]);
+        expect(events.filter((row) => row.eventType === 'v2.stage.validated')).toEqual([]);
+        const receipts = await store.listReceipts(executionId, {
+          stageInstanceId: 'si-functional-design',
+          attempt: 0,
+          consistentRead: true,
+        });
+        expect(receipts.filter((row) => row.kind === 'stage-approval')).toEqual([]);
+      } finally {
+        raw2.destroy();
+      }
+    }, 60_000);
+
+    it('writes no grant when a takeover wins the retry of a throttled un-park', async () => {
+      const executionId = `i-${randomUUID()}`;
+      await seed(executionId);
+      const answeredGates = [];
+      const ctx = makeCtx(executionId, answeredGates);
+      const { raw2, store2 } = makeFaultedStore();
+
+      let takeovers = 0;
+      throttleUnparkOnce(raw2, executionId, async () => {
+        takeovers += 1;
+        // A rewind relaunch's own write: a new run claims the still-parked
+        // intent under its own token before this run's un-park lands.
+        await store.updateExecution({
+          executionId,
+          status: 'RUNNING',
+          fromStatus: 'WAITING',
+          orchestratorRunId: 'run-relaunched',
+          pendingHumanTaskId: null,
+          resumeRequired: null,
+        });
+      });
+
+      try {
+        const result = await __durableHandler(
+          { action: 'start', intentId: executionId, executionId },
+          ctx,
+          makeDeps(executionId, ctx, store2),
+        );
+
+        expect(takeovers).toBe(1);
+        expect(answeredGates).toHaveLength(1);
+        expect(result).toMatchObject({ ok: false, reason: 'retired' });
+
+        const meta = await store.getExecution(executionId, { consistentRead: true });
+        expect(meta.status).toBe('RUNNING');
+        expect(meta.orchestratorRunId).toBe('run-relaunched');
+        expect(meta.constructionGateAutonomy).toBe('gated');
+        expect(meta.constructionGateAutonomyGrant ?? null).toBeNull();
+
+        const events = await store.listEvents(executionId, { consistentRead: true });
+        expect(events.filter((row) => row.eventType === 'v2.autonomy.mode_set')).toEqual([]);
+        expect(events.filter((row) => row.eventType === 'v2.stage.validated')).toEqual([]);
+        const receipts = await store.listReceipts(executionId, {
+          stageInstanceId: 'si-functional-design',
+          attempt: 0,
+          consistentRead: true,
+        });
+        expect(receipts.filter((row) => row.kind === 'stage-approval')).toEqual([]);
+      } finally {
+        raw2.destroy();
+      }
+    }, 60_000);
   },
 );

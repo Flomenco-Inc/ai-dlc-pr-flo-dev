@@ -1960,12 +1960,15 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
                   grantedBy: validation.gate?.answeredBy ?? null,
                   grantedByName: validation.gate?.answeredByName ?? null,
                 };
-                // Reaching this step does not prove the un-park landed:
-                // `awaitEngineGate` reports success for every write error that
-                // is NOT a lost condition, so a throttled un-park leaves META
-                // reading WAITING and the walk continues. A cancel or a rewind
-                // relaunch can then take the intent while this run believes it
-                // resumed. So the grant carries the same fence the terminal
+                // The un-park proves ownership only at the moment it commits:
+                // `unparkGate` now rethrows any write error that is not a lost
+                // condition, so a throttled attempt no longer leaves META
+                // reading WAITING while the walk continues — it either commits
+                // under this run's token or the step retries and surfaces the
+                // failure. What it cannot prove is that ownership still holds
+                // later, when this separate step runs: a cancel or a takeover
+                // can land after the un-park commits and before the grant
+                // write. So the grant carries the same fence the terminal
                 // writes carry — still RUNNING, still owned by this run — and a
                 // lost fence writes nothing. `completedAt` is deliberately NOT
                 // part of it: a retried intent carries a stale one and is owned.

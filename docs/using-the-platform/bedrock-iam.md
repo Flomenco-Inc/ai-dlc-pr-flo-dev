@@ -10,10 +10,12 @@ IAM enables Claude Code, OpenCode, and Codex through a dedicated inference role.
 
 ## Configure a role
 
-Deploy with the existing scripts:
+Complete the [deployment prerequisites](../getting-started/prerequisites.md#aws-deployment) and [manual setup](../getting-started/setup.md#advanced-manual-installation) first. Set `AIDLC_ENVIRONMENT` to your configured logical environment, not your AWS profile. It must match the `environment` value in your `.tfvars` file. The default configuration files are `terraform/environments/<environment>.tfvars` and `terraform/environments/<environment>.s3.tfbackend`; the setup guide documents overrides for files stored elsewhere.
 
 ```sh
-./scripts/deploy-terraform.sh review && ./scripts/deploy-frontend.sh review
+: "${AIDLC_ENVIRONMENT:?Set AIDLC_ENVIRONMENT to your configured environment}"
+./scripts/deploy-terraform.sh "$AIDLC_ENVIRONMENT" &&
+  ./scripts/deploy-frontend.sh "$AIDLC_ENVIRONMENT"
 ```
 
 Managed environments must run an image with IAM authentication support. Publish an updated environment where necessary. The runtime reports protocol 2, the `keys` and `iam` modes, and IAM connection verification; the control plane checks support before granting access, probing the selected runtime if its recorded qualification is missing or does not include the requested mode. **Test connection** reports that the environment must be republished when its runtime cannot verify IAM connections.

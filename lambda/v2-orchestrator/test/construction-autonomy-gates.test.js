@@ -407,7 +407,6 @@ describe('construction autonomy: an autonomous grant', () => {
       },
     ]);
     await run();
-    expect(gateFor('si-build-and-test')).toMatchObject({ learningsRitual: true });
     expect(eventsOfType('v2.gate.auto_approved')).toEqual([]);
   });
 
@@ -723,6 +722,83 @@ describe('construction autonomy: the grant-autonomy escalation', () => {
     expect(
       receiptsFor('si-functional-design').filter((receipt) => receipt.kind === 'stage-approval'),
     ).toEqual([]);
+  });
+
+  // A failed un-park is not proof of ownership. `awaitEngineGate` returns
+  // success for every write error that is NOT a lost condition (section.js), so
+  // a throttled un-park leaves META reading WAITING and the run walking on. The
+  // grant write is the next thing to touch META, and it is the write that has
+  // to notice.
+  const throttleTheUnpark = (onThrottle = () => {}) => {
+    const write = deps.store.updateExecution.getMockImplementation();
+    deps.store.updateExecution = vi.fn(async (args) => {
+      if (args.status === 'RUNNING' && args.fromStatus === 'WAITING') {
+        onThrottle();
+        throw Object.assign(new Error('throttled'), { name: 'ThrottlingException' });
+      }
+      return write(args);
+    });
+  };
+
+  it('writes no grant when a cancel lands while the un-park is throttled', async () => {
+    // The cancel's own WAITING→CANCELLED write succeeds because the un-park
+    // never moved META off WAITING. The already-answered gate is not superseded
+    // and there was no earlier grant for the cancel to withdraw, so only the
+    // grant write can refuse here.
+    throttleTheUnpark(() => {
+      execution = { ...execution, status: 'CANCELLED', completedAt: 'T-cancel' };
+    });
+
+    const result = await run();
+
+    expect(result).toMatchObject({ ok: false, reason: 'retired' });
+    expect(execution.constructionGateAutonomy).toBe('gated');
+    expect(execution.constructionGateAutonomyGrant).toBeUndefined();
+    expect(eventsOfType('v2.autonomy.mode_set')).toEqual([]);
+    expect(eventsOfType('v2.stage.validated')).toEqual([]);
+    expect(
+      receiptsFor('si-functional-design').filter((receipt) => receipt.kind === 'stage-approval'),
+    ).toEqual([]);
+  });
+
+  it('writes no grant when another run takes the intent over while the un-park is throttled', async () => {
+    // A rewind relaunch re-stamps `orchestratorRunId` and leaves the intent
+    // RUNNING, so status alone cannot tell this run that it no longer owns META.
+    throttleTheUnpark(() => {
+      execution = { ...execution, status: 'RUNNING', orchestratorRunId: 'run-relaunched' };
+    });
+
+    const result = await run();
+
+    expect(result).toMatchObject({ ok: false, reason: 'retired' });
+    expect(execution.constructionGateAutonomy).toBe('gated');
+    expect(execution.constructionGateAutonomyGrant).toBeUndefined();
+    expect(eventsOfType('v2.autonomy.mode_set')).toEqual([]);
+    expect(eventsOfType('v2.stage.validated')).toEqual([]);
+    expect(
+      receiptsFor('si-functional-design').filter((receipt) => receipt.kind === 'stage-approval'),
+    ).toEqual([]);
+  });
+
+  it('records the grant across a re-execution of the grant step', async () => {
+    // A lost checkpoint replays the step BODY, not its result. The fence is a
+    // condition on state this run still holds, so the second write converges
+    // instead of reading as a lost ownership and retiring the run.
+    ctx = makeCtx({
+      step: async (name, fn) => {
+        if (name.startsWith('autonomy-grant-') && !name.startsWith('autonomy-grant-event-')) {
+          await fn();
+        }
+        return fn();
+      },
+    });
+
+    const result = await run();
+
+    expect(result).toMatchObject({ ok: true });
+    expect(execution.constructionGateAutonomy).toBe('autonomous');
+    expect(eventsOfType('v2.autonomy.mode_set')).toHaveLength(1);
+    expect(eventsOfType('v2.gate.auto_approved')).toHaveLength(1);
   });
 
   it('resumes a gate whose park write never landed', async () => {

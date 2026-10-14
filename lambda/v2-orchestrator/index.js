@@ -1968,16 +1968,40 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
                   grantedBy: validation.gate?.answeredBy ?? null,
                   grantedByName: validation.gate?.answeredByName ?? null,
                 };
-                // A cancel that lands after the answer fails the gate's un-park,
-                // which writes RUNNING only from WAITING, so the run retires there.
-                await store.updateExecution({
-                  executionId,
-                  constructionGateAutonomy: 'autonomous',
-                  constructionGateAutonomyGrant: recorded,
-                });
+                // Reaching this step does not prove the un-park landed:
+                // `awaitEngineGate` reports success for every write error that
+                // is NOT a lost condition, so a throttled un-park leaves META
+                // reading WAITING and the walk continues. A cancel or a rewind
+                // relaunch can then take the intent while this run believes it
+                // resumed. So the grant carries the same fence the terminal
+                // writes carry — still RUNNING, still owned by this run — and a
+                // lost fence writes nothing. `completedAt` is deliberately NOT
+                // part of it: a retried intent carries a stale one and is owned.
+                try {
+                  await store.updateExecution({
+                    executionId,
+                    constructionGateAutonomy: 'autonomous',
+                    constructionGateAutonomyGrant: recorded,
+                    fromStatus: 'RUNNING',
+                    ...(runId ? { ifOrchestratorRunId: runId } : {}),
+                  });
+                } catch (error) {
+                  if (error?.name === 'ConditionalCheckFailedException') return null;
+                  throw error;
+                }
                 return recorded;
               },
             );
+            // No grant, no approval: the answer reached a run that no longer
+            // owns the intent, so neither the standing grant nor the stage
+            // approval it also carries may leave a mark.
+            if (!grant) {
+              logger.info('run retired before the autonomy grant was written', {
+                executionId,
+                stageId: stage.stageId,
+              });
+              return { ok: false, reason: 'retired', intentId };
+            }
             constructionGrantPossible = true;
             await emitEvent(
               ctx,

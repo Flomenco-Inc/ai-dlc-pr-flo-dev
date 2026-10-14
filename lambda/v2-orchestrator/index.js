@@ -1560,22 +1560,37 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
           // with `learnings: on` runs it, and only a gated stage — a stage with
           // no human gate has nowhere to ask, which matches upstream.
           const learningsRitual = stage.policy?.learnings === 'on';
-          const learningCandidates = learningsRitual
+          // The candidate lookup reads CONSISTENTLY and reports a failed read as
+          // such. An unread list is not an empty one: the waiver below halts on
+          // a candidate, so a swallowed read error would waive the gate that was
+          // supposed to put the candidate to the human, and a stale read could
+          // miss one written moments earlier. A failed read opens the human
+          // gate, which is where an unanswerable question belongs.
+          const learningCandidateLookup = learningsRitual
             ? await ctx.step(
                 `learning-candidates-${stage.stageInstanceId ?? stage.stageId}-${round}`,
                 async () => {
-                  const events = await store.listEvents(executionId).catch(() => []);
-                  return events
-                    .filter(
-                      (row) =>
-                        eventTypeOf(row) === 'v2.learning.candidate' &&
-                        row.stageInstanceId === stage.stageInstanceId,
-                    )
-                    .map((row) => String(row.summary ?? '').slice(0, 300))
-                    .filter(Boolean);
+                  try {
+                    const events = await store.listEvents(executionId, { consistentRead: true });
+                    return {
+                      candidates: events
+                        .filter(
+                          (row) =>
+                            eventTypeOf(row) === 'v2.learning.candidate' &&
+                            row.stageInstanceId === stage.stageInstanceId,
+                        )
+                        .map((row) => String(row.summary ?? '').slice(0, 300))
+                        .filter(Boolean),
+                      unavailable: false,
+                    };
+                  } catch (error) {
+                    logger.error('Learning-candidate read failed; opening the human gate', error);
+                    return { candidates: [], unavailable: true };
+                  }
                 },
               )
-            : [];
+            : { candidates: [], unavailable: false };
+          const learningCandidates = learningCandidateLookup.candidates;
           // Build-and-Test loop-back. The offer is computed from durable state
           // at the moment the gate opens: the recommendation the agent recorded
           // on this stage's row, the plan's own stage order, and the per-intent
@@ -1630,10 +1645,13 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
             // Learning candidates and a loop-back recommendation are put to the
             // human at the gate; a waived gate would drop them unseen, so a gate
             // with either halts. That covers every recommendation: offered, at
-            // the cap (upstream halts there too), or with no target.
+            // the cap (upstream halts there too), or with no target. A candidate
+            // list that could not be READ halts for the same reason as an
+            // unobserved output set: the waiver needs evidence, not its absence.
             autoApprove =
               autonomyWaivable &&
               outputsObserved &&
+              !learningCandidateLookup.unavailable &&
               learningCandidates.length === 0 &&
               !loopBackLookup.recommended &&
               gateFindings.length === 0;

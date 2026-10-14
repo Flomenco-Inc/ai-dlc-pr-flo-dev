@@ -410,6 +410,48 @@ describe('construction autonomy: an autonomous grant', () => {
     expect(eventsOfType('v2.gate.auto_approved')).toEqual([]);
   });
 
+  it('does not waive a gate whose learning candidates could not be read', async () => {
+    // Unavailable evidence is not an empty list. The timeline read the gate
+    // preconditions make succeeds and carries a candidate for this stage; the
+    // candidate lookup's own read is the one that fails. A waiver granted on
+    // that failure drops a recorded candidate unseen, so the human gate opens.
+    deps.loadPlan = vi.fn(async () => ({
+      valid: true,
+      plan: {
+        stages: [ANCHOR, { ...SECOND, policy: { ...POLICY, learnings: 'on' } }],
+      },
+    }));
+    let lookingUpCandidates = false;
+    ctx = makeCtx({
+      step: async (name, fn) => {
+        lookingUpCandidates = name.startsWith('learning-candidates-');
+        try {
+          return await fn();
+        } finally {
+          lookingUpCandidates = false;
+        }
+      },
+    });
+    deps.store.listEvents = vi.fn(async (_executionId, options) => {
+      // A stale candidate read could miss a just-written candidate, so the
+      // lookup has to ask for a consistent one.
+      expect(options?.consistentRead).toBe(true);
+      if (lookingUpCandidates) throw new Error('ProvisionedThroughputExceededException');
+      return [
+        {
+          type: 'v2.learning.candidate',
+          stageInstanceId: 'si-build-and-test',
+          summary: 'retry the flaky integration suite once before failing',
+        },
+      ];
+    });
+
+    await run();
+
+    expect(gateFor('si-build-and-test')).toMatchObject({ learningsRitual: true });
+    expect(eventsOfType('v2.gate.auto_approved')).toEqual([]);
+  });
+
   it.each([
     {
       name: 'an offered loop-back',

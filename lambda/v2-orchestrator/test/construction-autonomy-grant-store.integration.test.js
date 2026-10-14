@@ -2,7 +2,7 @@
 // DynamoDB Local, not a fake that re-implements its conditions. The mocked
 // store cannot prove the write is actually fenced: it is DynamoDB that
 // evaluates `fromStatus` and `ifOrchestratorRunId`, and the claim under test is
-// that a cancel which lands while the gate's un-park is throttled leaves no
+// that a cancel which lands between the gate's un-park and the grant leaves no
 // grant, no provenance and no approval on the row.
 //
 // The root test runner starts DynamoDB Local (test/dynamodb-setup.js).
@@ -172,32 +172,31 @@ describe.skipIf(!process.env.DYNAMODB_LOCAL_ENDPOINT)(
       applicationUrl: 'https://aidlc.example.test/',
     });
 
-    it('writes no grant when a cancel lands while the un-park is throttled', async () => {
+    it('writes no grant when a cancel lands between the un-park and the grant', async () => {
       const executionId = `i-${randomUUID()}`;
       await seed(executionId);
       const answeredGates = [];
       const ctx = makeCtx(executionId, answeredGates);
 
-      // Exactly the interleaving the review describes: the un-park's
-      // WAITING→RUNNING write fails with a NON-conditional error, which
-      // `awaitEngineGate` reports as success, and the cancel endpoint's own
-      // WAITING→CANCELLED conditional write lands against the real table.
-      let throttled = 0;
+      // The gate's un-park commits, and the cancel endpoint's own conditional
+      // write lands against the real table before the separate grant step. The
+      // run still carries the ownership token, so only status has moved.
+      let cancels = 0;
       const fenced = {
         ...store,
         updateExecution: async (args) => {
+          const result = await store.updateExecution(args);
           if (args.status === 'RUNNING' && args.fromStatus === 'WAITING') {
-            throttled += 1;
+            cancels += 1;
             await store.updateExecution({
               executionId,
               status: 'CANCELLED',
-              fromStatus: 'WAITING',
+              fromStatus: 'RUNNING',
               completedAt: 'T-cancel',
               pendingHumanTaskId: null,
             });
-            throw Object.assign(new Error('throttled'), { name: 'ThrottlingException' });
           }
-          return store.updateExecution(args);
+          return result;
         },
       };
 
@@ -207,7 +206,7 @@ describe.skipIf(!process.env.DYNAMODB_LOCAL_ENDPOINT)(
         makeDeps(executionId, ctx, fenced),
       );
 
-      expect(throttled).toBe(1);
+      expect(cancels).toBe(1);
       expect(answeredGates).toHaveLength(1);
       expect(result).toMatchObject({ ok: false, reason: 'retired' });
 

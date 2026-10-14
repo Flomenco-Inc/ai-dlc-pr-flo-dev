@@ -163,19 +163,24 @@ beforeEach(() => {
   deps = {
     store: {
       getExecution: vi.fn(async () => execution),
-      // Honours `fromStatus` and `ifOrchestratorRunId` as the real store's
-      // conditions do, so a cancel or a relaunch that lands while the gate is
-      // parked makes the gate's un-park fail.
+      // Honours `fromStatus`, `ifOrchestratorRunId` and `ifPendingHumanTaskId`
+      // as the real store's conditions do, so a cancel or a relaunch that lands
+      // while the gate is parked makes the gate's un-park fail.
       updateExecution: vi.fn(async (args) => {
         if (
           (args.fromStatus && execution.status !== args.fromStatus) ||
-          (args.ifOrchestratorRunId && execution.orchestratorRunId !== args.ifOrchestratorRunId)
+          (args.ifOrchestratorRunId && execution.orchestratorRunId !== args.ifOrchestratorRunId) ||
+          (args.ifPendingHumanTaskId !== undefined &&
+            (execution.pendingHumanTaskId ?? null) !== args.ifPendingHumanTaskId)
         ) {
           throw Object.assign(new Error('conditional'), {
             name: 'ConditionalCheckFailedException',
           });
         }
         if (args.status !== undefined) execution = { ...execution, status: args.status };
+        if (args.pendingHumanTaskId !== undefined) {
+          execution = { ...execution, pendingHumanTaskId: args.pendingHumanTaskId };
+        }
         if (args.orchestratorRunId !== undefined) {
           execution = { ...execution, orchestratorRunId: args.orchestratorRunId };
         }
@@ -184,7 +189,23 @@ beforeEach(() => {
         }
         return {};
       }),
-      createHumanTask: vi.fn(async (args) => ({ ...args, status: 'pending' })),
+      // Like the store: with a run, the gate row and its owned META park
+      // commit together, so nothing parks META separately afterwards.
+      createHumanTask: vi.fn(async (args) => {
+        if (args.orchestratorRunId) {
+          if (execution.orchestratorRunId !== args.orchestratorRunId) {
+            throw Object.assign(new Error('conditional'), {
+              name: 'ConditionalCheckFailedException',
+            });
+          }
+          execution = {
+            ...execution,
+            status: 'WAITING',
+            pendingHumanTaskId: args.humanTaskId,
+          };
+        }
+        return { ...args, status: 'pending' };
+      }),
       setGateCallbackId: vi.fn(async () => ({})),
       supersedeHumanTask: vi.fn(async () => ({})),
       getHumanTask: answerWithOfferedOption(),
@@ -766,28 +787,24 @@ describe('construction autonomy: the grant-autonomy escalation', () => {
     ).toEqual([]);
   });
 
-  // A failed un-park is not proof of ownership. `awaitEngineGate` returns
-  // success for every write error that is NOT a lost condition (section.js), so
-  // a throttled un-park leaves META reading WAITING and the run walking on. The
-  // grant write is the next thing to touch META, and it is the write that has
-  // to notice.
-  const throttleTheUnpark = (onThrottle = () => {}) => {
+  // The un-park is not the last word on ownership: it commits, and only then
+  // does the separate grant step write. A cancel or a relaunch that lands in
+  // that window keeps `orchestratorRunId` or `status` moving under the run,
+  // and the grant write is the next thing to touch META.
+  const afterTheUnpark = (change) => {
     const write = deps.store.updateExecution.getMockImplementation();
     deps.store.updateExecution = vi.fn(async (args) => {
-      if (args.status === 'RUNNING' && args.fromStatus === 'WAITING') {
-        onThrottle();
-        throw Object.assign(new Error('throttled'), { name: 'ThrottlingException' });
-      }
-      return write(args);
+      const result = await write(args);
+      if (args.status === 'RUNNING' && args.fromStatus === 'WAITING') change();
+      return result;
     });
   };
 
-  it('writes no grant when a cancel lands while the un-park is throttled', async () => {
-    // The cancel's own WAITING→CANCELLED write succeeds because the un-park
-    // never moved META off WAITING. The already-answered gate is not superseded
-    // and there was no earlier grant for the cancel to withdraw, so only the
-    // grant write can refuse here.
-    throttleTheUnpark(() => {
+  it('writes no grant when a cancel lands between the un-park and the grant', async () => {
+    // The cancel ends the run and finds no grant to withdraw, and the
+    // already-answered gate is not superseded by pending-gate cleanup, so only
+    // the grant write itself can refuse here.
+    afterTheUnpark(() => {
       execution = { ...execution, status: 'CANCELLED', completedAt: 'T-cancel' };
     });
 
@@ -803,10 +820,10 @@ describe('construction autonomy: the grant-autonomy escalation', () => {
     ).toEqual([]);
   });
 
-  it('writes no grant when another run takes the intent over while the un-park is throttled', async () => {
+  it('writes no grant when another run takes the intent over between the un-park and the grant', async () => {
     // A rewind relaunch re-stamps `orchestratorRunId` and leaves the intent
-    // RUNNING, so status alone cannot tell this run that it no longer owns META.
-    throttleTheUnpark(() => {
+    // RUNNING, so status alone cannot tell this run that it lost META.
+    afterTheUnpark(() => {
       execution = { ...execution, status: 'RUNNING', orchestratorRunId: 'run-relaunched' };
     });
 
@@ -1060,8 +1077,11 @@ describe('an answered engine gate resumes only while this run still waits on it'
     ]);
   });
 
-  it('resumes when the un-park write fails for a reason other than its condition', async () => {
-    // The un-park is best-effort: a throttled write is not a lost ownership.
+  it('does not resume when the un-park write fails for a reason other than its condition', async () => {
+    // A write that neither committed nor lost its condition leaves ownership
+    // unproven, so the un-park surfaces the failure instead of walking on. The
+    // durable retry re-runs the step; it does not approve the stage behind a
+    // META row that may have moved.
     const write = deps.store.updateExecution.getMockImplementation();
     deps.store.updateExecution = vi.fn(async (args) => {
       if (isUnpark(args))
@@ -1071,10 +1091,9 @@ describe('an answered engine gate resumes only while this run still waits on it'
 
     const result = await run();
 
-    expect(result).toMatchObject({ ok: true });
-    expect(openedGates().map((gate) => gate.stageInstanceId)).toEqual([
-      'si-functional-design',
-      'si-build-and-test',
-    ]);
+    expect(result).toMatchObject({ ok: false });
+    expect(result.reason).not.toBe('ok');
+    expect(openedGates().map((gate) => gate.stageInstanceId)).toEqual(['si-functional-design']);
+    expect(eventsOfType('v2.stage.validated')).toEqual([]);
   });
 });

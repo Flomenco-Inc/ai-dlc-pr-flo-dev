@@ -18,6 +18,8 @@
 
 import { Logger } from '@aws-lambda-powertools/logger';
 import { spawn } from 'node:child_process';
+import { childEnvironment } from './environment.js';
+import { currentCredentialSession } from '../credential-session.js';
 
 const logger = new Logger({ persistentKeys: { component: 'agentcore', module: 'spawn' } });
 const usesPosixProcessGroups = process.platform !== 'win32';
@@ -107,6 +109,18 @@ const trackProcessGroup = (child) => {
 // prints its terminating error, and it bounds memory on a chatty child.
 const clampTail = (s, max) => (s.length > max ? s.slice(s.length - max) : s);
 
+// Session-owned process groups include tool/MCP descendants. Killing just the
+// CLI parent would let those children keep using credentials the session
+// already delivered.
+const terminateChild = (child, detached, killProcessGroup) => {
+  try {
+    if (detached && child.pid) killProcessGroup(-child.pid, 'SIGKILL');
+    else child.kill?.('SIGKILL');
+  } catch {
+    /* group has already exited */
+  }
+};
+
 export const runChild = ({
   command,
   args,
@@ -122,18 +136,35 @@ export const runChild = ({
   processGroup = false,
   timeoutMs = 0,
   spawnFn = spawn,
+  killProcessGroup = (pid, signal) => process.kill(pid, signal),
 }) =>
   new Promise((resolve, reject) => {
     const capture = captureStderrTail > 0;
     const grouped = processGroup && usesPosixProcessGroups;
-    const mergedEnv = { ...process.env, ...env };
+    const session = currentCredentialSession();
+    try {
+      session?.assertAvailable();
+    } catch {
+      resolve({
+        exitCode: null,
+        stdout: '',
+        stderr: '',
+        stderrTail: '',
+        timedOut: false,
+        credentialError: session.signal.reason?.code ?? 'credential_unavailable',
+      });
+      return;
+    }
+    // A persona session or a credential-session child leads its own group.
+    const detached = (grouped || Boolean(session)) && usesPosixProcessGroups;
+    const mergedEnv = childEnvironment(env, process.env, session?.credentialEnvironment);
     let child;
     try {
       child = spawnFn(command, args, {
         cwd,
         env: mergedEnv,
         shell: false,
-        ...(grouped ? { detached: true } : {}),
+        ...(detached ? { detached: true } : {}),
         stdio: [
           promptViaStdin ? 'pipe' : 'ignore',
           onStdout ? 'pipe' : 'inherit',
@@ -163,6 +194,11 @@ export const runChild = ({
         stderrTail = clampTail(stderrTail + c.toString(), captureStderrTail);
       });
     }
+    const cancel = () => {
+      terminateChild(child, detached, killProcessGroup);
+      finish(null);
+    };
+    session?.signal.addEventListener('abort', cancel, { once: true });
     let settled = false;
     let timedOut = false;
     let timer = null;
@@ -170,8 +206,19 @@ export const runChild = ({
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      resolve({ exitCode, stderrTail, ...(timedOut ? { timedOut: true } : {}) });
+      session?.signal.removeEventListener('abort', cancel);
+      resolve({
+        exitCode,
+        stderrTail,
+        ...(timedOut ? { timedOut: true } : {}),
+        ...(session?.signal.aborted
+          ? {
+              credentialError: session.signal.reason?.code ?? 'credential_unavailable',
+            }
+          : {}),
+      });
     };
+    if (session?.signal.aborted) cancel();
     child.on('error', () => {
       untrackProcessGroup();
       finish(null);
@@ -193,7 +240,7 @@ export const runChild = ({
         if (settled) return;
         timedOut = true;
         if (grouped && child.pid) signalGroup(child, 'SIGKILL');
-        else child.kill?.('SIGKILL');
+        else terminateChild(child, detached, killProcessGroup);
       }, timeoutMs);
       timer.unref?.();
     }
@@ -226,15 +273,32 @@ export const captureChild = ({
   captureStderr = false,
   timeoutMs = 0,
   spawnFn = spawn,
+  killProcessGroup = (pid, signal) => process.kill(pid, signal),
 }) =>
   new Promise((resolve) => {
-    const mergedEnv = { ...process.env, ...env };
+    const session = currentCredentialSession();
+    try {
+      session?.assertAvailable();
+    } catch {
+      resolve({
+        exitCode: null,
+        stdout: '',
+        stderr: '',
+        stderrTail: '',
+        timedOut: false,
+        credentialError: session.signal.reason?.code ?? 'credential_unavailable',
+      });
+      return;
+    }
+    const detached = Boolean(session) && process.platform !== 'win32';
+    const mergedEnv = childEnvironment(env, process.env, session?.credentialEnvironment);
     let child;
     try {
       child = spawnFn(command, args, {
         cwd,
         env: mergedEnv,
         shell: false,
+        ...(detached ? { detached: true } : {}),
         stdio: [promptViaStdin ? 'pipe' : 'ignore', 'pipe', captureStderr ? 'pipe' : 'inherit'],
       });
     } catch (e) {
@@ -248,20 +312,36 @@ export const captureChild = ({
     child.stdout?.on('data', (c) => (stdout += c.toString()));
     let stderr = '';
     if (captureStderr) child.stderr?.on('data', (c) => (stderr += c.toString()));
+    const cancel = () => {
+      terminateChild(child, detached, killProcessGroup);
+      finish(null);
+    };
+    session?.signal.addEventListener('abort', cancel, { once: true });
     let settled = false;
     let timedOut = false;
     let timer = null;
     const finish = (exitCode) => {
       if (settled) return;
       settled = true;
+      session?.signal.removeEventListener('abort', cancel);
       if (timer) clearTimeout(timer);
-      resolve({ exitCode, stdout, stderr, timedOut });
+      resolve({
+        exitCode,
+        stdout,
+        stderr,
+        timedOut,
+        ...(session?.signal.aborted
+          ? {
+              credentialError: session.signal.reason?.code ?? 'credential_unavailable',
+            }
+          : {}),
+      });
     };
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         timedOut = true;
         try {
-          child.kill?.('SIGKILL');
+          terminateChild(child, detached, killProcessGroup);
         } catch {
           /* already gone */
         }
@@ -273,6 +353,7 @@ export const captureChild = ({
       // Never hold the event loop open for the watchdog alone.
       timer.unref?.();
     }
+    if (session?.signal.aborted) cancel();
     child.on('error', () => finish(null));
     child.on('close', (code) => finish(code));
     if (promptViaStdin) {

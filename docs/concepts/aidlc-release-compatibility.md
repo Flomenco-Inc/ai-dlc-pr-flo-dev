@@ -156,30 +156,38 @@ ship in the closure and quote engine commands too, but no prompt renders them,
 so they are not read as gaps. The 2.6.18 and 2.7.0 prompts invoke no engine
 command.
 
-No engine binary exists here. The stage and compose prompts neutralize the
-token and append the engine-command annex, a closed list that tells the agent,
-per command, what to do instead. A stage prompt carries the annex when its
-stage body or the conductor carries the token; the compose prompt carries it
-when the composer persona or its knowledge does. A command the annex answers
-does not hold promotion when it is found in one of those bodies:
+No engine binary exists here. The stage, persona and compose prompts neutralize
+the token and append the engine-command annex, a closed list that tells the
+agent, per command, what to do instead. A prompt carries the annex when a part
+the release authors to INSTRUCT the agent carries the token: the stage body, the
+conductor, the persona or the reference knowledge in a stage prompt; the persona
+or the reference knowledge in a reviewer or ensemble brief; the composer persona
+or its knowledge in the compose prompt. `lambda/shared/annex-reach.js` is the one
+definition those builders and the promotion guard share. A command the annex
+answers does not hold promotion when EVERY block whose body carries it is one of
+those: bodies are content-addressed, so one object can be the body of several
+blocks, and coverage for a stage is not coverage for a rule that shares the same
+text.
 
-| Command                                                                                                   | Handling              | What the platform does                                                                                                                                                                                                                                                                                                  |
-| --------------------------------------------------------------------------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `orchestrate report`                                                                                      | unsupported, answered | Records stage lifecycle itself from the turn ending.                                                                                                                                                                                                                                                                    |
-| `recompose --add`, `state set-construction-iteration`, `state practices-event`, `state practices-promote` | unsupported, answered | The agent records a recommendation for the human instead of performing the action.                                                                                                                                                                                                                                      |
-| `graph ars`                                                                                               | unsupported, answered | No composite is computed or shown. Upstream's score is advisory and nothing routes on it; the agent justifies each EXECUTE/SKIP with evidence and never presents a score.                                                                                                                                               |
-| `gen scope-table`, `gen stage-table`                                                                      | approximated          | Read-only reporting the prompt already carries.                                                                                                                                                                                                                                                                         |
-| `workspace detect`, `workspace codekb`, `workspace codekb-scope-diff`                                     | approximated          | Read-only reporting. The compose prompt carries the workspace signals the platform detected; a stage reads the compiled context and its working tree. No scope-diff identifier is minted.                                                                                                                               |
-| `worktree`, `worktree create`, `worktree merge`, `worktree info`                                          | approximated          | A per-unit lane runs on a unit branch the platform creates from the intent branch and checks out before the stage; any other stage runs on the intent branch. The platform merges each unit branch into the intent branch with `--no-ff` after the unit, and the intent branch reaches `main` through its pull request. |
-| `graph validate-grid`                                                                                     | approximated          | The plan resolver re-validates every compose proposal (strictly when in flight). Not reproduced: the validator summary, `nearest_stock`, the keyword collision check.                                                                                                                                                   |
+| Command                                                                                                   | Handling               | What the platform does                                                                                                                                                                                                                                                                                                  |
+| --------------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `orchestrate report`                                                                                      | unsupported, answered  | Records stage lifecycle itself from the turn ending.                                                                                                                                                                                                                                                                    |
+| `recompose --add`, `state set-construction-iteration`, `state practices-event`, `state practices-promote` | unsupported, answered  | The agent records a recommendation for the human instead of performing the action.                                                                                                                                                                                                                                      |
+| `graph ars`                                                                                               | unsupported, answered  | No composite is computed or shown. Upstream's score is advisory and nothing routes on it; the agent justifies each EXECUTE/SKIP with evidence and never presents a score.                                                                                                                                               |
+| `gen scope-table`, `gen stage-table`                                                                      | approximated, answered | Read-only reporting the prompt already carries.                                                                                                                                                                                                                                                                         |
+| `workspace detect`, `workspace codekb`, `workspace codekb-scope-diff`                                     | approximated, answered | Read-only reporting. The compose prompt carries the workspace signals the platform detected; a stage reads the compiled context and its working tree. No scope-diff identifier is minted.                                                                                                                               |
+| `worktree`, `worktree create`, `worktree merge`, `worktree info`                                          | approximated, answered | A per-unit lane runs on a unit branch the platform creates from the intent branch and checks out before the stage; any other stage runs on the intent branch. The platform merges each unit branch into the intent branch with `--no-ff` after the unit, and the intent branch reaches `main` through its pull request. |
+| `graph validate-grid`                                                                                     | approximated, answered | The plan resolver re-validates every compose proposal (strictly when in flight). Not reproduced: the validator summary, `nearest_stock`, the keyword collision check.                                                                                                                                                   |
 
 Any other command, including other subcommands or flags of these families and a
 family name on its own (`state`, `orchestrate --next`), gets only the annex's
 catch-all (say it is unavailable, never improvise), which leaves the
 authored step unperformed, so it still holds promotion. So does an answered
-command found only in a body whose prompt may carry no annex, such as a
-persona other than the composer or a rule. With these, 2.8.2 and 2.9.0 author
-nothing this build cannot honour and are promotable. The admin tab lists
+command — including an approximated one, whose platform substitute the agent
+only learns from the annex — found in a body whose prompt carries no annex, such
+as a rule or a scope. One such consumer is enough: the verdict is the same
+whether that body is shared with a stage or authored separately. With these,
+2.8.2 and 2.9.0 author nothing this build cannot honour and are promotable. The admin tab lists
 exactly what a given import still holds on. A gap list stored by a build that
 read other files is re-read from the closure the next time it is listed or
 promoted.

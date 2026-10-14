@@ -68,17 +68,37 @@ describe('{{INVOKE}} dialect', () => {
     expect(prompt).not.toContain('{{INVOKE}}');
   });
 
-  it('does not append the annex for incidental mentions in other prompt parts', () => {
-    for (const part of ['agentPersona', 'knowledge', 'compiledContext']) {
+  // A release authors the persona and the reference knowledge to INSTRUCT the
+  // agent just as it authors the stage body: the promotion guard counts an
+  // engine command found in one of those bodies as answered, so the prompt that
+  // renders it has to carry the answer. The compose prompt already gates on the
+  // composer persona and its knowledge (commands/compose-plan-start.js); a stage
+  // prompt renders the same kinds of body and gates on them the same way.
+  it('appends the annex when the persona or the reference knowledge instructs', () => {
+    for (const part of ['agentPersona', 'knowledge']) {
       const prompt = buildStagePrompt({
         stage: STAGE,
         stageBody: 'plain',
-        [part]: 'Historically this ran {{INVOKE}} engine gen scope-table.',
+        [part]: 'Obtain the branch with `{{INVOKE}} engine worktree info --slug current`.',
       });
-      expect(prompt).not.toContain(INVOKE_DIALECT_ANNEX);
-      expect(prompt).not.toContain('{{INVOKE}}');
-      expect(prompt).toContain('<runtime-managed-engine>');
+      expect(prompt, part).toContain(INVOKE_DIALECT_ANNEX);
+      expect(prompt, part).not.toContain('{{INVOKE}}');
+      expect(prompt, part).toContain('<runtime-managed-engine> engine worktree info');
     }
+  });
+
+  // The compiled context is runtime data the platform assembles, never authored
+  // release content, so it is not evidence the guard reads and gating on it
+  // would append the annex for an incidental quote.
+  it('does not append the annex for an incidental mention in the compiled context', () => {
+    const prompt = buildStagePrompt({
+      stage: STAGE,
+      stageBody: 'plain',
+      compiledContext: 'Historically this ran {{INVOKE}} engine gen scope-table.',
+    });
+    expect(prompt).not.toContain(INVOKE_DIALECT_ANNEX);
+    expect(prompt).not.toContain('{{INVOKE}}');
+    expect(prompt).toContain('<runtime-managed-engine>');
   });
 
   it('never tells the agent a missing prerequisite is satisfied', () => {

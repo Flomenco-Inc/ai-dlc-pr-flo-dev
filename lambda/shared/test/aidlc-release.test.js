@@ -723,10 +723,11 @@ describe('reading capability evidence out of a published closure', () => {
     ]);
   });
 
-  // A stage prompt carries the engine-command annex only when its stage body or
-  // the conductor carries the token, and the compose prompt only when the
-  // composer persona or its knowledge does. An answered command anywhere else
-  // may reach a prompt with no annex.
+  // A stage prompt carries the engine-command annex when its stage body, the
+  // conductor, the persona or the reference knowledge carries the token, and the
+  // compose prompt when the composer persona or its knowledge does. A body no
+  // prompt builder gates on — a rule, a scope — may still reach a prompt with no
+  // annex, so a command found there keeps holding promotion.
   it('answers an annexed command only in a body whose prompt carries the annex', async () => {
     const readGaps = async (path) => {
       const files = filesFor(NEXT);
@@ -752,17 +753,97 @@ describe('reading capability evidence out of a published closure', () => {
     );
     expect(await readGaps('core/aidlc-common/conductor.md')).toEqual(answered);
     expect(await readGaps('core/agents/aidlc-composer-agent.md')).toEqual(answered);
-    expect(await readGaps('core/agents/aidlc-architect-agent.md')).toEqual(unanswered);
+    expect(await readGaps('core/agents/aidlc-architect-agent.md')).toEqual(answered);
+    expect(await readGaps('core/knowledge/aidlc-shared/state-template.md')).toEqual(answered);
+    expect(await readGaps('core/memory/org.md')).toEqual(unanswered);
+    expect(await readGaps('core/scopes/aidlc-feature.md')).toEqual(unanswered);
+  });
+
+  // Bodies are content-addressed, so ONE object can be the body of several
+  // blocks. Coverage is a property of every block consuming it, not of the key:
+  // the same command in a stage and in a rule reaches a steering doc whose
+  // prompt may carry no annex, exactly as it would from two distinct bodies.
+  // Without the per-consumer rule, deduplication alone decides promotion.
+  it('answers a shared body only when every block consuming it reaches the annex', async () => {
+    const STAGE = ['core/aidlc-common/stages/construction/code-generation.md', 'code-generation'];
+    const PERSONA = ['core/agents/aidlc-developer-agent.md', 'aidlc-developer-agent'];
+    const RULE = ['core/memory/org.md', 'aidlc-org'];
+    const readGaps = async (consumers, { distinct = false } = {}) => {
+      const files = filesFor(NEXT);
+      consumers.forEach(([path], index) => {
+        expect(files.has(path), path).toBe(true);
+        const suffix = distinct ? ` Consumer ${index}.` : '';
+        files.set(
+          path,
+          `${files.get(path)}\nRun {{INVOKE}} engine state practices-event --type override.${suffix}\n`,
+        );
+      });
+      const bundle = buildReleaseBundle({ profileId: NEXT, files });
+      const byId = new Map(
+        Object.values(bundle.catalog.blocks)
+          .flat()
+          .map((block) => [block.blockId, block.bodyRef?.s3Key]),
+      );
+      const keys = consumers.map(([, blockId]) => {
+        expect(byId.has(blockId), blockId).toBe(true);
+        return byId.get(blockId);
+      });
+      // Byte-identical bodies are ONE content-addressed object, so the guard
+      // sees a single key for both consumers. Asserted, so the case can never
+      // silently become two objects and pass for the wrong reason.
+      expect(new Set(keys).size, distinct ? 'distinct bodies' : 'shared body').toBe(
+        distinct ? consumers.length : 1,
+      );
+      store.clear();
+      await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+      const gaps = await readReleaseFidelityGaps({ s3, bucket: BUCKET, manifest: bundle.manifest });
+      return gaps.filter((gap) => gap.blockType === 'BODY');
+    };
+    const answered = [
+      { blockType: 'BODY', field: '{{INVOKE}}', value: 'engine state', annexed: true },
+    ];
+    const unanswered = [{ blockType: 'BODY', field: '{{INVOKE}}', value: 'engine state' }];
+
+    // The decision is the same whether the two bodies are byte-identical (one
+    // object) or differ (two objects) — that is the invariant the content key
+    // broke.
+    expect(await readGaps([STAGE, RULE])).toEqual(unanswered);
+    expect(await readGaps([STAGE, RULE], { distinct: true })).toEqual(unanswered);
+    expect(await readGaps([STAGE, PERSONA])).toEqual(answered);
+    expect(await readGaps([STAGE, PERSONA], { distinct: true })).toEqual(answered);
+  });
+
+  // An APPROXIMATED family has a platform equivalent, but the agent only learns
+  // it from the annex: told to run `worktree info` with no annex, the session has
+  // the authored step and no substitute. Membership in the approximated list is
+  // not evidence that the answer arrived, so reach decides it too.
+  it('raises an approximated command whose answer does not reach its prompt', async () => {
+    const readGaps = async (path) => {
+      const files = filesFor(NEXT);
+      expect(files.has(path), path).toBe(true);
+      files.set(path, `${files.get(path)}\n{{INVOKE}} engine worktree info --slug current\n`);
+      const bundle = buildReleaseBundle({ profileId: NEXT, files });
+      store.clear();
+      await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+      const gaps = await readReleaseFidelityGaps({ s3, bucket: BUCKET, manifest: bundle.manifest });
+      return gaps.filter((gap) => gap.blockType === 'BODY');
+    };
+
+    expect(await readGaps('core/aidlc-common/stages/construction/code-generation.md')).toEqual([]);
+    expect(await readGaps('core/agents/aidlc-developer-agent.md')).toEqual([]);
+    expect(await readGaps('core/memory/org.md')).toEqual([
+      { blockType: 'BODY', field: '{{INVOKE}}', value: 'engine worktree' },
+    ]);
   });
 
   // Bodies are read concurrently and folded as they arrive. A command found both
   // in a body whose prompt carries the annex and in one whose prompt may not is
   // unanswered whichever arrives last.
-  it('leaves a command unanswered in a stage body and another persona in either read order', async () => {
+  it('leaves a command unanswered in a stage body and a rule in either read order', async () => {
     const files = filesFor(NEXT);
     for (const [path, tag] of [
       ['core/aidlc-common/stages/construction/code-generation.md', 'stage'],
-      ['core/agents/aidlc-architect-agent.md', 'persona'],
+      ['core/memory/org.md', 'rule'],
     ]) {
       expect(files.has(path), path).toBe(true);
       files.set(

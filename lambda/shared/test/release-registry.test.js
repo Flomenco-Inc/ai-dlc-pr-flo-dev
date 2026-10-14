@@ -1637,16 +1637,18 @@ describe('a custom fork of 2.9.0 with its own stages, scopes and sensors', () =>
     });
   });
 
-  // The annex is appended to a stage prompt only when the stage body or the
-  // conductor carries the token, and this fork's carry none. A persona's engine
-  // command would reach that prompt with no annex, so it is not answered.
-  it('refuses an answered engine command that only a persona outside the compose prompt invokes', async () => {
+  // The annex is appended to a prompt only when a part the release authors to
+  // INSTRUCT carries the token — the stage body, the conductor, a persona or the
+  // reference knowledge — and this fork's carry none. A rule body is rendered
+  // into the stage's steering doc but is not a part any builder gates on, so an
+  // engine command invoked there reaches a session with no answer.
+  it('refuses an answered engine command that only a body no prompt annexes invokes', async () => {
     const files = forkFiles({ invokeLines: false });
-    const persona = 'core/agents/aidlc-devsecops-agent.md';
-    expect(files.has(persona)).toBe(true);
+    const rule = 'core/memory/org.md';
+    expect(files.has(rule)).toBe(true);
     files.set(
-      persona,
-      `${files.get(persona)}\nRecord it: {{INVOKE}} engine state practices-event --type override\n`,
+      rule,
+      `${files.get(rule)}\nRecord it: {{INVOKE}} engine state practices-event --type override\n`,
     );
     const registered = await publishFork(files);
     const gap = { blockType: 'BODY', field: '{{INVOKE}}', value: 'engine state' };
@@ -1656,6 +1658,71 @@ describe('a custom fork of 2.9.0 with its own stages, scopes and sensors', () =>
       code: 'release_capability_unhandled',
       details: { gaps: [gap] },
     });
+  });
+
+  // Bodies are content-addressed, so a stage and a rule authored with the SAME
+  // text share one object. Coverage belongs to each consuming block: the rule's
+  // session still receives the command, so the verdict must be the one the
+  // distinct-body case gets. Deduplication is a storage detail and may not
+  // decide compatibility.
+  it.each([
+    ['share one body', false],
+    ['carry their own', true],
+  ])('refuses it when the stage and the rule %s', async (_label, distinct) => {
+    const files = forkFiles({ invokeLines: false });
+    const stage = 'core/aidlc-common/stages/construction/acme-security-review.md';
+    const rule = 'core/memory/org.md';
+    const command = 'Record it: {{INVOKE}} engine state practices-event --type override.';
+    files.set(stage, `${files.get(stage)}\n${command}\n`);
+    files.set(rule, `${command}${distinct ? ' Org layer.' : ''}\n`);
+    const registered = await publishFork(files);
+    const gap = { blockType: 'BODY', field: '{{INVOKE}}', value: 'engine state' };
+
+    expect(registered.unhonouredValues).toEqual([gap]);
+    await expect(promoteFork(registered)).rejects.toMatchObject({
+      code: 'release_capability_unhandled',
+      details: { gaps: [gap] },
+    });
+  });
+
+  // An APPROXIMATED family is no gap only where the annex that names the
+  // platform's substitute arrives: the agent learns from it that the platform
+  // owns the worktree and that the branch is readable from git. Invoked from a
+  // body no builder annexes, the session has the authored step and no
+  // substitute, so membership in the approximated list cannot clear it.
+  it('refuses an approximated command whose answer does not reach its prompt', async () => {
+    const files = forkFiles({ invokeLines: false });
+    const rule = 'core/memory/org.md';
+    files.set(
+      rule,
+      `${files.get(rule)}\nObtain the branch: {{INVOKE}} engine worktree info --slug current\n`,
+    );
+    const registered = await publishFork(files);
+    const gap = { blockType: 'BODY', field: '{{INVOKE}}', value: 'engine worktree' };
+
+    expect(registered.unhonouredValues).toEqual([gap]);
+    await expect(promoteFork(registered)).rejects.toMatchObject({
+      code: 'release_capability_unhandled',
+      details: { gaps: [gap] },
+    });
+  });
+
+  it.each([
+    'core/aidlc-common/stages/construction/acme-security-review.md',
+    'core/agents/aidlc-devsecops-agent.md',
+    'core/knowledge/aidlc-shared/state-template.md',
+  ])('honours an approximated command invoked from %s', async (path) => {
+    const files = forkFiles({ invokeLines: false });
+    expect(files.has(path), path).toBe(true);
+    files.set(
+      path,
+      `${files.get(path)}\nObtain the branch: {{INVOKE}} engine worktree info --slug current\n`,
+    );
+    const registered = await publishFork(files);
+
+    expect(registered.fidelityGaps.filter((gap) => gap.blockType === 'BODY')).toEqual([]);
+    expect(registered.unhonouredValues).toEqual([]);
+    await expect(promoteFork(registered)).resolves.toMatchObject({ runnable: true });
   });
 
   it('honours the same command in a stage body, and graph ars in the composer persona', async () => {
@@ -2063,7 +2130,7 @@ describe('promotion of a record registered before protocol evidence existed', ()
 
     expect(promoted).toMatchObject({ supportState: 'selectable', unhonouredValues: [] });
     expect(rows.get(keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META'))).toMatchObject({
-      fidelityEvidenceRevision: 3,
+      fidelityEvidenceRevision: 4,
     });
   });
 
@@ -2071,7 +2138,7 @@ describe('promotion of a record registered before protocol evidence existed', ()
     await registerRelease(registerArgs(CANDIDATE_PROFILE));
 
     expect(rows.get(keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META'))).toMatchObject({
-      fidelityEvidenceRevision: 3,
+      fidelityEvidenceRevision: 4,
     });
   });
 
@@ -2199,7 +2266,7 @@ describe('admin listing of a record registered before protocol evidence existed'
     const second = await listReleases({ ...registryArgs(), s3, bucket: BUCKET });
 
     const listed = first.find((release) => release.releaseId === CANDIDATE_RELEASE_ID);
-    expect(cached.fidelityEvidenceRevision).toBe(3);
+    expect(cached.fidelityEvidenceRevision).toBe(4);
     expect(cached.fidelityGaps).toEqual(listed.fidelityGaps);
     expect(cached.fidelityGaps).not.toEqual(legacy.fidelityGaps);
     // Evidence is derived from an immutable closure, never a decision, so the

@@ -159,31 +159,42 @@ const INFORMATIONAL_UNMAPPED_FIELDS = new Map([
 // family, so the promotion guard keeps refusing a release that invokes one.
 // `annexed` marks the entries the annex answers by name; only a gap carrying it
 // can be honoured, so a command no pattern matches can never pass under the name
-// it happens to share.
+// it happens to share. It is also what makes the answer's REACH checkable: an
+// approximated family has a platform equivalent, but the agent only learns it
+// from the annex ("skip, the data is already in the prompt", "the platform owns
+// the worktree, read the branch from git"), so a prompt carrying one of these
+// commands without the annex is a session holding an authored step and no
+// substitute. Membership in this table is therefore never evidence on its own —
+// `fidelityReport` raises an approximated family whose reach failed exactly like
+// a refused command that went unanswered.
 const INVOKE_FAMILY_FIDELITY = Object.freeze([
   Object.freeze({ pattern: /^sensor-[a-z0-9-]+$/, family: 'sensor-<id>', handling: 'native' }),
   Object.freeze({
     pattern: /^gen (?:scope-table|stage-table)$/,
     family: 'gen',
     handling: 'approximated',
+    annexed: true,
     note: 'Read-only reporting; the scope, stage list, inputs and outputs are already in the prompt.',
   }),
   Object.freeze({
     pattern: /^workspace (?:detect|codekb|codekb-scope-diff)$/,
     family: 'workspace',
     handling: 'approximated',
+    annexed: true,
     note: 'Read-only reporting; the compose prompt carries the workspace signals the platform detected, and code knowledge reaches a stage through the compiled context and the checked-out working tree. No scope-diff identifier is minted.',
   }),
   Object.freeze({
     pattern: /^worktree(?: (?:create|merge|info))?$/,
     family: 'worktree',
     handling: 'approximated',
+    annexed: true,
     note: 'The platform performs the worktree lifecycle itself. A per-unit lane runs on a unit branch the platform creates from the intent branch and checks out before the stage starts (agentcore/commands/lane.js init-lane); any other stage runs on the intent branch. The platform merges each unit branch back into the intent branch with a --no-ff merge after the unit (merge-lane), and the intent branch reaches main through its pull request; that stands in for upstream merging the Bolt branch into main. The agent never creates, merges or inspects a worktree.',
   }),
   Object.freeze({
     pattern: /^graph validate-grid$/,
     family: 'graph validate-grid',
     handling: 'approximated',
+    annexed: true,
     note: 'The platform validates every compose proposal with its plan resolver (strict for an in-flight proposal) before anything is applied, and rejects an invalid grid. Not reproduced: the validator summary the agent would copy, the nearest_stock ranking, and the keyword collision check.',
   }),
   Object.freeze({
@@ -727,6 +738,28 @@ const fidelityReport = (adapterFieldValues, invokeCommands) => {
           (entry.annexed
             ? 'State-mutating engine commands have no equivalent seam; the agent records a recommendation for the human instead of performing the action.'
             : 'The annex does not answer this command: the agent is told it is unavailable, so the authored step is not performed.'),
+      })),
+    // An APPROXIMATED family is honoured only where the annex that names its
+    // platform equivalent arrives. `entry.annexed` is the folded reach — true
+    // only when every prompt invoking the family carries the annex — so a family
+    // the table answers by name whose reach failed is a gap, and promotion
+    // refuses it exactly like an unanswered refusal. Without this a release
+    // could move the invocation into a body no prompt builder annexes and keep
+    // an empty unhonoured list.
+    ...invokeCommands
+      .filter(
+        (entry) =>
+          entry.handling === 'approximated' &&
+          entry.annexed !== true &&
+          invokeFamilyHandling(entry.commands[0]).annexed === true,
+      )
+      .map((entry) => ({
+        kind: 'engine-command',
+        blockType: 'BODY',
+        field: '{{INVOKE}}',
+        value: `engine ${entry.family}`,
+        paths: entry.paths,
+        note: `The platform's substitute for this command is named only in the dialect annex, and the annex does not reach every prompt that invokes it (${entry.paths.join(', ')}): that session would receive the command with no answer.`,
       })),
   ].toSorted((left, right) =>
     `${left.blockType}:${left.field}:${left.value}`.localeCompare(

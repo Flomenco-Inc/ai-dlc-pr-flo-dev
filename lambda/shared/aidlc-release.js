@@ -24,6 +24,7 @@ import {
   profileFor,
 } from './aidlc-compatibility.js';
 import { parseRepositorySlug } from './aidlc-custom-source.js';
+import { annexReachingBlocks } from './annex-reach.js';
 import { buildFromFiles, CONDUCTOR_REPO_PATH } from './block-mappers.js';
 import { buildBodyRef, buildScriptRef, RELEASE_LIBRARY_TYPES, sha256 } from './blocks.js';
 import { isCommitSha } from './aidlc-ref.js';
@@ -36,7 +37,6 @@ import {
   isPreconditionFailed,
 } from './methodology-catalog.js';
 import { canonicalJson } from './workflow-checkpoint.js';
-import { COMPOSER_AGENT_ID } from './compose-match.js';
 import {
   AIDLC_RELEASE_IMPORTER_REVISION,
   FIRST_FINGERPRINTED_IMPORTER_REVISION,
@@ -558,17 +558,25 @@ const readReleaseFidelityGaps = async ({ s3, bucket, manifest }) => {
     Object.keys(RELEASE_LIBRARY_TYPES).flatMap((type) => bodyKeys(catalog.blocks[type] ?? [])),
   );
   // A prompt carries the engine-command annex only when a part that instructs
-  // the agent carries the token: the stage body or the conductor in a stage
-  // prompt (stage-materializer), the composer persona or its knowledge in the
-  // compose prompt (compose-plan-start). A command the annex answers is answered
-  // only in those bodies; in any other (a persona, a rule) it reaches a prompt
-  // that may have no annex, and keeps holding promotion.
-  const annexBodyKeys = new Set(
-    bodyKeys([
-      ...(catalog.blocks.STAGE ?? []),
-      ...(catalog.blocks.AGENT ?? []).filter((block) => block?.blockId === COMPOSER_AGENT_ID),
-      ...(catalog.blocks.KNOWLEDGE ?? []).filter((block) => block?.agentRef === COMPOSER_AGENT_ID),
-    ]),
+  // the agent carries the token. `annex-reach.js` names those bodies for both
+  // this guard and the prompt builders; a command the annex answers is answered
+  // only there, and in any other body (a rule, a scope) it reaches a prompt with
+  // no annex and keeps holding promotion.
+  //
+  // Coverage is decided per CONSUMING BLOCK, not per object key: bodies are
+  // content-addressed, so one object can be the body of several blocks, and a
+  // body shared by a stage and a rule is still read by the rule's session.
+  // Reading coverage off the key alone let deduplication — a storage detail —
+  // decide the compatibility verdict.
+  const reachingBlockIds = new Set(
+    annexReachingBlocks({ blocks: catalog.blocks }).map((block) => block?.blockId),
+  );
+  const unreachedBodyKeys = new Set(
+    Object.keys(RELEASE_LIBRARY_TYPES)
+      .flatMap((type) => catalog.blocks[type] ?? [])
+      .filter((block) => !reachingBlockIds.has(block?.blockId))
+      .map((block) => block?.bodyRef?.s3Key)
+      .filter(Boolean),
   );
   const invokes = invokeCommandCollector();
   await mapWithConcurrency(
@@ -615,8 +623,10 @@ const readReleaseFidelityGaps = async ({ s3, bucket, manifest }) => {
       }
       const conductor = object.path === CONDUCTOR_REPO_PATH;
       if (promptBodyKeys.has(object.key) || conductor) {
+        // No consuming block means the conductor, which every stage prompt
+        // renders and gates on, so it reaches.
         invokes.add(`closure/body-${index}.md`, body, {
-          annexReaches: conductor || annexBodyKeys.has(object.key),
+          annexReaches: !unreachedBodyKeys.has(object.key),
         });
       }
     },

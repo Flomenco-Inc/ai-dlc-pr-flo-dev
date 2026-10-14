@@ -181,6 +181,55 @@ describe('AidlcReleasesTab', () => {
     ).toHaveTextContent(/server will verify its immutable closure before promotion/i);
   });
 
+  // A listing the server could not afford to recompute carries the evidence a
+  // previous build stored. Blocking promotion on it would strand the admin on a
+  // verdict this build no longer reaches; the server re-verifies the closure
+  // before it decides, so the page states the refresh and leaves promotion open.
+  it('reports stale evidence neutrally and keeps promotion available', async () => {
+    list.mockResolvedValue({
+      releases: [
+        release({
+          supportState: 'structurally-valid',
+          fidelityEvidenceStale: true,
+          fidelityGaps: [{ blockType: 'STAGE', field: 'mode', value: 'agent-team' }],
+          unhonouredValues: [{ blockType: 'STAGE', field: 'mode', value: 'agent-team' }],
+        }),
+      ],
+    });
+    const user = userEvent.setup();
+    render(<AidlcReleasesTab />);
+
+    expect(
+      await screen.findByTestId('release-evidence-refreshing-aidlc:aaa111bbb222'),
+    ).toHaveTextContent(/evidence is being refreshed/i);
+    expect(screen.queryByTestId('release-promotion-gaps-aidlc:aaa111bbb222')).toBeNull();
+    await user.click(screen.getByLabelText('Support state for 1.2.0'));
+    expect(screen.getByRole('option', { name: 'Selectable' })).not.toHaveAttribute(
+      'aria-disabled',
+      'true',
+    );
+  });
+
+  it('keeps blocking promotion when current evidence names unsupported behavior', async () => {
+    list.mockResolvedValue({
+      releases: [
+        release({
+          supportState: 'structurally-valid',
+          fidelityEvidenceStale: false,
+          unhonouredValues: [{ blockType: 'STAGE', field: 'mode', value: 'agent-team' }],
+        }),
+      ],
+    });
+    const user = userEvent.setup();
+    render(<AidlcReleasesTab />);
+
+    await user.click(await screen.findByLabelText('Support state for 1.2.0'));
+    expect(screen.getByRole('option', { name: 'Selectable' })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    );
+  });
+
   it('shows the readable API reason when promotion is refused', async () => {
     list.mockResolvedValue({ releases: [release({ supportState: 'structurally-valid' })] });
     update.mockRejectedValue(

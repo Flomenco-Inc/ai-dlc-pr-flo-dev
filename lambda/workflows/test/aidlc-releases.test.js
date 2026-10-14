@@ -1395,13 +1395,14 @@ describe('GET /aidlc-releases — gap lists stored before protocol evidence', ()
     field: 'mode',
     value: 'agent-team',
   });
-  const makeLegacy = () => {
-    const key = keyOf(`AIDLC_RELEASE#${CANDIDATE_RELEASE_ID}`, 'META');
+  const makeLegacyFor = (releaseId) => {
+    const key = keyOf(`AIDLC_RELEASE#${releaseId}`, 'META');
     const row = { ...rows.get(key), fidelityGaps: [UNPRODUCIBLE_GAP] };
     delete row.fidelityEvidenceRevision;
     rows.set(key, row);
     return key;
   };
+  const makeLegacy = () => makeLegacyFor(CANDIDATE_RELEASE_ID);
 
   it('shows an admin no gap once the loop-back is handled', async () => {
     await register(CANDIDATE_PROFILE);
@@ -1430,5 +1431,67 @@ describe('GET /aidlc-releases — gap lists stored before protocol evidence', ()
     expect(rows.get(key).fidelityGaps).not.toEqual(legacy.fidelityGaps);
     expect(s3Mock.commandCalls(GetObjectCommand).length).toBe(readsAfterFirst);
     expect(second.body.releases).toEqual(first.body.releases);
+  });
+
+  // A deploy that bumps FIDELITY_EVIDENCE_REVISION makes every registered row
+  // stale at once. The listing runs on a 128 MB / 30 s Lambda, so what it may
+  // recompute per call has to be bounded or the first admin GET after the
+  // deploy times out instead of answering.
+  it('bounds what one call recomputes and marks the rest stale', async () => {
+    await register(BASELINE_PROFILE);
+    await register(CANDIDATE_PROFILE);
+    makeLegacyFor(BASELINE_RELEASE_ID);
+    makeLegacyFor(CANDIDATE_RELEASE_ID);
+    const readsBefore = s3Mock.commandCalls(GetObjectCommand).length;
+
+    const res = parse(await listReleases());
+
+    const listed = res.body.releases;
+    const readsForOne = s3Mock.commandCalls(GetObjectCommand).length - readsBefore;
+    // One closure's manifest, catalog and objects — whichever of the two is
+    // larger. The whole page would cost the sum of both.
+    const oneClosureCeiling =
+      Math.max(baselineBundle.manifest.objects.length, candidateBundle.manifest.objects.length) + 2;
+    expect(listed.length).toBe(2);
+    expect(listed.filter((release) => release.fidelityEvidenceStale === true).length).toBe(1);
+    expect(
+      listed.find((release) => release.fidelityEvidenceStale === false).fidelityGaps,
+    ).not.toContainEqual(UNPRODUCIBLE_GAP);
+    expect(readsForOne).toBeLessThanOrEqual(oneClosureCeiling);
+
+    const second = parse(await listReleases());
+    const readsAfterSecond = s3Mock.commandCalls(GetObjectCommand).length;
+    const third = parse(await listReleases());
+
+    expect(second.body.releases.every((release) => release.fidelityEvidenceStale === false)).toBe(
+      true,
+    );
+    for (const release of second.body.releases)
+      expect(release.fidelityGaps).not.toContainEqual(UNPRODUCIBLE_GAP);
+    expect(s3Mock.commandCalls(GetObjectCommand).length).toBe(readsAfterSecond);
+    expect(third.body.releases).toEqual(second.body.releases);
+  });
+
+  it('promotes a release whose listed evidence was still stale', async () => {
+    await register(BASELINE_PROFILE);
+    await register(CANDIDATE_PROFILE);
+    makeLegacyFor(BASELINE_RELEASE_ID);
+    makeLegacyFor(CANDIDATE_RELEASE_ID);
+    const listed = parse(await listReleases()).body.releases;
+    const deferred = listed.find((release) => release.fidelityEvidenceStale === true);
+
+    const res = parse(
+      await patchRelease(deferred.releaseId, {
+        expectedRevision: deferred.revision,
+        supportState: 'selectable',
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.release).toMatchObject({
+      supportState: 'selectable',
+      unhonouredValues: [],
+      fidelityEvidenceStale: false,
+    });
   });
 });

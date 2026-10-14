@@ -73,6 +73,11 @@ export interface AidlcRelease {
   // before any promotion or channel move.
   fidelityGaps?: ReleaseFidelityGap[] | null;
   unhonouredValues?: ReleaseFidelityGap[] | null;
+  // True when `fidelityGaps` is a verdict an EARLIER build stored: a listing
+  // recomputes only what it can afford per call. Such a list may name behavior
+  // this build now honours, so it must not be shown as a promotion blocker —
+  // the server re-verifies the closure before it decides.
+  fidelityEvidenceStale?: boolean;
   revision?: number;
 }
 

@@ -85,6 +85,27 @@ const VERSION_SEGMENT_WIDTH = 6;
 // stays at 1: the listing Lambda has 128 MB and a registry page is unbounded.
 const RELEASE_LIST_EVIDENCE_CONCURRENCY = 1;
 
+// How many it may re-verify SUCCESSFULLY in one call. A deploy that bumps
+// FIDELITY_EVIDENCE_REVISION makes every registered row stale at the same
+// moment, so an unbounded migrate-on-read turns the first admin GET into one
+// closure verification per release — past the 30 s the listing Lambda has, which
+// answers 504 and loses the work. The listing recomputes up to this many rows,
+// reports the rest with the evidence it has (marked stale), and converges across
+// calls. Promotion and channel moves are unaffected: they re-verify the closure
+// themselves before deciding, so no decision is ever taken on stale evidence.
+//
+// Only a verification that PRODUCED evidence is charged. A closure that cannot
+// be read is never cached and keeps its place in a deterministic page order, so
+// charging it would make the listing spend the whole budget on the same row on
+// every call and park every row behind it at its stored evidence for good.
+const RELEASE_LIST_EVIDENCE_BUDGET = 1;
+
+// The bound on everything the budget does not charge for: a closure that is slow
+// to read, and the failures. Checked before a verification starts, so the one
+// already in flight is always allowed to finish and be cached, and a page of
+// unverifiable rows costs this much wall clock rather than one attempt per row.
+const RELEASE_LIST_EVIDENCE_BUDGET_MS = 6000;
+
 class ReleaseRegistryError extends Error {
   constructor(code, message, { cause, details = null } = {}) {
     super(message, cause ? { cause } : undefined);
@@ -202,6 +223,11 @@ const releaseToApi = (item) =>
         unhonouredValues: Array.isArray(item.fidelityGaps)
           ? unhonouredValues({ fidelityGaps: item.fidelityGaps })
           : null,
+        // Whether `fidelityGaps` above is a verdict THIS build reached. A stored
+        // list an earlier evidence revision produced can name behavior this
+        // build now honours, so a reader must not refuse a release for it; the
+        // registry re-verifies the closure before any decision.
+        fidelityEvidenceStale: !hasCurrentFidelityEvidence(item),
         revision: item.revision ?? 1,
       }
     : null;
@@ -333,23 +359,39 @@ const listReleases = async ({ ddb, tableName, visibleOnly = false, s3 = null, bu
   // one at a time: the peak heap is one closure rather than the whole page, which
   // is what a 128 MB listing Lambda can actually afford. The recomputed evidence
   // is then cached back onto the row, so this cost is paid once per legacy record.
+  //
+  // What one call may pay for is capped by `RELEASE_LIST_EVIDENCE_BUDGET`, which
+  // only a verification that produced evidence spends, and by a wall-clock
+  // budget, which bounds the rest — a slow closure and a closure that cannot be
+  // verified at all. A row past either is reported as it is stored, already
+  // marked `fidelityEvidenceStale` by `releaseToApi`, and is left untouched so a
+  // later call recomputes it. Charging a failure would be the end of the
+  // backlog's convergence: the page order is deterministic, so the same
+  // unverifiable row would spend the budget on every call.
+  const deadline = Date.now() + RELEASE_LIST_EVIDENCE_BUDGET_MS;
+  let remaining = RELEASE_LIST_EVIDENCE_BUDGET;
   return mapWithConcurrency(
     projected,
     RELEASE_LIST_EVIDENCE_CONCURRENCY,
     async (release, index) => {
       const item = sortedItems[index];
       if (hasCurrentFidelityEvidence(item)) return release;
+      if (remaining <= 0 || Date.now() >= deadline) return release;
       const fidelityGaps = await fidelityGapsForRecord({
         release: item,
         s3,
         bucket,
         requireCurrentEvidence: true,
       }).catch(() => null);
-      if (fidelityGaps) await cacheFidelityEvidence({ ddb, tableName, item, fidelityGaps });
+      if (fidelityGaps) {
+        remaining -= 1;
+        await cacheFidelityEvidence({ ddb, tableName, item, fidelityGaps });
+      }
       return {
         ...release,
         fidelityGaps,
         unhonouredValues: fidelityGaps ? unhonouredValues({ fidelityGaps }) : null,
+        fidelityEvidenceStale: false,
       };
     },
   );
@@ -1495,6 +1537,9 @@ const __test = {
   isSelectableRecord,
   isStableEligible,
   channelsBrokenBy,
+  FIDELITY_EVIDENCE_REVISION,
+  RELEASE_LIST_EVIDENCE_BUDGET,
+  RELEASE_LIST_EVIDENCE_BUDGET_MS,
 };
 
 export {

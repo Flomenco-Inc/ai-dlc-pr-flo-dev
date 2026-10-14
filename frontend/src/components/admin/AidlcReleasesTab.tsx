@@ -443,8 +443,15 @@ export function AidlcReleasesTab() {
               // Known unpublished only for an allowlisted profile: a fork has no
               // profile row, so its upgrade is attempted and the API decides.
               const upgradePublished = release.custom ? true : (profile?.published ?? false);
-              const promotionGaps = release.unhonouredValues ?? [];
-              const compatibilityEvidenceMissing = release.fidelityGaps === null;
+              // Evidence the server could not afford to recompute for this
+              // listing is a verdict an earlier build reached, so it may name
+              // behavior this build now honours. Promotion must stay available:
+              // the server re-verifies the closure before it decides, and
+              // refuses with a readable reason if the gap is real.
+              const evidenceRefreshing = release.fidelityEvidenceStale === true;
+              const promotionGaps = evidenceRefreshing ? [] : (release.unhonouredValues ?? []);
+              const compatibilityEvidenceMissing =
+                !evidenceRefreshing && release.fidelityGaps === null;
               return (
                 <div
                   key={release.releaseId}
@@ -598,6 +605,15 @@ export function AidlcReleasesTab() {
                         .map((gap) => `${gap.blockType}.${gap.field}=${gap.value}`)
                         .join(', ')}
                       .
+                    </p>
+                  )}
+                  {evidenceRefreshing && (
+                    <p
+                      className="text-[11px] text-muted-foreground"
+                      data-testid={`release-evidence-refreshing-${release.releaseId}`}
+                    >
+                      Capability evidence is being refreshed for this record; the server verifies
+                      its immutable closure before promotion.
                     </p>
                   )}
                   {compatibilityEvidenceMissing && (

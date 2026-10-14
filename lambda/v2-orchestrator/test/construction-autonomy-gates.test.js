@@ -166,19 +166,24 @@ beforeEach(() => {
   deps = {
     store: {
       getExecution: vi.fn(async () => execution),
-      // Honours `fromStatus` and `ifOrchestratorRunId` as the real store's
-      // conditions do, so a cancel or a relaunch that lands while the gate is
-      // parked makes the gate's un-park fail.
+      // Honours `fromStatus`, `ifOrchestratorRunId` and `ifPendingHumanTaskId`
+      // as the real store's conditions do, so a cancel or a relaunch that lands
+      // while the gate is parked makes the gate's un-park fail.
       updateExecution: vi.fn(async (args) => {
         if (
           (args.fromStatus && execution.status !== args.fromStatus) ||
-          (args.ifOrchestratorRunId && execution.orchestratorRunId !== args.ifOrchestratorRunId)
+          (args.ifOrchestratorRunId && execution.orchestratorRunId !== args.ifOrchestratorRunId) ||
+          (args.ifPendingHumanTaskId !== undefined &&
+            (execution.pendingHumanTaskId ?? null) !== args.ifPendingHumanTaskId)
         ) {
           throw Object.assign(new Error('conditional'), {
             name: 'ConditionalCheckFailedException',
           });
         }
         if (args.status !== undefined) execution = { ...execution, status: args.status };
+        if (args.pendingHumanTaskId !== undefined) {
+          execution = { ...execution, pendingHumanTaskId: args.pendingHumanTaskId };
+        }
         if (args.orchestratorRunId !== undefined) {
           execution = { ...execution, orchestratorRunId: args.orchestratorRunId };
         }
@@ -188,10 +193,24 @@ beforeEach(() => {
         return {};
       }),
       // A conditional put, like the real store: an existing row is never
-      // overwritten, so a re-executed step cannot reopen an answered gate.
+      // overwritten, so a re-executed step cannot reopen an answered gate. With
+      // a run, the gate row and its owned META park commit together, so nothing
+      // parks META separately afterwards.
       createHumanTask: vi.fn(async (args) => {
         if (storedGates.has(args.humanTaskId)) {
           throw Object.assign(new Error('exists'), { name: 'ConditionalCheckFailedException' });
+        }
+        if (args.orchestratorRunId) {
+          if (execution.orchestratorRunId !== args.orchestratorRunId) {
+            throw Object.assign(new Error('conditional'), {
+              name: 'ConditionalCheckFailedException',
+            });
+          }
+          execution = {
+            ...execution,
+            status: 'WAITING',
+            pendingHumanTaskId: args.humanTaskId,
+          };
         }
         const row = { ...args, status: 'pending' };
         storedGates.set(args.humanTaskId, row);
@@ -443,6 +462,47 @@ describe('construction autonomy: an autonomous grant', () => {
       },
     ]);
     await run();
+    expect(eventsOfType('v2.gate.auto_approved')).toEqual([]);
+  });
+
+  it('does not waive a gate whose learning candidates could not be read', async () => {
+    // Unavailable evidence is not an empty list. The timeline read the gate
+    // preconditions make succeeds and carries a candidate for this stage; the
+    // candidate lookup's own read is the one that fails. A waiver granted on
+    // that failure drops a recorded candidate unseen, so the human gate opens.
+    deps.loadPlan = vi.fn(async () => ({
+      valid: true,
+      plan: {
+        stages: [ANCHOR, { ...SECOND, policy: { ...POLICY, learnings: 'on' } }],
+      },
+    }));
+    let lookingUpCandidates = false;
+    ctx = makeCtx({
+      step: async (name, fn) => {
+        lookingUpCandidates = name.startsWith('learning-candidates-');
+        try {
+          return await fn();
+        } finally {
+          lookingUpCandidates = false;
+        }
+      },
+    });
+    deps.store.listEvents = vi.fn(async (_executionId, options) => {
+      // A stale candidate read could miss a just-written candidate, so the
+      // lookup has to ask for a consistent one.
+      expect(options?.consistentRead).toBe(true);
+      if (lookingUpCandidates) throw new Error('ProvisionedThroughputExceededException');
+      return [
+        {
+          type: 'v2.learning.candidate',
+          stageInstanceId: 'si-build-and-test',
+          summary: 'retry the flaky integration suite once before failing',
+        },
+      ];
+    });
+
+    await run();
+
     expect(gateFor('si-build-and-test')).toMatchObject({ learningsRitual: true });
     expect(eventsOfType('v2.gate.auto_approved')).toEqual([]);
   });
@@ -764,6 +824,79 @@ describe('construction autonomy: the grant-autonomy escalation', () => {
     expect(
       receiptsFor('si-functional-design').filter((receipt) => receipt.kind === 'stage-approval'),
     ).toEqual([]);
+  });
+
+  // The un-park is not the last word on ownership: it commits, and only then
+  // does the separate grant step write. A cancel or a relaunch that lands in
+  // that window keeps `orchestratorRunId` or `status` moving under the run,
+  // and the grant write is the next thing to touch META.
+  const afterTheUnpark = (change) => {
+    const write = deps.store.updateExecution.getMockImplementation();
+    deps.store.updateExecution = vi.fn(async (args) => {
+      const result = await write(args);
+      if (args.status === 'RUNNING' && args.fromStatus === 'WAITING') change();
+      return result;
+    });
+  };
+
+  it('writes no grant when a cancel lands between the un-park and the grant', async () => {
+    // The cancel ends the run and finds no grant to withdraw, and the
+    // already-answered gate is not superseded by pending-gate cleanup, so only
+    // the grant write itself can refuse here.
+    afterTheUnpark(() => {
+      execution = { ...execution, status: 'CANCELLED', completedAt: 'T-cancel' };
+    });
+
+    const result = await run();
+
+    expect(result).toMatchObject({ ok: false, reason: 'retired' });
+    expect(execution.constructionGateAutonomy).toBe('gated');
+    expect(execution.constructionGateAutonomyGrant).toBeUndefined();
+    expect(eventsOfType('v2.autonomy.mode_set')).toEqual([]);
+    expect(eventsOfType('v2.stage.validated')).toEqual([]);
+    expect(
+      receiptsFor('si-functional-design').filter((receipt) => receipt.kind === 'stage-approval'),
+    ).toEqual([]);
+  });
+
+  it('writes no grant when another run takes the intent over between the un-park and the grant', async () => {
+    // A rewind relaunch re-stamps `orchestratorRunId` and leaves the intent
+    // RUNNING, so status alone cannot tell this run that it lost META.
+    afterTheUnpark(() => {
+      execution = { ...execution, status: 'RUNNING', orchestratorRunId: 'run-relaunched' };
+    });
+
+    const result = await run();
+
+    expect(result).toMatchObject({ ok: false, reason: 'retired' });
+    expect(execution.constructionGateAutonomy).toBe('gated');
+    expect(execution.constructionGateAutonomyGrant).toBeUndefined();
+    expect(eventsOfType('v2.autonomy.mode_set')).toEqual([]);
+    expect(eventsOfType('v2.stage.validated')).toEqual([]);
+    expect(
+      receiptsFor('si-functional-design').filter((receipt) => receipt.kind === 'stage-approval'),
+    ).toEqual([]);
+  });
+
+  it('records the grant across a re-execution of the grant step', async () => {
+    // A lost checkpoint replays the step BODY, not its result. The fence is a
+    // condition on state this run still holds, so the second write converges
+    // instead of reading as a lost ownership and retiring the run.
+    ctx = makeCtx({
+      step: async (name, fn) => {
+        if (name.startsWith('autonomy-grant-') && !name.startsWith('autonomy-grant-event-')) {
+          await fn();
+        }
+        return fn();
+      },
+    });
+
+    const result = await run();
+
+    expect(result).toMatchObject({ ok: true });
+    expect(execution.constructionGateAutonomy).toBe('autonomous');
+    expect(eventsOfType('v2.autonomy.mode_set')).toHaveLength(1);
+    expect(eventsOfType('v2.gate.auto_approved')).toHaveLength(1);
   });
 
   it('resumes a gate whose park write never landed', async () => {
@@ -1359,8 +1492,11 @@ describe('an answered engine gate resumes only while this run still waits on it'
     ]);
   });
 
-  it('resumes when the un-park write fails for a reason other than its condition', async () => {
-    // The un-park is best-effort: a throttled write is not a lost ownership.
+  it('does not resume when the un-park write fails for a reason other than its condition', async () => {
+    // A write that neither committed nor lost its condition leaves ownership
+    // unproven, so the un-park surfaces the failure instead of walking on. The
+    // durable retry re-runs the step; it does not approve the stage behind a
+    // META row that may have moved.
     const write = deps.store.updateExecution.getMockImplementation();
     deps.store.updateExecution = vi.fn(async (args) => {
       if (isUnpark(args))
@@ -1370,10 +1506,9 @@ describe('an answered engine gate resumes only while this run still waits on it'
 
     const result = await run();
 
-    expect(result).toMatchObject({ ok: true });
-    expect(openedGates().map((gate) => gate.stageInstanceId)).toEqual([
-      'si-functional-design',
-      'si-build-and-test',
-    ]);
+    expect(result).toMatchObject({ ok: false });
+    expect(result.reason).not.toBe('ok');
+    expect(openedGates().map((gate) => gate.stageInstanceId)).toEqual(['si-functional-design']);
+    expect(eventsOfType('v2.stage.validated')).toEqual([]);
   });
 });

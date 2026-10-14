@@ -34,8 +34,11 @@ import {
   StopRuntimeSessionCommand,
 } from '@aws-sdk/client-bedrock-agentcore';
 import { parseLambdaPayload } from '../shared/lambda-payload.js';
-import { credentialProviderForCli } from '../shared/agent-credentials.js';
 import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js';
+import {
+  prepareAgentInvocation,
+  executionCredentialBinding,
+} from '../shared/agent-credential-service.js';
 import { commandDefinition } from '../shared/agent-command-registry.js';
 import { repoProvider as sharedRepoProvider } from '../shared/repo-provider.js';
 import { createProcessStore } from '../shared/v2-process-store.js';
@@ -46,7 +49,7 @@ import {
   planSegments,
   stageInstanceId as planStageInstanceId,
 } from '../shared/v2-execution-plan.js';
-import { humanTaskMatchesOwner, isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
+import { isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
 import {
   evaluateGatePreconditions,
   mergeFindings,
@@ -82,6 +85,7 @@ import {
 } from './section.js';
 import { runQuorumEdit } from './quorum-edit.js';
 import { buildIntentAttribution } from './pr-attribution.js';
+import { bindGateCallback, ownsAnsweredGate, unparkGate } from './gate-callback.js';
 import { OVERRIDE_REASON_MAX } from '../shared/gate-answer.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
@@ -196,7 +200,7 @@ const stopRuntimeSession = async (sessionId, target = { agentRuntimeArn: RUNTIME
     );
     return { stopped: true };
   } catch (e) {
-    return { stopped: false, error: e.message };
+    return { stopped: false, notFound: e?.name === 'ResourceNotFoundException', error: e.message };
   }
 };
 
@@ -427,21 +431,22 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
   const stopIntentSession = (sessionId) => stopSession(sessionId, runtimeTarget);
 
   const { projectId, workflowId, workflowVersion, scope } = meta;
-  const credentialProvider = credentialProviderForCli(meta.agentCli);
-  const credentialBinding =
-    meta.credentialBinding ??
-    (credentialProvider ? { provider: credentialProvider, source: 'platform' } : null);
+  const credentialBinding = executionCredentialBinding(meta);
   const invokeIntentRuntime = async (payload, runtimeSessionId) => {
     const authMode = commandDefinition(payload.command)?.agentAuth;
     if (!authMode || !credentialBinding || typeof deps.issueAgentCredentialGrant !== 'function') {
       return rawInvokeRuntime(payload, runtimeSessionId, runtimeTarget);
     }
-    const agentCredentialGrant = await deps.issueAgentCredentialGrant({
-      purpose: authMode,
-      projectId,
-      executionId,
-      bindings: [credentialBinding],
-    });
+    const { agentCredentialGrant } = await prepareAgentInvocation(
+      {
+        purpose: authMode,
+        projectId,
+        executionId,
+        credentialBinding,
+        runtimeCapabilities: meta.environment,
+      },
+      { issueGrant: deps.issueAgentCredentialGrant },
+    );
     return rawInvokeRuntime(
       {
         ...payload,
@@ -897,7 +902,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
             planStageInstanceId(namespace, stage.stageId, unitSlug, sectionIndex)),
         store,
         suffix,
-        ids: { projectId, intentId, executionId },
+        ids: { projectId, intentId, executionId, orchestratorRunId: runId },
         workflowId,
         workflowVersion,
         ...(meta.aidlcRepoRef ? { aidlcRepoRef: meta.aidlcRepoRef } : {}),
@@ -975,59 +980,47 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         const expectedStageInstanceId = result.stageInstanceId ?? stage.stageInstanceId ?? null;
         const expectedCallbackOwner = `stage:${expectedStageInstanceId ?? label}`;
         const callbackBound = await ctxArg.step(`bind-callback-${humanTaskId}`, () =>
-          store.setGateCallbackId({
+          bindGateCallback(store, {
             executionId,
             humanTaskId,
             callbackId,
             stageInstanceId: expectedStageInstanceId,
             callbackOwner: expectedCallbackOwner,
+            unitSlug,
+            sectionIndex,
           }),
         );
         let answeredEarly = false;
         if (!callbackBound) {
-          // The answer can win the CAS immediately before this bind. In that
-          // case setGateCallbackId returns null because the gate is no longer
-          // pending, but no callback is needed: resume directly with the
-          // persisted answer. Any still-pending, differently owned, or already
-          // bound gate remains an invariant violation.
+          // bindGateCallback returns an answered gate owned by this stage, so a
+          // current bind is null only on a real conflict. Deployed versions
+          // checkpointed null for an answer that won the pending-only bind and
+          // then recorded this step; replaying those runs must find the same
+          // step name at the same position.
           const gateAfterBindFailure = await ctxArg.step(
             `gate-after-bind-failure-${humanTaskId}`,
             () => store.getHumanTask(executionId, humanTaskId, { consistentRead: true }),
           );
           if (gateAfterBindFailure?.status === 'superseded') {
-            ctx.logger?.info?.('run retired before gate callback bind', {
-              intentId,
-              humanTaskId,
-            });
+            logger.info('run retired before gate callback bind', { humanTaskId });
             return {
               state: 'TERMINAL',
               value: { ok: false, reason: 'retired', intentId, humanTaskId },
             };
           }
-          const ownsExpectedStage = humanTaskMatchesOwner({
-            task: gateAfterBindFailure,
+          answeredEarly = ownsAnsweredGate(gateAfterBindFailure, {
+            callbackId,
+            callbackOwner: expectedCallbackOwner,
             stageInstanceId: expectedStageInstanceId,
             unitSlug,
             sectionIndex,
           });
-          const callbackIdCompatible =
-            gateAfterBindFailure?.callbackId == null ||
-            gateAfterBindFailure.callbackId === callbackId;
-          const callbackOwnerCompatible =
-            gateAfterBindFailure?.callbackOwner == null ||
-            gateAfterBindFailure.callbackOwner === expectedCallbackOwner;
-          answeredEarly =
-            isHumanTaskAnswerStatus(gateAfterBindFailure?.status) &&
-            Boolean(gateAfterBindFailure.answeredAt || gateAfterBindFailure.answer) &&
-            ownsExpectedStage &&
-            callbackIdCompatible &&
-            callbackOwnerCompatible;
           if (!answeredEarly) {
             return {
               state: 'TERMINAL',
               value: await fail(
                 'gate_callback_conflict',
-                `gate ${humanTaskId} bind failed without an unbound answer owned by this stage`,
+                `gate ${humanTaskId} is already bound to a different stage callback`,
               ),
             };
           }
@@ -1100,7 +1093,7 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // over the fresh row — field incident). Verify we still own the run
         // BEFORE dispatching anything.
         const ownerRunId = await ctxArg.step(`run-owner-${humanTaskId}`, async () => {
-          const currentMeta = await store.getExecution(executionId);
+          const currentMeta = await store.getExecution(executionId, { consistentRead: true });
           return currentMeta?.orchestratorRunId ?? null;
         });
         if (runId && ownerRunId && ownerRunId !== runId) {
@@ -1116,32 +1109,9 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         // Credential resolution only permits active executions. Unpark META
         // before AgentCore restores a released session's workspace, otherwise
         // the re-clone is rejected while the execution still reads WAITING.
-        const ownedUnpark = await ctxArg.step(`gate-unpark-${humanTaskId}`, async () => {
-          // Lane gates never park META: another lane may own its single pending
-          // gate pointer, and this lane's META status has remained RUNNING. The
-          // conditional ownership update leaves that status and pointer intact.
-          try {
-            if (unitSlug) {
-              await store.updateExecution({
-                executionId,
-                orchestratorRunId: runId,
-                ifOrchestratorRunId: runId,
-              });
-              return true;
-            }
-            await store.updateExecution({
-              executionId,
-              status: 'RUNNING',
-              pendingHumanTaskId: null,
-              fromStatus: 'WAITING',
-              ifOrchestratorRunId: runId,
-            });
-            return true;
-          } catch (e) {
-            if (e?.name === 'ConditionalCheckFailedException') return false;
-            throw e;
-          }
-        });
+        const ownedUnpark = await ctxArg.step(`gate-unpark-${humanTaskId}`, () =>
+          unparkGate(store, { executionId, humanTaskId, runId, unitSlug }),
+        );
         if (!ownedUnpark) {
           logger.info('run retired while unparking gate', { humanTaskId });
           return {
@@ -1156,6 +1126,9 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
         });
       }
 
+      if (result?.reason === 'retired') {
+        return { state: 'TERMINAL', value: { ok: false, reason: 'retired', intentId } };
+      }
       if (result?.state === 'FAILED') {
         return {
           state: 'FAILED',
@@ -1375,7 +1348,8 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
             );
             if (fanoutSection) {
               unitPlanForGate = await ctx.step(`load-unit-plan-${stage.stageId}${suffix}`, () =>
-                store.getUnitPlan(executionId).catch(() => null),
+                // Read-after-write: promote-units saved this plan just now.
+                store.getUnitPlan(executionId, { consistentRead: true }).catch(() => null),
               );
             }
           }
@@ -1561,22 +1535,37 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
           // with `learnings: on` runs it, and only a gated stage — a stage with
           // no human gate has nowhere to ask, which matches upstream.
           const learningsRitual = stage.policy?.learnings === 'on';
-          const learningCandidates = learningsRitual
+          // The candidate lookup reads CONSISTENTLY and reports a failed read as
+          // such. An unread list is not an empty one: the waiver below halts on
+          // a candidate, so a swallowed read error would waive the gate that was
+          // supposed to put the candidate to the human, and a stale read could
+          // miss one written moments earlier. A failed read opens the human
+          // gate, which is where an unanswerable question belongs.
+          const learningCandidateLookup = learningsRitual
             ? await ctx.step(
                 `learning-candidates-${stage.stageInstanceId ?? stage.stageId}-${round}`,
                 async () => {
-                  const events = await store.listEvents(executionId).catch(() => []);
-                  return events
-                    .filter(
-                      (row) =>
-                        eventTypeOf(row) === 'v2.learning.candidate' &&
-                        row.stageInstanceId === stage.stageInstanceId,
-                    )
-                    .map((row) => String(row.summary ?? '').slice(0, 300))
-                    .filter(Boolean);
+                  try {
+                    const events = await store.listEvents(executionId, { consistentRead: true });
+                    return {
+                      candidates: events
+                        .filter(
+                          (row) =>
+                            eventTypeOf(row) === 'v2.learning.candidate' &&
+                            row.stageInstanceId === stage.stageInstanceId,
+                        )
+                        .map((row) => String(row.summary ?? '').slice(0, 300))
+                        .filter(Boolean),
+                      unavailable: false,
+                    };
+                  } catch (error) {
+                    logger.error('Learning-candidate read failed; opening the human gate', error);
+                    return { candidates: [], unavailable: true };
+                  }
                 },
               )
-            : [];
+            : { candidates: [], unavailable: false };
+          const learningCandidates = learningCandidateLookup.candidates;
           // Build-and-Test loop-back. The offer is computed from durable state
           // at the moment the gate opens: the recommendation the agent recorded
           // on this stage's row, the plan's own stage order, and the per-intent
@@ -1657,10 +1646,13 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
             // Learning candidates and a loop-back recommendation are put to the
             // human at the gate; a waived gate would drop them unseen, so a gate
             // with either halts. That covers every recommendation: offered, at
-            // the cap (upstream halts there too), or with no target.
+            // the cap (upstream halts there too), or with no target. A candidate
+            // list that could not be READ halts for the same reason as an
+            // unobserved output set: the waiver needs evidence, not its absence.
             autoApprove =
               autonomyWaivable &&
               outputsObserved &&
+              !learningCandidateLookup.unavailable &&
               learningCandidates.length === 0 &&
               !loopBackLookup.recommended &&
               gateFindings.length === 0;
@@ -2035,16 +2027,40 @@ const handler = async (event, ctx, deps = defaultDeps()) => {
                   grantedBy: validation.gate?.answeredBy ?? null,
                   grantedByName: validation.gate?.answeredByName ?? null,
                 };
-                // A cancel that lands after the answer fails the gate's un-park,
-                // which writes RUNNING only from WAITING, so the run retires there.
-                await store.updateExecution({
-                  executionId,
-                  constructionGateAutonomy: 'autonomous',
-                  constructionGateAutonomyGrant: recorded,
-                });
+                // Reaching this step does not prove the un-park landed:
+                // `awaitEngineGate` reports success for every write error that
+                // is NOT a lost condition, so a throttled un-park leaves META
+                // reading WAITING and the walk continues. A cancel or a rewind
+                // relaunch can then take the intent while this run believes it
+                // resumed. So the grant carries the same fence the terminal
+                // writes carry — still RUNNING, still owned by this run — and a
+                // lost fence writes nothing. `completedAt` is deliberately NOT
+                // part of it: a retried intent carries a stale one and is owned.
+                try {
+                  await store.updateExecution({
+                    executionId,
+                    constructionGateAutonomy: 'autonomous',
+                    constructionGateAutonomyGrant: recorded,
+                    fromStatus: 'RUNNING',
+                    ...(runId ? { ifOrchestratorRunId: runId } : {}),
+                  });
+                } catch (error) {
+                  if (error?.name === 'ConditionalCheckFailedException') return null;
+                  throw error;
+                }
                 return recorded;
               },
             );
+            // No grant, no approval: the answer reached a run that no longer
+            // owns the intent, so neither the standing grant nor the stage
+            // approval it also carries may leave a mark.
+            if (!grant) {
+              logger.info('run retired before the autonomy grant was written', {
+                executionId,
+                stageId: stage.stageId,
+              });
+              return { ok: false, reason: 'retired', intentId };
+            }
             constructionGrantPossible = true;
             await emitEvent(
               ctx,

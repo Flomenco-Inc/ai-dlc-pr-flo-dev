@@ -52,6 +52,7 @@
 import processKeysPkg from '../shared/v2-process-keys.js';
 import { stageIsNoopForUnit } from '../shared/unit-kind-pruning.js';
 import { buildIntentAttribution } from './pr-attribution.js';
+import { bindGateCallback, unparkGate } from './gate-callback.js';
 import { assertPrStrategySupported } from '../shared/pr-strategy.js';
 import { repoProvider as sharedRepoProvider } from '../shared/repo-provider.js';
 import { parseChoice } from '../shared/gate-answer.js';
@@ -184,21 +185,31 @@ export const awaitEngineGate = async (
   const { store, broadcast, ids, runId } = toolkit;
   const { executionId, intentId, projectId } = ids;
   const humanTaskId = `eg-${name}-${runId}`;
-
+  const ownsRun = async () => {
+    const meta = await store.getExecution(executionId, { consistentRead: true });
+    return Boolean(meta) && (!runId || !meta.orchestratorRunId || meta.orchestratorRunId === runId);
+  };
   // A prior attempt of THIS run may have already opened and even answered the
   // gate (resume after a suspend) — reuse the decision instead of hanging on
   // a callback nobody will complete.
-  const existing = await ctxArg.step(`gate-pre-${name}`, () =>
-    store.getHumanTask(executionId, humanTaskId).catch(() => null),
-  );
+  // Preserve the deployed operation sequence: durable checkpoints address
+  // steps by position as well as name. New checks belong inside existing steps.
+  const existing = await ctxArg.step(`gate-pre-${name}`, async () => {
+    if (!(await ownsRun())) return { status: 'superseded' };
+    return store.getHumanTask(executionId, humanTaskId, { consistentRead: true });
+  });
   if (existing && existing.status === 'superseded') return { superseded: true };
   if (existing && existing.status !== 'pending') return { gate: existing };
 
-  await ctxArg.step(`gate-open-${name}`, async () => {
+  const opened = await ctxArg.step(`gate-open-${name}`, async () => {
+    // With a run, createHumanTask parks META (WAITING + pointer) in the same
+    // transaction as the gate, so only an existing gate needs the park below.
+    let parkedWithGate = false;
     try {
       await store.createHumanTask({
         executionId,
         humanTaskId,
+        orchestratorRunId: runId,
         stageInstanceId,
         unitSlug,
         sectionIndex,
@@ -217,19 +228,31 @@ export const awaitEngineGate = async (
         // this open, so the gate row is the only place it survives.
         ...(loopBackStatus ? { loopBackReason, loopBackStatus, loopBackNote } : {}),
       });
-    } catch {
-      /* already exists from a prior attempt — idempotent open */
+      parkedWithGate = Boolean(runId);
+    } catch (error) {
+      if (error?.name !== 'ConditionalCheckFailedException') throw error;
     }
     // Park META (WAITING + pointer): the cancel endpoint and the UI badge key
     // off it. Engine gates are barriers — no lanes are running while pending.
-    try {
-      await store.updateExecution({
-        executionId,
-        status: 'WAITING',
-        pendingHumanTaskId: humanTaskId,
-      });
-    } catch {
-      /* park bookkeeping is best-effort; the gate row is the truth */
+    if (!parkedWithGate) {
+      try {
+        await store.updateExecution({
+          executionId,
+          status: 'WAITING',
+          pendingHumanTaskId: humanTaskId,
+          ifOrchestratorRunId: runId,
+        });
+      } catch (error) {
+        if (error?.name !== 'ConditionalCheckFailedException') throw error;
+        // Current stores create/park atomically. Also clean up gates created
+        // by a deployed older version before its META ownership write failed.
+        await store.supersedeHumanTask({
+          executionId,
+          humanTaskId,
+          supersededBy: 'run_replaced',
+        });
+        return false;
+      }
     }
     try {
       await broadcast?.(intentId, {
@@ -255,58 +278,43 @@ export const awaitEngineGate = async (
     } catch {
       /* live fan-out is best-effort */
     }
+    return true;
   });
+  if (opened === false) return { superseded: true };
 
   const [callbackPromise, callbackId] = await ctxArg.createCallback(`await-${humanTaskId}`);
-  const callbackBound = await ctxArg.step(`bind-callback-${humanTaskId}`, () =>
-    store.setGateCallbackId({
+  const callbackBound = await ctxArg.step(`bind-callback-${humanTaskId}`, async () => {
+    const bound = await bindGateCallback(store, {
       executionId,
       humanTaskId,
       callbackId,
       stageInstanceId: stageInstanceId ?? null,
       callbackOwner: `engine:${humanTaskId}`,
-    }),
-  );
+      unitSlug,
+      sectionIndex,
+    });
+    if (!bound) return null;
+    // An answer can win immediately after binding. Save that observation in
+    // the existing bind checkpoint, retaining compatibility with old row values.
+    return store.getHumanTask(executionId, humanTaskId, { consistentRead: true });
+  });
   if (!callbackBound) {
     throw new Error(
       `gate_callback_conflict: ${humanTaskId} already has a different callback owner`,
     );
   }
-  await callbackPromise;
+  if (!callbackBound.status || callbackBound.status === 'pending') await callbackPromise;
 
-  // Re-read after the wake: cancel/rewind supersedes and wakes with a
-  // sentinel — that run owns META from here (same discipline as stage gates).
+  // Re-read after the wake (or an answer observed while binding), so a
+  // subsequent cancellation is not hidden by the bind checkpoint.
   const gate = await ctxArg.step(`gate-after-${name}`, () =>
-    store.getHumanTask(executionId, humanTaskId).catch(() => null),
+    store.getHumanTask(executionId, humanTaskId, { consistentRead: true }),
   );
   if (!gate || gate.status === 'superseded') return { superseded: true };
-  // An answered gate is not superseded, and META reads WAITING until this
-  // un-park, so a cancel, a rewind or a relaunch can still land after the
-  // answer. The un-park therefore writes RUNNING only from WAITING and only
-  // while this run owns META. A park write that never landed, or this step's
-  // own earlier write, leaves META RUNNING under this run, which is not a
-  // retirement.
-  const unparked = await ctxArg.step(`gate-unpark-${name}`, async () => {
-    try {
-      // The answer reached the run, so any resume marker for it is resolved.
-      await store.updateExecution({
-        executionId,
-        status: 'RUNNING',
-        pendingHumanTaskId: null,
-        resumeRequired: null,
-        fromStatus: 'WAITING',
-        ifOrchestratorRunId: runId,
-      });
-      return true;
-    } catch (error) {
-      if (error?.name !== 'ConditionalCheckFailedException') return true;
-      const meta = await store
-        .getExecution(executionId, { consistentRead: true })
-        .catch(() => null);
-      return meta?.status === 'RUNNING' && (!runId || meta.orchestratorRunId === runId);
-    }
-  });
-  if (!unparked) return { superseded: true };
+  const unparked = await ctxArg.step(`gate-unpark-${name}`, () =>
+    unparkGate(store, { executionId, humanTaskId, runId }),
+  );
+  if (unparked === false) return { superseded: true };
   return { gate };
 };
 
@@ -436,7 +444,10 @@ export const runParallelSection = async (segment, toolkit) => {
   const { executionId, intentId, projectId } = ids;
   const sk = `s${segment.index}`;
 
-  const unitPlan = await ctx.step(`load-unit-plan-${sk}`, () => store.getUnitPlan(executionId));
+  // Consistent: the fan-out approval patched this plan's decisions just before.
+  const unitPlan = await ctx.step(`load-unit-plan-${sk}`, () =>
+    store.getUnitPlan(executionId, { consistentRead: true }),
+  );
   if (!unitPlan || (unitPlan.units ?? []).length === 0) {
     return await fail(
       'unit_plan_missing',
@@ -971,6 +982,9 @@ export const runParallelSection = async (segment, toolkit) => {
           })),
         },
       });
+      // A retired revision belongs to a replaced run: the replacement may
+      // already own this batch, so write nothing and exit.
+      if (revision.state === 'TERMINAL') return { terminal: revision.value };
       if (revision.state !== 'SUCCEEDED') {
         const revisionFailure = `${revision.reason ?? 'feedback_revision_failed'}${
           revision.detail ? `: ${revision.detail}` : ''
@@ -1152,6 +1166,7 @@ export const runParallelSection = async (segment, toolkit) => {
 
     for (let reconciliation = 0; ; reconciliation += 1) {
       const feedback = await processNextFeedback(`r${reconciliation}-pre`);
+      if (feedback.terminal) return { slug, state: 'TERMINAL', value: feedback.terminal };
       if (feedback.failed) {
         return laneFailed(laneCtx, slug, round, {
           stageId: 'review-feedback',
@@ -1323,6 +1338,9 @@ export const runParallelSection = async (segment, toolkit) => {
         const pollFeedback = await processNextFeedback(
           `r${reconciliation}-observation-${observation}`,
         );
+        if (pollFeedback.terminal) {
+          return { slug, state: 'TERMINAL', value: pollFeedback.terminal };
+        }
         if (pollFeedback.failed) {
           return laneFailed(laneCtx, slug, round, {
             stageId: 'review-feedback',
@@ -2198,6 +2216,29 @@ export const runParallelSection = async (segment, toolkit) => {
     }
   };
 
+  const failDeadLaneAttempts = async (slug) => {
+    for (const stage of segment.stages) {
+      const stageInstanceId = toolkit.stageInstanceIdFor(stage.stageId, slug, segment.index);
+      try {
+        const row = await store.getStage(executionId, stageInstanceId, { consistentRead: true });
+        if (row?.state !== 'RUNNING' || !row.stageCallbackId) continue;
+        await store.failRunningStageAttempt({
+          executionId,
+          stageInstanceId,
+          stageCallbackId: row.stageCallbackId,
+          runtimeError: 'lane_released',
+        });
+      } catch (error) {
+        // Best-effort: a row left RUNNING fails the retry as stage_attempt_conflict.
+        ctx.logger?.error?.('dead lane attempt not released', {
+          slug,
+          stageInstanceId,
+          error: error?.message,
+        });
+      }
+    }
+  };
+
   // Run lanes + halt-and-ask rounds until every requested lane is MERGED, the
   // human skips, or a terminal exit. Returns null | terminal value.
   // Revision runs (feedbackTaskId set) revive MERGED lanes and inject the
@@ -2237,11 +2278,16 @@ export const runParallelSection = async (segment, toolkit) => {
       // AgentCore deployments do not replace an existing live session. Stop
       // each failed lane before retrying so it remounts the preserved
       // workspace in a fresh session running the currently deployed image.
+      // A stopped session has no live job, so a stage row it left RUNNING
+      // (lane crash, refused duplicate start) is a dead attempt the retry
+      // could never claim. Fail those rows inside the existing step.
       for (const slug of failed) {
         const sessionId = laneSessionIdFor(intentId, segment.index, slug);
-        await ctx.step(`retry-release-${sk}-${slug}${idSuffix}-r${round}`, () =>
-          stopSession(sessionId),
-        );
+        await ctx.step(`retry-release-${sk}-${slug}${idSuffix}-r${round}`, async () => {
+          const released = await stopSession(sessionId);
+          if (released?.stopped || released?.notFound) await failDeadLaneAttempts(slug);
+          return released;
+        });
       }
       round += 1;
       toRun = [...failed, ...toRun.filter((s) => laneState.get(s) === 'BLOCKED')];

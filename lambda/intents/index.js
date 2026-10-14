@@ -41,7 +41,7 @@ import {
   GRANT_AUTONOMY_OPTION,
   constructionAutonomyApplies,
 } from '../shared/construction-autonomy.js';
-import { createProcessStore } from '../shared/v2-process-store.js';
+import { createProcessStore, isTransactionConflict } from '../shared/v2-process-store.js';
 import { CONSTRUCTION_AUTONOMY_MODES, isHumanTaskAnswerStatus } from '../shared/v2-process-keys.js';
 import { deleteIntentCascade, IntentRunningError } from '../shared/intent-deletion.js';
 import { buildResponse } from '../shared/response.js';
@@ -115,9 +115,11 @@ import {
 } from '../shared/release-registry.js';
 import { parseLambdaPayload } from '../shared/lambda-payload.js';
 import { mapWithConcurrency } from '../shared/concurrency.js';
-import { credentialProviderForCli } from '../shared/agent-credentials.js';
-import { resolveEffectiveCredentialBindingsViaBroker } from '../shared/agent-credential-metadata.js';
-import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js';
+import {
+  resolveSelectedAgentCredential,
+  prepareAgentInvocation,
+} from '../shared/agent-credential-service.js';
+import { credentialBindingDisplay } from '../shared/agent-auth-contracts.js';
 import { SYSTEM_TENANT } from '../shared/tenant.js';
 import { fetchKnowledgeGraph } from './knowledge-graph.js';
 import { buildIntentAudit } from './audit.js';
@@ -193,59 +195,9 @@ const attachmentCleanup = createAttachmentCleanupService({
 const attachmentEventKey = /^intent-attachments\/staging\/([^/]+)\/([^.]+)(\.[a-z0-9]+)$/i;
 const ATTACHMENT_PROMOTION_CAS_ATTEMPTS = 4;
 
-const resolveSelectedAgentCredential = async ({ projectId, userId, agentCli }) => {
-  const provider = credentialProviderForCli(agentCli);
-  if (!provider) {
-    return {
-      error: {
-        statusCode: 400,
-        body: {
-          error: `Unsupported agent CLI "${agentCli || ''}"`,
-          code: 'unsupported_agent_cli',
-        },
-      },
-    };
-  }
-  const bindings = await resolveEffectiveCredentialBindingsViaBroker({
-    projectId,
-    userId,
-  });
-  const credentialBinding = bindings[provider];
-  if (!credentialBinding) {
-    return {
-      error: {
-        statusCode: 409,
-        body: {
-          error: `No ${provider === 'kiro' ? 'Kiro' : 'Bedrock'} credential is available for this CLI`,
-          code: 'agent_credential_required',
-          provider,
-        },
-      },
-    };
-  }
-  return { provider, credentialBinding };
-};
-
-const issueInvocationAgentCredentialGrant = async ({
-  purpose,
-  projectId,
-  executionId,
-  credentialBinding = null,
-  agentCli = null,
-}) => {
-  const binding =
-    credentialBinding ??
-    (credentialProviderForCli(agentCli)
-      ? { provider: credentialProviderForCli(agentCli), source: 'platform' }
-      : null);
-  if (!binding) return null;
-  return issueAgentCredentialGrant(ssm, {
-    purpose,
-    projectId,
-    executionId,
-    bindings: [binding],
-  });
-};
+const issueInvocationAgentCredentialGrant = async (request) =>
+  (await prepareAgentInvocation({ ...request, legacyExecution: true }, { ssm }))
+    .agentCredentialGrant;
 
 // Finalizes a browser upload after S3 emits Object Created: verify it against
 // its DynamoDB reservation, copy the exact object version from staging to the
@@ -1336,7 +1288,11 @@ const normalizeSource = (raw, trackers) => {
 
 // ── DTO assembly ──
 
-const CREDENTIAL_FAILURE_CODES = ['credential_unavailable', 'credential_invalid'];
+const CREDENTIAL_FAILURE_CODES = [
+  'credential_unavailable',
+  'credential_invalid',
+  'credential_quota_exhausted',
+];
 
 // New execution rows persist a structured failure. Older rows only have the
 // concatenated failureReason string, so normalize those once at the API
@@ -1411,6 +1367,10 @@ const mapIntent = (meta) => ({
   resumeRequired: meta.resumeRequired ?? null,
   agentCli: meta.agentCli ?? null,
   credentialSource: meta.credentialBinding?.source ?? null,
+  credentialConnection:
+    meta.status === 'DRAFT' && !meta.credentialBinding
+      ? null
+      : credentialBindingDisplay(meta.credentialBinding, meta.agentCli),
   cliModels: meta.cliModels ?? null,
   tierModels: meta.tierModels ?? null,
   environment: meta.environment ?? null,
@@ -2521,6 +2481,7 @@ export const handler = async (event, context) => {
             executionId: intentId,
             credentialBinding: records.meta.credentialBinding,
             agentCli: records.meta.agentCli,
+            runtimeCapabilities: records.meta.environment,
           });
           const res = await agentcore.send(
             new InvokeAgentRuntimeCommand({
@@ -2879,22 +2840,36 @@ export const handler = async (event, context) => {
         answer: data.answer ?? null,
         answeredBy: responder.sub,
         answeredByName: responder.displayName,
+        ifOrchestratorRunId: gate.orchestratorRunId ?? null,
+        ifStageCallbackId: gate.stageCallbackId ?? null,
+        stageInstanceId: gate.stageInstanceId ?? null,
       };
-      const answerResult = steeringMessage
-        ? await store.answerHumanTaskWithSteering({
-            ...answerInput,
-            steering: {
-              kind: 'gate-steer',
-              message: steeringMessage,
-              targetGateId: humanTaskId,
-              createdBy: responder.sub,
-              createdByName: responder.displayName,
-            },
-          })
-        : await store.answerHumanTask(answerInput);
-      const answered = steeringMessage
-        ? answerResult && { ...gate, ...answerResult.answered }
-        : answerResult;
+      let answerResult;
+      try {
+        answerResult = steeringMessage
+          ? await store.answerHumanTaskWithSteering({
+              ...answerInput,
+              steering: {
+                kind: 'gate-steer',
+                message: steeringMessage,
+                targetGateId: humanTaskId,
+                createdBy: responder.sub,
+                createdByName: responder.displayName,
+              },
+            })
+          : await store.answerHumanTask(answerInput);
+      } catch (error) {
+        // The answer transaction also checks META, which running workers write
+        // constantly. A conflict that outlasts the store's retries committed
+        // nothing, so the same answer can simply be sent again.
+        if (!isTransactionConflict(error)) throw error;
+        return response(409, {
+          error: 'The intent was busy saving other changes. Send the answer again.',
+          code: 'gate_answer_conflict',
+          retryable: true,
+        });
+      }
+      const answered = steeringMessage ? answerResult?.answered : answerResult;
       if (!answered) {
         return response(409, { error: 'Gate already answered or not pending' });
       }
@@ -2932,14 +2907,16 @@ export const handler = async (event, context) => {
       // older sibling gate just records the durable Q&A — the run is parked on a
       // different callback. SendDurableExecutionCallbackSuccess resumes the
       // EXISTING execution; a fresh Invoke would start a new one.
-      if (gate.callbackId) {
+      // Binding can finish after the initial GET. ALL_NEW from the answer CAS
+      // is the authoritative callback owner at the instant the answer commits.
+      if (answered.callbackId) {
         try {
-          await resumeDurableCallback(gate.callbackId, answered.answer);
+          await resumeDurableCallback(answered.callbackId, answered.answer);
           await (
             store.markGateCallbackConsumed?.({
               executionId: intentId,
               humanTaskId,
-              callbackId: gate.callbackId,
+              callbackId: answered.callbackId,
             }) ?? Promise.resolve()
           ).catch((markErr) =>
             logger.error('Gate callback consumption marker write failed', markErr),
@@ -2977,7 +2954,7 @@ export const handler = async (event, context) => {
               executionId: intentId,
               resumeRequired: {
                 humanTaskId,
-                callbackId: gate.callbackId,
+                callbackId: answered.callbackId,
                 answeredAt: answered.answeredAt ?? null,
               },
             })
@@ -3228,6 +3205,7 @@ export const handler = async (event, context) => {
           projectId,
           userId: sub,
           agentCli: selectedAgentCli,
+          runtimeCapabilities: meta.environment,
         });
         if (resolved.error) {
           return response(resolved.error.statusCode, resolved.error.body);
@@ -3665,6 +3643,7 @@ export const handler = async (event, context) => {
           projectId,
           userId: sub,
           agentCli: requestedCli,
+          runtimeCapabilities: meta.environment,
         });
         if (resolved.error) {
           return response(resolved.error.statusCode, resolved.error.body);
@@ -3835,6 +3814,7 @@ export const handler = async (event, context) => {
           executionId: intentId,
           credentialBinding,
           agentCli: requestedCli,
+          runtimeCapabilities: meta.environment,
         });
         const res = await agentcore.send(
           new InvokeAgentRuntimeCommand({
@@ -4126,6 +4106,7 @@ export const handler = async (event, context) => {
           executionId: intentId,
           credentialBinding: meta.credentialBinding,
           agentCli: meta.agentCli,
+          runtimeCapabilities: meta.environment,
         });
         const res = await agentcore.send(
           new InvokeAgentRuntimeCommand({

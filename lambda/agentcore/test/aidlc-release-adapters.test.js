@@ -3,9 +3,16 @@
 // sensor `fire_on` planes. Each case also pins the legacy shape, because a
 // catalog without the new fields must produce byte-identical output.
 
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { ANNEX_HANDLED_ENGINE_COMMANDS } from '../../shared/aidlc-capabilities.js';
-import { INVOKE_FAMILY_FIDELITY } from '../../shared/aidlc-compatibility.js';
+import {
+  INVOKE_FAMILY_FIDELITY,
+  filesFromCompatibilityFixture,
+} from '../../shared/aidlc-compatibility.js';
+import { buildReleaseBundle } from '../../shared/aidlc-release.js';
+import { annexReachingBlocks } from '../../shared/annex-reach.js';
+import { COMPOSER_AGENT_ID } from '../../shared/compose-match.js';
 import { createSensorRunner } from '../sensor-runner.js';
 import {
   INVOKE_DIALECT_ANNEX,
@@ -15,6 +22,9 @@ import {
   neutralizeInvoke,
   renderScopePolicy,
 } from '../stage-materializer.js';
+import { buildComposePrompt } from '../commands/compose-plan-start.js';
+import { composePersonaPrompt } from '../persona-dispatch.js';
+import { __test as runStageInternals } from '../commands/run-stage.js';
 import { workspaceRelativePath } from '../repo-paths.js';
 
 const STAGE = Object.freeze({
@@ -409,5 +419,161 @@ describe('sensor fire_on planes', () => {
     expect(verdict.detail.artifacts).toEqual([
       { artifact: 'business-logic-model', reason: 'not found in graph' },
     ]);
+  });
+});
+
+// `annex-reach.js` is a claim the PROMPT BUILDERS have to honour: the promotion
+// guard stops blocking an engine command found in one of these blocks, so every
+// session the runtime renders that block into must receive the answer. The
+// builders and the guard share one module, but sharing a set is not the same as
+// delivering it — a builder could gate on a part this set does not name, or stop
+// gating on one it does. So rather than restate the rule, each case below walks
+// the blocks of a REAL catalog and asserts the REAL prompt of each session that
+// renders the block.
+describe('annex reach, against the prompts the runtime really builds', () => {
+  const PROFILE = 'v2.9.0';
+  const { catalog } = buildReleaseBundle({
+    profileId: PROFILE,
+    files: filesFromCompatibilityFixture({
+      profileId: PROFILE,
+      fixture: JSON.parse(
+        readFileSync(
+          new URL(
+            `../../shared/test/fixtures/aidlc-compatibility/${PROFILE}.json`,
+            import.meta.url,
+          ),
+          'utf8',
+        ),
+      ),
+    }),
+  });
+  const TOKEN_BODY = 'Run `{{INVOKE}} engine state practices-event --type x`.';
+  const STAGES = catalog.blocks.STAGE;
+  // These are CATALOG blocks (`block-mappers.js` `mapStage`), whose shape is
+  // `supportAgents` and a `reviewer` STRING naming the reviewing agent — not the
+  // resolved plan's `supportAgentRefs` / `reviewer.reviewerAgent`. Reading the
+  // plan's field names here leaves both sets empty and silently reduces the
+  // whole check to lead sessions, so the enumeration is pinned below.
+  const LEAD_AGENTS = new Set(STAGES.map((stage) => stage.leadAgent).filter(Boolean));
+  const SUPPORT_AGENTS = new Set(STAGES.flatMap((stage) => stage.supportAgents ?? []));
+  const REVIEWER_AGENTS = new Set(STAGES.map((stage) => stage.reviewer).filter(Boolean));
+  // The agentRef `loadMethodologyKnowledge` (commands/run-stage.js) renders into
+  // every session regardless of which agent runs it.
+  const SHARED_KNOWLEDGE_AGENT_REF = 'shared';
+  const label = (block) => `${block.type}:${block.id}`;
+
+  // One entry per session kind the runtime spawns, each rendering ONE authored
+  // part through the builder that session really uses. `part` is `persona` or
+  // `knowledge`: a release authors engine commands in both, and the guard counts
+  // them the same way.
+  const PROMPTS = Object.freeze({
+    lead: (part, body) =>
+      buildStagePrompt({
+        stage: STAGE,
+        stageBody: 'plain',
+        ...(part === 'persona' ? { agentPersona: body } : { knowledge: body }),
+      }),
+    reviewer: (part, body) =>
+      runStageInternals.buildReviewerPrompt({
+        stage: { ...STAGE, reviewer: { artifact: 'business-logic-model' } },
+        reviewerAgent: 'aidlc-architecture-reviewer-agent',
+        reviewerPersona: part === 'persona' ? body : 'reviewer persona',
+        knowledge: part === 'knowledge' ? body : '',
+        round: 1,
+      }),
+    support: (part, body) => personaBrief('support', part, body),
+    link: (part, body) => personaBrief('link', part, body),
+    integrator: (part, body) => personaBrief('integrator', part, body),
+    composer: (part, body) =>
+      buildComposePrompt({
+        mode: 'initial',
+        persona: part === 'persona' ? body : '',
+        knowledge: part === 'knowledge' ? body : '',
+      }),
+  });
+  const personaBrief = (role, part, body) =>
+    composePersonaPrompt({
+      brief: `${role} brief`,
+      persona: part === 'persona' ? body : 'p',
+      knowledge: part === 'knowledge' ? body : '',
+      role,
+    });
+
+  // Which sessions render ONE claimed block, read off the real catalog. An agent
+  // that leads one stage is frequently a support persona or the reviewer in
+  // another, so these are not exclusive.
+  const sessionsRendering = (block) => {
+    if (block.type === 'STAGE') return ['lead'];
+    const agentRef = block.type === 'AGENT' ? block.blockId : block.agentRef;
+    if (agentRef === COMPOSER_AGENT_ID) return ['composer'];
+    if (agentRef === SHARED_KNOWLEDGE_AGENT_REF) {
+      return ['lead', 'reviewer', 'support', 'link', 'integrator'];
+    }
+    const sessions = [];
+    if (LEAD_AGENTS.has(agentRef)) sessions.push('lead');
+    if (REVIEWER_AGENTS.has(agentRef)) sessions.push('reviewer');
+    if (SUPPORT_AGENTS.has(agentRef)) sessions.push('support', 'link', 'integrator');
+    return sessions;
+  };
+
+  it('enumerates the catalog lead, support and reviewer agents, including dual-role ones', () => {
+    expect(LEAD_AGENTS.size).toBeGreaterThan(0);
+    expect(SUPPORT_AGENTS.size).toBeGreaterThan(0);
+    expect(REVIEWER_AGENTS.size).toBeGreaterThan(0);
+    const dualRole = [...LEAD_AGENTS].filter(
+      (ref) => SUPPORT_AGENTS.has(ref) || REVIEWER_AGENTS.has(ref),
+    );
+    expect(dualRole.length).toBeGreaterThan(0);
+    expect(sessionsRendering({ type: 'KNOWLEDGE', agentRef: dualRole[0] }).length).toBeGreaterThan(
+      1,
+    );
+  });
+
+  it('answers a claimed body in every session the runtime renders it into', () => {
+    const claimed = annexReachingBlocks({ blocks: catalog.blocks });
+    const checked = [];
+
+    for (const block of claimed) {
+      const sessions = sessionsRendering(block);
+      // A claimed body no session renders would make the guard's claim vacuous
+      // rather than wrong, and it would still be a hole: nothing would prove the
+      // answer arrives.
+      expect(sessions.length, label(block)).toBeGreaterThan(0);
+      const parts = block.type === 'STAGE' ? ['stageBody'] : ['persona', 'knowledge'];
+      for (const session of sessions) {
+        for (const part of parts) {
+          const prompt =
+            part === 'stageBody'
+              ? buildStagePrompt({ stage: STAGE, stageBody: TOKEN_BODY })
+              : PROMPTS[session](part, TOKEN_BODY);
+          const where = `${label(block)}:${session}:${part}`;
+          expect(prompt, where).toContain(INVOKE_DIALECT_ANNEX);
+          expect(prompt, where).not.toContain('{{INVOKE}}');
+          checked.push(`${session}:${part}`);
+        }
+      }
+    }
+
+    // Every session kind had to be exercised, or the catalog stopped covering a
+    // role and the check quietly narrowed to the ones that remain.
+    expect([...new Set(checked.map((entry) => entry.split(':')[0]))].toSorted()).toEqual(
+      Object.keys(PROMPTS).toSorted(),
+    );
+    expect(checked.length).toBeGreaterThan(claimed.length);
+  });
+
+  // The other half of the claim: a body type NO builder gates on must stay out
+  // of the set, because a command invoked only there reaches a session with no
+  // answer and has to keep holding promotion.
+  it('leaves the block types no builder gates on out of the set', () => {
+    const claimedTypes = new Set(
+      annexReachingBlocks({ blocks: catalog.blocks }).map((b) => b.type),
+    );
+
+    expect([...claimedTypes].toSorted()).toEqual(['AGENT', 'KNOWLEDGE', 'STAGE']);
+    for (const type of ['RULE', 'SCOPE', 'ARTIFACT', 'SENSOR']) {
+      expect((catalog.blocks[type] ?? []).length, type).toBeGreaterThan(0);
+      expect(claimedTypes.has(type), type).toBe(false);
+    }
   });
 });

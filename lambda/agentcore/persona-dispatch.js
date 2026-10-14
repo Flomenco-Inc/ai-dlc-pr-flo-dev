@@ -212,6 +212,7 @@ export const dispatchPersona = async ({
           mcpRole,
           exitCode: childResult?.exitCode ?? null,
           ...(childResult?.timedOut ? { timedOut: true } : {}),
+          ...(childResult?.credentialError ? { credentialError: childResult.credentialError } : {}),
           ...(childResult?.stderrTail ? { stderrTail: childResult.stderrTail } : {}),
         },
       };

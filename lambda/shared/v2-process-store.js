@@ -1,3 +1,4 @@
+import { inventoryReferenceWrites, scopeActivityWrites } from './agent-auth-inventory.js';
 // V2 process store — the thin DynamoDB I/O shell over the pure key scheme +
 // record builders in v2-process-keys.js. The AgentCore container uses this to
 // write execution/stage/event/human/metric state; a future trigger/resume
@@ -93,24 +94,214 @@ const queryAll = async (ddb, input) => {
   return items;
 };
 
-const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
-  if (!ddb) throw new Error('createProcessStore requires a DynamoDB DocumentClient');
+// META writes that also index the credential binding run as a transaction,
+// so a failed META condition arrives as TransactionCanceledException. Callers
+// expect the single-item ConditionalCheckFailedException, so translate it
+// when the META write (always the first item) was the one that failed.
+const metaConditionFailure = (error, message) =>
+  error?.name === 'TransactionCanceledException' &&
+  error.CancellationReasons?.[0]?.Code === 'ConditionalCheckFailed'
+    ? Object.assign(new Error(message), {
+        name: 'ConditionalCheckFailedException',
+        cause: error,
+      })
+    : error;
+
+// Worker writes fence ownership in transactions that include META, which
+// appendOutput, the orchestrator and sibling lanes write constantly. DynamoDB
+// rejects (never applies) a write that collides with an in-flight transaction
+// on the same item, and the SDK does not retry that rejection.
+const TRANSACTION_CONFLICT_ATTEMPTS = 5;
+const isTransactionConflict = (error) =>
+  error?.name === 'TransactionConflictException' ||
+  (error?.name === 'TransactionCanceledException' &&
+    Boolean(error.CancellationReasons?.some((reason) => reason?.Code === 'TransactionConflict')) &&
+    error.CancellationReasons.every((reason) =>
+      ['None', 'TransactionConflict'].includes(reason?.Code ?? 'None'),
+    ));
+const conflictBackoffMs = (attempt) => 10 * 2 ** (attempt - 1) * (1 + Math.random());
+const retryTransactionConflicts = (client) => ({
+  send: async (command, ...rest) => {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await client.send(command, ...rest);
+      } catch (error) {
+        if (!isTransactionConflict(error) || attempt >= TRANSACTION_CONFLICT_ATTEMPTS) throw error;
+        await new Promise((resolve) => setTimeout(resolve, conflictBackoffMs(attempt)));
+      }
+    }
+  },
+});
+
+const createProcessStore = ({ ddb: client, tableName, clock, ids } = {}) => {
+  if (!client) throw new Error('createProcessStore requires a DynamoDB DocumentClient');
+  const ddb = retryTransactionConflicts(client);
   const table = () => tableName ?? process.env.V2_PROCESS_TABLE;
   const now = () => (clock ? clock() : new Date().toISOString());
   const nextId = () => (ids ? ids() : randomUUID());
 
+  const transact = async (TransactItems) => {
+    try {
+      await ddb.send(new TransactWriteCommand({ TransactItems }));
+    } catch (error) {
+      if (
+        error?.name === 'TransactionCanceledException' &&
+        error.CancellationReasons?.some((reason) => reason.Code === 'ConditionalCheckFailed')
+      ) {
+        throw Object.assign(new Error('Conditional transaction did not commit'), {
+          name: 'ConditionalCheckFailedException',
+          cause: error,
+        });
+      }
+      throw error;
+    }
+  };
+
+  // Ownership invariant for worker writes: META still names this run and
+  // STAGE still names this callback attempt. Check both in the SAME transaction
+  // as the mutation; a read followed by an unconditional write cannot fence a
+  // rewind. Repeating the same owner's mutation is allowed.
+  // The single definition of that invariant, shared by worker writes and gate
+  // answers. Placeholders are namespaced so they merge into other conditions.
+  const ownershipConditions = ({
+    executionId,
+    orchestratorRunId,
+    stageInstanceId,
+    stageCallbackId,
+  }) => ({
+    ownsRun: {
+      TableName: table(),
+      Key: executionMetaKey(executionId),
+      ConditionExpression:
+        'orchestratorRunId = :ownedRun AND #ownedStatus IN (:ownedRunning, :ownedWaiting)',
+      ExpressionAttributeNames: { '#ownedStatus': 'status' },
+      ExpressionAttributeValues: {
+        ':ownedRun': orchestratorRunId,
+        ':ownedRunning': 'RUNNING',
+        ':ownedWaiting': 'WAITING',
+      },
+    },
+    ownsStage: {
+      TableName: table(),
+      Key: stageKey(executionId, stageInstanceId),
+      ConditionExpression: 'stageCallbackId = :ownedCallback',
+      ExpressionAttributeValues: { ':ownedCallback': stageCallbackId },
+    },
+  });
+
+  const writeStageAttempt = async ({ executionId, ownership, writes, claim = false }) => {
+    const stage = stageKey(executionId, ownership.stageInstanceId);
+    const { ownsRun, ownsStage } = ownershipConditions({ executionId, ...ownership });
+    let writesStage = false;
+    let writesMeta = false;
+    const guarded = writes.map((item) => {
+      const type = item.Put ? 'Put' : 'Update';
+      const input = { ...item[type] };
+      delete input.ReturnValues;
+      const key = input.Key ?? input.Item;
+      if (key.pk === ownsRun.Key.pk && key.sk === ownsRun.Key.sk) {
+        writesMeta = true;
+        input.ConditionExpression = [input.ConditionExpression, ownsRun.ConditionExpression]
+          .filter(Boolean)
+          .join(' AND ');
+        input.ExpressionAttributeNames = {
+          ...input.ExpressionAttributeNames,
+          ...ownsRun.ExpressionAttributeNames,
+        };
+        input.ExpressionAttributeValues = {
+          ...input.ExpressionAttributeValues,
+          ...ownsRun.ExpressionAttributeValues,
+        };
+      }
+      if (key.pk === stage.pk && key.sk === stage.sk) {
+        writesStage = true;
+        if (!claim) {
+          input.ConditionExpression = [input.ConditionExpression, ownsStage.ConditionExpression]
+            .filter(Boolean)
+            .join(' AND ');
+          input.ExpressionAttributeValues = {
+            ...input.ExpressionAttributeValues,
+            ...ownsStage.ExpressionAttributeValues,
+          };
+        }
+      }
+      return { [type]: input };
+    });
+    await transact([
+      ...(!writesMeta ? [{ ConditionCheck: ownsRun }] : []),
+      ...(!writesStage ? [{ ConditionCheck: ownsStage }] : []),
+      ...guarded,
+    ]);
+  };
+
+  const claimStageAttempt = async ({ executionId, ownership, stageId = null, phase = null }) => {
+    await writeStageAttempt({
+      executionId,
+      ownership,
+      claim: true,
+      writes: [
+        {
+          Update: {
+            TableName: table(),
+            Key: stageKey(executionId, ownership.stageInstanceId),
+            // A repeated dispatch can claim its own RUNNING row. A different
+            // callback may claim only a parked/terminal/reset stage.
+            ConditionExpression:
+              'attribute_not_exists(pk) OR #state <> :running OR stageCallbackId = :callback',
+            UpdateExpression:
+              'SET stageCallbackId = :callback, orchestratorRunId = :run' +
+              (stageId
+                ? ', stageId = if_not_exists(stageId, :stageId), phase = if_not_exists(phase, :phase), GSI2PK = if_not_exists(GSI2PK, :g2pk)'
+                : ''),
+            ExpressionAttributeNames: { '#state': 'state' },
+            ExpressionAttributeValues: {
+              ':running': 'RUNNING',
+              ':callback': ownership.stageCallbackId,
+              ':run': ownership.orchestratorRunId,
+              ...(stageId
+                ? {
+                    ':stageId': stageId,
+                    ':phase': phase,
+                    ':g2pk': executionTypeStateIndex({
+                      executionId,
+                      type: 'STAGE',
+                      state: 'PENDING',
+                      id: ownership.stageInstanceId,
+                    }).GSI2PK,
+                  }
+                : {}),
+            },
+          },
+        },
+      ],
+    });
+  };
+
   // Create the execution META row. Conditional so a re-invoke (same session)
-  // never clobbers an in-flight execution. `init-ws` calls this once.
+  // never clobbers an in-flight execution. `init-ws` calls this once and
+  // treats an existing row (ConditionalCheckFailedException) as idempotent.
   const createExecution = async (input) => {
     const startedAt = input.startedAt ?? now();
     const item = buildExecutionMeta({ ...input, startedAt });
-    await ddb.send(
-      new PutCommand({
-        TableName: table(),
-        Item: item,
-        ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
-      }),
-    );
+    try {
+      await ddb.send(
+        new TransactWriteCommand({
+          TransactItems: [
+            {
+              Put: {
+                TableName: table(),
+                Item: item,
+                ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
+              },
+            },
+            ...inventoryReferenceWrites(table(), item),
+            ...scopeActivityWrites(table(), [item], { includePlatform: true }),
+          ],
+        }),
+      );
+    } catch (error) {
+      throw metaConditionFailure(error, `Execution ${item.executionId} already exists`);
+    }
     return item;
   };
 
@@ -190,6 +381,9 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     status,
     fromStatus = null,
     ifOrchestratorRunId = null,
+    ifPendingHumanTaskId,
+    ownership = null,
+    additionalWrites = [],
     orchestratorRunId,
     durableExecutionName,
     durableExecutionArn,
@@ -511,6 +705,10 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       conditions.push('resumeRequired.humanTaskId = :ifRrh');
       params.ExpressionAttributeValues[':ifRrh'] = ifResumeRequiredFor;
     }
+    if (ifPendingHumanTaskId !== undefined) {
+      conditions.push('pendingHumanTaskId = :ifPendingHumanTaskId');
+      params.ExpressionAttributeValues[':ifPendingHumanTaskId'] = ifPendingHumanTaskId;
+    }
     if (ifAttachmentRevision !== null) {
       conditions.push(
         '(attribute_not_exists(attachmentRevision) OR attachmentRevision = :ifAttachmentRevision)',
@@ -526,6 +724,41 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       values[':ifDraftRevision'] = ifDraftRevision;
     }
     if (conditions.length) params.ConditionExpression = conditions.join(' AND ');
+    const credentialWrites = [];
+    if (credentialBinding !== undefined) {
+      const row = { ...executionMetaKey(executionId), projectId, credentialBinding };
+      credentialWrites.push(
+        ...inventoryReferenceWrites(table(), row),
+        ...scopeActivityWrites(table(), [row], { includePlatform: true }),
+      );
+    }
+    if (ownership) {
+      await writeStageAttempt({
+        executionId,
+        ownership,
+        writes: [...additionalWrites, ...credentialWrites, { Update: params }],
+      });
+      // Transactions cannot return ALL_NEW; read the committed row instead.
+      return getExecution(executionId, { consistentRead: true });
+    }
+    if (additionalWrites.length) {
+      const { ReturnValues: _returnValues, ...update } = params;
+      await transact([...additionalWrites, ...credentialWrites, { Update: update }]);
+      return getExecution(executionId, { consistentRead: true });
+    }
+    if (credentialBinding !== undefined) {
+      const { ReturnValues: _returnValues, ...write } = params;
+      try {
+        await ddb.send(
+          new TransactWriteCommand({
+            TransactItems: [{ Update: write }, ...credentialWrites],
+          }),
+        );
+      } catch (error) {
+        throw metaConditionFailure(error, `Execution ${executionId} changed`);
+      }
+      return getExecution(executionId, { consistentRead: true });
+    }
     const { Attributes } = await ddb.send(new UpdateCommand(params));
     return Attributes;
   };
@@ -533,9 +766,22 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
   // Upsert a stage row in a given state (the container marks RUNNING at start and
   // a terminal state at end). Not a CAS — the container owns its stage lifecycle
   // within a session; idempotent re-writes are fine.
-  const putStage = async (input) => {
+  const putStage = async ({ ownership = null, ...input }) => {
     const item = buildStageRow({ ...input, now: now() });
-    await ddb.send(new PutCommand({ TableName: table(), Item: item }));
+    if (ownership) {
+      await writeStageAttempt({
+        executionId: input.executionId,
+        ownership,
+        writes: [
+          {
+            Put: {
+              TableName: table(),
+              Item: { ...item, orchestratorRunId: ownership.orchestratorRunId },
+            },
+          },
+        ],
+      });
+    } else await ddb.send(new PutCommand({ TableName: table(), Item: item }));
     return item;
   };
 
@@ -567,6 +813,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     resolvedModel,
     pendingHumanTaskId,
     pendingCodeCommitRefs,
+    ownership = null,
   }) => {
     const ts = now();
     const sets = ['#state = :state', 'updatedAt = :ts', 'GSI2SK = :g2sk', 'runtimeError = :err'];
@@ -605,16 +852,19 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       sets.push('pendingCodeCommitRefs = :pccr');
       values[':pccr'] = pendingCodeCommitRefs;
     }
-    const { Attributes } = await ddb.send(
-      new UpdateCommand({
-        TableName: table(),
-        Key: stageKey(executionId, stageInstanceId),
-        UpdateExpression: `SET ${sets.join(', ')}`,
-        ExpressionAttributeNames: { '#state': 'state' },
-        ExpressionAttributeValues: values,
-        ReturnValues: 'ALL_NEW',
-      }),
-    );
+    const input = {
+      TableName: table(),
+      Key: stageKey(executionId, stageInstanceId),
+      UpdateExpression: `SET ${sets.join(', ')}`,
+      ExpressionAttributeNames: { '#state': 'state' },
+      ExpressionAttributeValues: values,
+      ReturnValues: 'ALL_NEW',
+    };
+    if (ownership) {
+      await writeStageAttempt({ executionId, ownership, writes: [{ Update: input }] });
+      return getStage(executionId, stageInstanceId, { consistentRead: true });
+    }
+    const { Attributes } = await ddb.send(new UpdateCommand(input));
     return Attributes;
   };
 
@@ -679,6 +929,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     resolvedModel,
     stageCallbackId,
     aidlcRepoRef,
+    ownership = null,
   }) => {
     const existing = await getStage(executionId, stageInstanceId, { consistentRead: true });
     const ts = now();
@@ -731,16 +982,19 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       sets.push('aidlcRepoRef = :aidlcRepoRef');
       values[':aidlcRepoRef'] = aidlcRepoRef;
     }
-    const { Attributes } = await ddb.send(
-      new UpdateCommand({
-        TableName: table(),
-        Key: stageKey(executionId, stageInstanceId),
-        UpdateExpression: `SET ${sets.join(', ')}`,
-        ExpressionAttributeNames: { '#state': 'state' },
-        ExpressionAttributeValues: values,
-        ReturnValues: 'ALL_NEW',
-      }),
-    );
+    const input = {
+      TableName: table(),
+      Key: stageKey(executionId, stageInstanceId),
+      UpdateExpression: `SET ${sets.join(', ')}`,
+      ExpressionAttributeNames: { '#state': 'state' },
+      ExpressionAttributeValues: values,
+      ReturnValues: 'ALL_NEW',
+    };
+    if (ownership) {
+      await writeStageAttempt({ executionId, ownership, writes: [{ Update: input }] });
+      return getStage(executionId, stageInstanceId, { consistentRead: true });
+    }
+    const { Attributes } = await ddb.send(new UpdateCommand(input));
     return Attributes;
   };
 
@@ -800,6 +1054,8 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     loopBackStatus,
     loopBackNote,
     humanTaskId,
+    ownership = null,
+    orchestratorRunId = null,
   }) => {
     const id = humanTaskId ?? nextId();
     const item = buildHumanTaskRow({
@@ -824,6 +1080,71 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       loopBackNote,
       now: now(),
     });
+    if (ownership) {
+      Object.assign(item, {
+        orchestratorRunId: ownership.orchestratorRunId,
+        stageCallbackId: ownership.stageCallbackId,
+      });
+      const ts = now();
+      const writes = [
+        {
+          Put: {
+            TableName: table(),
+            Item: item,
+            ConditionExpression: 'attribute_not_exists(pk)',
+          },
+        },
+        {
+          Update: {
+            TableName: table(),
+            Key: stageKey(executionId, stageInstanceId),
+            UpdateExpression:
+              'SET #state = :waiting, pendingHumanTaskId = :gate, parkedAt = :ts, updatedAt = :ts, GSI2SK = :g2',
+            ExpressionAttributeNames: { '#state': 'state' },
+            ExpressionAttributeValues: {
+              ':waiting': 'WAITING_FOR_HUMAN',
+              ':gate': id,
+              ':ts': ts,
+              ':g2': executionTypeStateIndex({
+                executionId,
+                type: 'STAGE',
+                state: 'WAITING_FOR_HUMAN',
+                id: stageInstanceId,
+              }).GSI2SK,
+            },
+          },
+        },
+      ];
+      if (unitSlug) await writeStageAttempt({ executionId, ownership, writes });
+      else
+        await updateExecution({
+          executionId,
+          status: 'WAITING',
+          pendingHumanTaskId: id,
+          ownership,
+          additionalWrites: writes,
+        });
+      return item;
+    }
+    if (orchestratorRunId) {
+      item.orchestratorRunId = orchestratorRunId;
+      await updateExecution({
+        executionId,
+        status: 'WAITING',
+        pendingHumanTaskId: id,
+        ifOrchestratorRunId: orchestratorRunId,
+        additionalWrites: [
+          {
+            Put: {
+              TableName: table(),
+              Item: item,
+              ConditionExpression: 'attribute_not_exists(pk)',
+            },
+          },
+        ],
+      });
+      return item;
+    }
     await ddb.send(
       new PutCommand({
         TableName: table(),
@@ -948,13 +1269,39 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     },
   });
 
+  const humanTaskAnswerOwnershipChecks = ({
+    executionId,
+    ifOrchestratorRunId,
+    ifStageCallbackId,
+    stageInstanceId,
+  }) => {
+    if (!ifOrchestratorRunId) return [];
+    const { ownsRun, ownsStage } = ownershipConditions({
+      executionId,
+      orchestratorRunId: ifOrchestratorRunId,
+      stageInstanceId,
+      stageCallbackId: ifStageCallbackId,
+    });
+    return [
+      { ConditionCheck: ownsRun },
+      ...(ifStageCallbackId && stageInstanceId ? [{ ConditionCheck: ownsStage }] : []),
+    ];
+  };
+
   // Resolve a pending human gate (CAS on status=pending so it can't be answered
   // twice). `answer` is the structured answer payload.
   const answerHumanTask = async (input) => {
     try {
+      const update = humanTaskAnswerUpdate({ ...input, answeredAt: now() });
+      if (input.ifOrchestratorRunId) {
+        await transact([...humanTaskAnswerOwnershipChecks(input), { Update: update }]);
+        // Transactions have no ALL_NEW. Read the committed callback, which may
+        // have been bound while the answer was in flight.
+        return getHumanTask(input.executionId, input.humanTaskId, { consistentRead: true });
+      }
       const { Attributes } = await ddb.send(
         new UpdateCommand({
-          ...humanTaskAnswerUpdate({ ...input, answeredAt: now() }),
+          ...update,
           ReturnValues: 'ALL_NEW',
         }),
       );
@@ -977,37 +1324,25 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
       now: ts,
     });
     try {
-      await ddb.send(
-        new TransactWriteCommand({
-          TransactItems: [
-            { Update: humanTaskAnswerUpdate({ ...answerInput, answeredAt: ts }) },
-            {
-              Put: {
-                TableName: table(),
-                Item: steer,
-                ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
-              },
-            },
-          ],
-        }),
-      );
-      return {
-        answered: {
-          ...answerInput,
-          answer: answerInput.answer ?? null,
-          answeredBy: answerInput.answeredBy ?? null,
-          answeredByName: answerInput.answeredByName ?? null,
-          answeredAt: ts,
+      await transact([
+        ...humanTaskAnswerOwnershipChecks(answerInput),
+        { Update: humanTaskAnswerUpdate({ ...answerInput, answeredAt: ts }) },
+        {
+          Put: {
+            TableName: table(),
+            Item: steer,
+            ConditionExpression: 'attribute_not_exists(pk) AND attribute_not_exists(sk)',
+          },
         },
+      ]);
+      return {
+        answered: await getHumanTask(answerInput.executionId, answerInput.humanTaskId, {
+          consistentRead: true,
+        }),
         steering: steer,
       };
     } catch (e) {
-      if (
-        e?.name === 'TransactionCanceledException' ||
-        e?.name === 'ConditionalCheckFailedException'
-      ) {
-        return null;
-      }
+      if (e?.name === 'ConditionalCheckFailedException') return null;
       throw e;
     }
   };
@@ -1015,32 +1350,44 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
   // Retire a still-pending gate whose run is being cancelled/rewound (CAS on
   // pending — an already-answered gate is left alone). The gate stays as the
   // audit record; `supersededBy` names the steering row / action that retired it.
-  const supersedeHumanTask = async ({ executionId, humanTaskId, supersededBy = null }) => {
+  const supersedeHumanTask = async ({
+    executionId,
+    humanTaskId,
+    supersededBy = null,
+    ownership = null,
+  }) => {
     const ts = now();
     try {
-      const { Attributes } = await ddb.send(
-        new UpdateCommand({
-          TableName: table(),
-          Key: humanTaskKey(executionId, humanTaskId),
-          ConditionExpression: '#status = :pending',
-          UpdateExpression:
-            'SET #status = :status, supersededAt = :ts, supersededBy = :by, GSI2SK = :g2sk',
-          ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: {
-            ':pending': 'pending',
-            ':status': 'superseded',
-            ':ts': ts,
-            ':by': supersededBy,
-            ':g2sk': executionTypeStateIndex({
-              executionId,
-              type: 'HUMAN',
-              state: 'superseded',
-              id: humanTaskId,
-            }).GSI2SK,
-          },
-          ReturnValues: 'ALL_NEW',
-        }),
-      );
+      const input = {
+        TableName: table(),
+        Key: humanTaskKey(executionId, humanTaskId),
+        ConditionExpression: '#status = :pending',
+        UpdateExpression:
+          'SET #status = :status, supersededAt = :ts, supersededBy = :by, GSI2SK = :g2sk',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':pending': 'pending',
+          ':status': 'superseded',
+          ':ts': ts,
+          ':by': supersededBy,
+          ':g2sk': executionTypeStateIndex({
+            executionId,
+            type: 'HUMAN',
+            state: 'superseded',
+            id: humanTaskId,
+          }).GSI2SK,
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+      if (ownership) {
+        input.ConditionExpression +=
+          ' AND stageInstanceId = :ownedStage AND (attribute_not_exists(stageCallbackId) OR stageCallbackId = :ownedCallback)';
+        input.ExpressionAttributeValues[':ownedStage'] = ownership.stageInstanceId;
+        input.ExpressionAttributeValues[':ownedCallback'] = ownership.stageCallbackId;
+        await writeStageAttempt({ executionId, ownership, writes: [{ Update: input }] });
+        return getHumanTask(executionId, humanTaskId, { consistentRead: true });
+      }
+      const { Attributes } = await ddb.send(new UpdateCommand(input));
       return Attributes;
     } catch (e) {
       if (e?.name === 'ConditionalCheckFailedException') return null;
@@ -1727,7 +2074,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     return items;
   };
 
-  const listActiveExecutions = async ({ limit = 100 } = {}) => {
+  const listActiveExecutions = async ({ limit = Infinity } = {}) => {
     const items = [];
     let ExclusiveStartKey;
     do {
@@ -1737,7 +2084,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
           IndexName: 'GSI3',
           KeyConditionExpression: 'GSI3PK = :pk',
           ExpressionAttributeValues: { ':pk': ACTIVE_EXECUTIONS_INDEX_PK },
-          Limit: limit - items.length,
+          ...(Number.isFinite(limit) ? { Limit: limit - items.length } : {}),
           ExclusiveStartKey,
         }),
       );
@@ -1821,9 +2168,13 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     return item;
   };
 
-  const getUnitPlan = async (executionId) => {
+  const getUnitPlan = async (executionId, { consistentRead = false } = {}) => {
     const { Item } = await ddb.send(
-      new GetCommand({ TableName: table(), Key: unitPlanKey(executionId) }),
+      new GetCommand({
+        TableName: table(),
+        Key: unitPlanKey(executionId),
+        ...(consistentRead ? { ConsistentRead: true } : {}),
+      }),
     );
     return Item ?? null;
   };
@@ -2848,12 +3199,16 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
   // never silently leaves rows behind. Idempotent — deleting a missing key is
   // a no-op, so a retried delete after a partial failure just finishes the job.
   const deleteExecution = async (executionId) => {
-    const keys = await queryAll(ddb, {
+    const execution = await getExecution(executionId, { consistentRead: true });
+    const records = await queryAll(ddb, {
       TableName: table(),
       KeyConditionExpression: 'pk = :pk',
       ExpressionAttributeValues: { ':pk': executionPk(executionId) },
       ProjectionExpression: 'pk, sk',
     });
+    // Keep META until all other rows are gone so a retry can still find the
+    // pinned scopes. Delete its references atomically with the authoritative row.
+    const keys = records.filter((key) => key.sk !== META);
     let deleted = 0;
     for (let i = 0; i < keys.length; i += 25) {
       let requests = keys
@@ -2877,6 +3232,22 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
         }
       }
     }
+    await ddb.send(
+      new TransactWriteCommand({
+        TransactItems: [
+          { Delete: { TableName: table(), Key: executionMetaKey(executionId) } },
+          ...(execution
+            ? inventoryReferenceWrites(table(), execution).map(({ Put }) => ({
+                Delete: {
+                  TableName: table(),
+                  Key: { pk: Put.Item.pk, sk: Put.Item.sk },
+                },
+              }))
+            : []),
+        ],
+      }),
+    );
+    if (execution) deleted += 1;
     return { deleted };
   };
 
@@ -2889,6 +3260,7 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
     updateExecution,
     deleteExecution,
     putStage,
+    claimStageAttempt,
     getStage,
     updateStageState,
     failRunningStageAttempt,
@@ -2962,5 +3334,5 @@ const createProcessStore = ({ ddb, tableName, clock, ids } = {}) => {
   };
 };
 
-export { createProcessStore };
+export { createProcessStore, isTransactionConflict };
 export default { createProcessStore };

@@ -2431,6 +2431,109 @@ describe('a deployment admitting the real AI-DLC 2.11.0', () => {
       expect(promoted.releaseId).not.toBe(releaseId);
     });
 
+    // The three approximated families are not gaps because the ANNEX answers
+    // them, and that answer only arrives where a prompt carries the annex. A
+    // SCOPE body is rendered into the compose grounding, which no builder gates
+    // on (`shared/annex-reach.js`), so a fork that moves such an invocation into
+    // a scope has a consuming session instructed to run a command it has no
+    // answer for — the exact invariant `annexed` is supposed to make checkable.
+    // Membership in the approximated list is not evidence of reach, so promotion
+    // must refuse it.
+    describe('a fork that invokes an approximated command from a scope body', () => {
+      const SCOPE_FORK_SHA = '0f0e0d0c0b0a09080706050403020100ffeeddcc';
+      const SCOPE_REPOSITORY = 'acme/aidlc-211-scope-fork';
+
+      const scopeForkFiles = () => {
+        const files = filesWithInvokeLines(PROFILE);
+        const scopePath = [...files.keys()].find((path) => path.startsWith('core/scopes/'));
+        expect(scopePath, 'a scope body').toBeTruthy();
+        files.set(
+          scopePath,
+          `${files.get(scopePath)}\n\nRecord the time with {{INVOKE}} engine now.\n`,
+        );
+        return files;
+      };
+
+      it('names the command as unhonoured and refuses promotion', async () => {
+        const bundle = buildReleaseBundle({
+          profile: customProfile({
+            repository: SCOPE_REPOSITORY,
+            sha: SCOPE_FORK_SHA,
+            baseProfileId: PROFILE,
+          }),
+          files: scopeForkFiles(),
+        });
+        await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+
+        const { release } = await registerCustomRelease({
+          ...registryArgs(),
+          s3,
+          bucket: BUCKET,
+          repository: SCOPE_REPOSITORY,
+          sha: SCOPE_FORK_SHA,
+          baseProfileId: PROFILE,
+          actor: 'admin-1',
+        });
+
+        expect(release.unhonouredValues).toContainEqual({
+          blockType: 'BODY',
+          field: '{{INVOKE}}',
+          value: 'engine now',
+        });
+        await expect(
+          updateRelease({
+            ...registryArgs(),
+            s3,
+            bucket: BUCKET,
+            releaseId: release.releaseId,
+            expectedRevision: release.revision,
+            patch: { supportState: 'selectable' },
+            actor: 'admin-1',
+          }),
+        ).rejects.toMatchObject({ code: 'release_capability_unhandled' });
+      });
+
+      // The same command in a body every consuming prompt DOES annex — the
+      // knowledge of an agent that only ever reviews — is answered: the shared
+      // persona tail appends the annex whenever that knowledge instructs, so the
+      // reviewer receives the answer with its recording channel redirected to
+      // the tool it has.
+      it('still honours it in a body whose prompts all carry the annex', async () => {
+        const KNOWLEDGE_SHA = '1f1e1d1c1b1a19181716151413121110ffeeddcc';
+        const REPOSITORY = 'acme/aidlc-211-knowledge-fork';
+        const files = filesWithInvokeLines(PROFILE);
+        const knowledgePath = [...files.keys()].find((path) =>
+          path.startsWith('core/knowledge/aidlc-architecture-reviewer-agent/'),
+        );
+        expect(knowledgePath, 'a reviewer knowledge body').toBeTruthy();
+        files.set(
+          knowledgePath,
+          `${files.get(knowledgePath)}\n\nStamp it with {{INVOKE}} engine now.\n`,
+        );
+        const bundle = buildReleaseBundle({
+          profile: customProfile({
+            repository: REPOSITORY,
+            sha: KNOWLEDGE_SHA,
+            baseProfileId: PROFILE,
+          }),
+          files,
+        });
+        await publishReleaseBundle({ s3, bucket: BUCKET, bundle });
+
+        const { release } = await registerCustomRelease({
+          ...registryArgs(),
+          s3,
+          bucket: BUCKET,
+          repository: REPOSITORY,
+          sha: KNOWLEDGE_SHA,
+          baseProfileId: PROFILE,
+          actor: 'admin-1',
+        });
+
+        expect(release.unhonouredValues).toEqual([]);
+      });
+    });
+
     it('is never admitted under the official repository slug', () => {
       expect(() =>
         customProfile({

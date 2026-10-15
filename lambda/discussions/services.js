@@ -14,6 +14,7 @@ import { runtimeTargetInput } from '../shared/runtime-target.js';
 import { fetchMembershipRole } from '../shared/trackers.js';
 import { agentcore, ddb, ssm, query } from './clients.js';
 import { fetchProjectIdForSprint, fetchProjectIdForIntent } from './data-access.js';
+import { discussionSessionIdFor } from '../shared/runtime-session-ids.js';
 
 const logger = new Logger({ persistentKeys: { component: 'discussions' } });
 
@@ -128,9 +129,6 @@ export const getSecret = async () => {
   if (!cachedSecret) throw new Error(`SSM parameter ${paramName} is empty`);
   return cachedSecret;
 };
-
-const discussionSessionIdFor = (intentId, discussionId) =>
-  `aidlc-discuss-${intentId}-${discussionId}`.padEnd(33, '0');
 
 const discussionRuntimeTargetFor = async (intentId, fallbackRuntimeArn) => {
   const fallbackTarget = runtimeTargetInput(null, fallbackRuntimeArn);

@@ -56,6 +56,7 @@ import { bindGateCallback, unparkGate } from './gate-callback.js';
 import { assertPrStrategySupported } from '../shared/pr-strategy.js';
 import { repoProvider as sharedRepoProvider } from '../shared/repo-provider.js';
 import { parseChoice } from '../shared/gate-answer.js';
+import { laneSessionIdFor } from '../shared/runtime-session-ids.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
 // this module implements. Checked against the registry by a test, so a
@@ -121,8 +122,9 @@ const isIntegratedUnitPr = (row) => row?.state === 'MERGED' || row?.state === 'P
 
 // The unit lane's AgentCore session (A2 rule 3). >= 33 chars like the intent
 // session; distinct session = distinct microVM + persistent mount per lane.
-export const laneSessionIdFor = (intentId, sectionIndex, slug) =>
-  `aidlc-intent-${intentId}-s${sectionIndex}-${slug}`.padEnd(33, '0');
+// Derived in shared/runtime-session-ids.js (the intent-deletion teardown
+// rebuilds the same ids from there).
+export { laneSessionIdFor };
 
 // ── engine gates ─────────────────────────────────────────────────────────────
 // An approval gate the ENGINE opens (skeleton / ladder / batch / halt / the

@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { stubPublicEcr } from './helpers/public-ecr.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const installer = join(root, 'scripts/install.sh');
@@ -555,12 +556,14 @@ exec '${process.execPath}' "$@"
     { mode: 0o755 },
   );
 
+  stubPublicEcr(bin);
   const deployed = run(
     'bash',
     [deployTerraform, 'summary', '--plan-file', join(dir, 'summary.tfplan')],
     {
       env: {
         PATH: `${bin}:${process.env.PATH}`,
+        DOCKER_CONFIG: join(dir, 'docker'),
         AIDLC_CONFIG_DIR: join(dir, 'config'),
         AIDLC_SKIP_NPM_CI: '1',
       },
@@ -658,9 +661,11 @@ exec '${process.execPath}' "$@"
     { mode: 0o755 },
   );
 
+  stubPublicEcr(bin);
   return {
     env: {
       PATH: `${bin}:${process.env.PATH}`,
+      DOCKER_CONFIG: join(dir, 'docker'),
       AIDLC_CONFIG_DIR: join(dir, 'config'),
       AIDLC_SKIP_NPM_CI: '1',
       AIDLC_TERRAFORM_LOG: terraformLog,
@@ -679,6 +684,29 @@ exec '${process.execPath}' "$@"
     planFile: join(dir, 'summary.tfplan'),
   };
 };
+
+test('standalone all/apply fails Public ECR authentication before Terraform or retired-task mutations', (t) => {
+  for (const phase of ['all', 'apply']) {
+    const dir = mkdtempSync(join(tmpdir(), 'aidlc-deploy-ecr-denied-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const { env, terraformLog, awsLog, planFile } = standaloneDeployEnv(dir);
+    writeFileSync(planFile, 'saved plan');
+    const result = run(
+      'bash',
+      [deployTerraform, 'summary', '--phase', phase, '--plan-file', planFile],
+      {
+        env: { ...env, ECR_TEST_LOGIN_FAIL: '1' },
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /ecr-public:GetAuthorizationToken and sts:GetServiceBearerToken in us-east-1/,
+    );
+    assert.ok(!existsSync(terraformLog));
+    assert.ok(!existsSync(awsLog));
+  }
+});
 
 test('standalone deployment forwards --var overrides to terraform plan', () => {
   const dir = mkdtempSync(join(tmpdir(), 'aidlc-deploy-var-'));

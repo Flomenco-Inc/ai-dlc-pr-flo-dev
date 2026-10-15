@@ -355,6 +355,51 @@ step also runs with `--skip-seed`; a failure fails deployment. If you apply
 Terraform directly, follow the [inventory initialization instructions](../development/agent-authentication-foundation.md#scoped-reviews)
 before saving personal or space credentials.
 
+### Public ECR base-image authentication
+
+Container builds use the existing digest-pinned Public ECR Node images.
+`deploy-terraform.sh` automatically runs `scripts/with-public-ecr-auth.mjs`
+for `--phase all` and `--phase apply`; a separate plan does not request a token.
+The wrapper requests a fresh token in `us-east-1` using the current deployment
+identity, so that identity needs the
+[Public ECR permissions](prerequisites.md#public-ecr-permissions-for-container-builds).
+
+The wrapper creates a temporary Docker config with restrictive permissions and
+passes its directory as `DOCKER_CONFIG` for the deployment subprocess. The
+locked Terraform Docker provider's Buildx path reads this config for its
+BuildKit auth session, covering AgentCore ARM64, optional AgentCore AMD64, and
+Yjs AMD64. Terraform's existing private ECR `registry_auth` still handles image
+pushes. Existing Docker contexts, proxy settings and other registry helpers are
+retained; only Public ECR uses the fresh token. The caller's Docker config is
+unchanged. The temporary config is removed on completion, failure, SIGINT or
+SIGTERM; a forced kill or host loss can bypass cleanup, so use an ephemeral
+runner or clean abandoned `aidlc-public-ecr-*` temporary directories.
+
+Before running the deployment command, the wrapper checks authenticated GET
+access to the exact manifests named in both Dockerfiles. This catches missing
+permissions, expired/invalid authentication and manifest-access failures before
+apply. It does **not** download or verify every layer, validate platform
+execution, warm the builder cache, or prove connectivity from a separate builder.
+It does not retry Terraform apply.
+
+For direct Terraform use, wrap the saved-plan apply explicitly:
+
+```bash
+node scripts/with-public-ecr-auth.mjs "$PWD" -- \
+  terraform -chdir=terraform apply /tmp/aidlc-dev.tfplan
+```
+
+AWS documents a separate unauthenticated data allowance; a `429 Data limit
+exceeded` response is not necessarily a short burst of requests. Authentication
+removes reliance on anonymous pulls but cannot guarantee freedom from account
+or service limits. If authenticated pulls still encounter limits, record which
+identity and build failed, check the applicable
+[Public ECR quotas](https://docs.aws.amazon.com/AmazonECR/latest/public/public-service-quotas.html),
+and evaluate a separately approved private ECR mirror or pull-through cache.
+That requires repository/cache permissions, lifecycle and cost decisions, and
+verification of the pinned image digests for each architecture. This deployment
+does not provision a mirror or fall back to anonymous Docker Hub pulls.
+
 ### Bootstrap the first platform administrator
 
 The **Admin** page (user management, agent settings and default models, provider OAuth/App configuration, migrations) and workflow/building-block authoring require the **`platform-admin`** role. For local Cognito users, bootstrap the first administrator via the CLI (users must sign out and back in to pick up the group); afterwards, additional local admins can be granted or revoked in the UI under **Admin → Users**:

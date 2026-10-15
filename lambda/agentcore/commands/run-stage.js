@@ -35,9 +35,8 @@ import {
   selectCli,
   getDriver,
   buildKiroListSessions,
-  parseLatestKiroSession,
+  parseKiroSessionSource,
   buildKiroUsage,
-  parseKiroCredits,
   parseKiroCreditRate,
 } from '../cli/drivers.js';
 import { runChild, captureChild } from '../cli/spawn.js';
@@ -1441,20 +1440,20 @@ const gateAgeMs = (gate, nowIso) => {
   return nowMs - askedMs;
 };
 
-// Capture the Kiro session id created by a just-finished fresh run (Kiro can't be
-// told the id up front). Lists sessions as JSON and returns the newest for the
-// cwd; null when nothing parseable. The list spawn captures stdout (runChild
-// inherits it, so it can't).
-const captureKiroSession = async ({ env, driver, workspaceDir, spawnFn }) => {
+// Look up which Kiro store holds the parked session `sessionId` (after the store
+// restore). The driver pins the v2 engine, which can only load "v2" sessions;
+// sessions written by Kiro <= 2.19 report "classic". Null when the session is
+// not listed. The list spawn captures stdout (runChild inherits it, so it can't).
+const kiroSessionSource = async ({ env, workspaceDir, sessionId, spawnFn }) => {
   const list = buildKiroListSessions();
   const { stdout } = await captureChild({
     command: list.command,
     args: list.args,
-    env: driver.envForAuth(env),
+    env: getDriver('kiro').envForAuth(env),
     cwd: workspaceDir,
     spawnFn,
   });
-  return parseLatestKiroSession(stdout ?? '', workspaceDir);
+  return parseKiroSessionSource(stdout ?? '', workspaceDir, sessionId);
 };
 
 // Capture Kiro's $/credit overage rate by running the `/usage` slash command
@@ -2443,10 +2442,12 @@ const runStageAttempt = async (
     }
 
     // Did the parked conversation survive the mount? Both CLIs keep it on
-    // /mnt/workspace (Claude JSONL under CLAUDE_CONFIG_DIR, Kiro SQLite under
+    // /mnt/workspace (Claude JSONL under CLAUDE_CONFIG_DIR, Kiro's stores under
     // V2_KIRO_STORE_DIR), so a re-cloned source means the conversation is gone too.
     // Kiro additionally copies its store mount→local each run; a failed restore is
-    // the same signal even if the source happened to survive.
+    // the same signal even if the source happened to survive. A restored Kiro
+    // session the pinned v2 engine cannot load (a "classic" session parked by
+    // Kiro <= 2.19, or one missing from the store) is lost the same way.
     // Codex is restored from its dedicated rollout store after its scoped local
     // home is resolved below. Checkout restoration is not a loss signal for it.
     let conversationLost = !demotedResume && cli !== 'codex' && sourceRestored;
@@ -2456,6 +2457,18 @@ const runStageAttempt = async (
       if (!kiroRestored && resolveKiroStore(env)) conversationLost = true;
       else if (!kiroRestored)
         logger.error('kiro store not restored for resume', { stageInstanceId });
+      if (!conversationLost && priorSessionId) {
+        const source = await kiroSessionSource({
+          env,
+          workspaceDir,
+          sessionId: priorSessionId,
+          spawnFn,
+        }).catch(() => null);
+        if (source !== 'v2') {
+          logger.error('kiro session not resumable', { stageInstanceId, source });
+          conversationLost = true;
+        }
+      }
     } else if (!demotedResume && cli === 'opencode') {
       const storePresent = await hasOpenCodeStore({ env }).catch(() => false);
       if (!storePresent && resolveOpenCodeStore(env)) conversationLost = true;
@@ -3418,7 +3431,7 @@ const runStageAttempt = async (
   // Kiro store handling for a RESUME is done in step 2b (restore + the D2 wiped-
   // mount decision) so a lost parked conversation is recovered, not run blind. For
   // a FRESH Kiro run we still restore the durable store here: Kiro keeps ALL
-  // conversations in one SQLite DB and persistKiroStore does rm+cp at exit, so
+  // conversations in one shared store and persistKiroStore does rm+cp at exit, so
   // without a prior restore this run would clobber sibling stages' conversations on
   // the mount. A missing store is fine (Kiro just starts new). Only skip if step
   // 2b already attempted restoration: a missing session ID starts a fresh
@@ -3494,9 +3507,9 @@ const runStageAttempt = async (
       if (reportedErrors.length > 8) reportedErrors.shift();
     },
     onSession: (observedSessionId) => {
-      // OpenCode and Codex choose their own session/thread id; capture the
-      // first one observed on the stream so a later resume can target it.
-      if ((cli !== 'opencode' && cli !== 'codex') || cliSessionId) return;
+      // OpenCode, Codex and Kiro choose their own session/thread id; capture
+      // the first one observed on the stream so a later resume can target it.
+      if (cli === 'claude' || cliSessionId) return;
       cliSessionId = observedSessionId;
       // Persist the first id immediately; the queue is awaited before the park
       // check so a WAITING row can never be written ahead of its resume handle.
@@ -3668,17 +3681,17 @@ const runStageAttempt = async (
     }
   }
 
-  // Kiro only: record the run's credit spend. kiro-cli prints a per-turn footer
-  // on stderr (`▸ Credits: 0.03 • Time: 2s`) which runChild already tees into
-  // stderrTail for the benign-crash check — scrape it and record a `credits`
-  // metric sample, stamped with the trusted model AND the $/credit overage rate
-  // (from `/usage`, cached per container) so the read path can price it as an
-  // ESTIMATE (Kiro is credit-based; in-plan credits are covered by the plan).
-  // Runs on ANY exit — a parked or crashed turn still spent its credits. Best-
-  // effort: no credits footer / no rate never affects the stage outcome.
+  // Kiro only: record the run's credit spend. kiro-cli's stream-json reports
+  // per-turn metering (`meteringUsage`, in credits), which the output parser
+  // sums — record it as a `credits` metric sample, stamped with the trusted model
+  // AND the $/credit overage rate (from `/usage`, cached per container) so the
+  // read path can price it as an ESTIMATE (Kiro is credit-based; in-plan credits
+  // are covered by the plan). Runs on ANY exit — a parked or crashed turn still
+  // spent its credits. Best-effort: no metering / no rate never affects the
+  // stage outcome.
   if (cli === 'kiro') {
     try {
-      const credits = parseKiroCredits(result?.stderrTail);
+      const credits = cliOutput.state?.metrics?.credits ?? null;
       if (credits != null && credits > 0) {
         const creditRate = await captureKiroCreditRate({
           env,
@@ -3708,24 +3721,6 @@ const runStageAttempt = async (
       }
     } catch (e) {
       logger.error('kiro credits not recorded', e, { stageInstanceId });
-    }
-  }
-
-  // Kiro has no start-time session-id flag — capture the id it created so a later
-  // resume can target the SAME conversation. Runs on ANY exit: a Kiro run can park
-  // a question and THEN exit non-zero (e.g. a transient model error on the turn
-  // after ask_question), and a parked stage still needs its session linked or
-  // resume can't find it. A demoted resume is a fresh Kiro conversation, so it also
-  // needs capture. Best-effort — a failed capture leaves cliSessionId null.
-  if (freshRun && cli === 'kiro') {
-    const captured = await captureKiroSession({ env, driver, workspaceDir, spawnFn }).catch(
-      () => null,
-    );
-    if (captured) {
-      cliSessionId = captured;
-      await store
-        .updateStageState({ executionId, stageInstanceId, state: 'RUNNING', cli, cliSessionId })
-        .catch(() => {});
     }
   }
 
@@ -4362,7 +4357,7 @@ const runStageAttempt = async (
         }) ??
           'The provider credit allowance is exhausted. Replenish it or rotate the pinned credential, then retry the failed stage.',
       );
-    } else if (cli === 'kiro' && isBenignKiroEmptyCompletion(result?.stderrTail)) {
+    } else if (cli === 'kiro' && isBenignKiroEmptyCompletion(failureOutput)) {
       logger.error('kiro empty-completion (benign); treating as success', {
         stage: stageId,
         exitCode,

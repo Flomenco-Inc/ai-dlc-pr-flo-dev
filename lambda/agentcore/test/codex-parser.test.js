@@ -255,6 +255,43 @@ describe('Codex output normalization', () => {
     });
   });
 
+  it('keeps a distinct failure cause but shows a reused result text once', () => {
+    const emitted = [];
+    const sink = createCliOutputSink({ cli: 'codex', emit: (event) => emitted.push(event) });
+    sink.write(
+      [
+        // Shell failure: the output and the `exit 1` cause are distinct.
+        line({
+          type: 'item.completed',
+          item: {
+            type: 'command_execution',
+            command: 'cat missing.css',
+            aggregated_output: 'cat: missing.css: No such file or directory',
+            exit_code: 1,
+            status: 'failed',
+          },
+        }),
+        // MCP failure without item.error: the result text doubles as the error.
+        line({
+          type: 'item.completed',
+          item: {
+            type: 'mcp_tool_call',
+            server: 'aidlc',
+            tool: 'get_upstream',
+            status: 'failed',
+            arguments: { id: 'missing' },
+            result: { content: [{ type: 'text', text: 'upstream missing' }] },
+          },
+        }),
+      ].join(''),
+    );
+    sink.flush();
+    const [shell, mcp] = emitted.map(({ display }) => display.details);
+    expect(shell).toContain('No such file or directory');
+    expect(shell).toContain('exit 1');
+    expect(mcp.split('upstream missing')).toHaveLength(2);
+  });
+
   it('captures the session id and usage through the sink callbacks', () => {
     const onSession = vi.fn();
     const onUsage = vi.fn();

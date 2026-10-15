@@ -7,6 +7,7 @@ set -euo pipefail
 export AWS_PAGER=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEPLOY_ARGS=("$@")
 TF_DIR="$SCRIPT_DIR/../terraform"
 ENVIRONMENT="dev"
 PHASE="all"
@@ -286,6 +287,13 @@ if [[ -n "$AUTH_MODE_OVERRIDE" ]]; then
 fi
 
 echo "Deploying environment: $ENVIRONMENT ($PHASE)"
+
+# Keep the token alive through apply (and refresh it for a separately saved plan).
+# The shared workflow also wraps older release scripts that predate this guard.
+if [[ "$PHASE" != "plan" && "${AIDLC_PUBLIC_ECR_AUTH_WRAPPED:-0}" != "1" ]]; then
+    exec node "$SCRIPT_DIR/with-public-ecr-auth.mjs" "$SCRIPT_DIR/.." -- \
+        bash "$SCRIPT_DIR/deploy-terraform.sh" ${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}
+fi
 
 if [[ "$PHASE" == "plan" || "$PHASE" == "all" ]]; then
     configure_docker_build_args

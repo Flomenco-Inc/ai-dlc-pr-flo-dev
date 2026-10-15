@@ -125,4 +125,27 @@ describe('OpenCode output normalization', () => {
       title: 'Artifact write failed: a',
     });
   });
+
+  it('keeps both the tool output and a distinct error in the failure details', () => {
+    const emitted = [];
+    const sink = createCliOutputSink({ cli: 'opencode', emit: (event) => emitted.push(event) });
+    sink.write(
+      line({
+        type: 'tool_use',
+        part: {
+          type: 'tool',
+          tool: 'bash',
+          state: {
+            status: 'error',
+            input: { command: 'npm test' },
+            output: '3 tests failed',
+            error: 'exit code 1',
+          },
+        },
+      }),
+    );
+    sink.flush();
+    expect(emitted[0].display.details).toContain('3 tests failed');
+    expect(emitted[0].display.details).toContain('exit code 1');
+  });
 });

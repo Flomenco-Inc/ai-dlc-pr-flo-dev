@@ -31,7 +31,6 @@ import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import {
   BedrockAgentCoreClient,
   InvokeAgentRuntimeCommand,
-  StopRuntimeSessionCommand,
 } from '@aws-sdk/client-bedrock-agentcore';
 import { parseLambdaPayload } from '../shared/lambda-payload.js';
 import { issueAgentCredentialGrant } from '../shared/agent-credential-grants.js';
@@ -75,6 +74,7 @@ import {
 } from '../shared/construction-autonomy.js';
 import { broadcastToIntentChannel } from '../shared/ws-fanout.js';
 import { resolveRuntimeTarget } from '../shared/runtime-target.js';
+import { sdkTarget, stopSession as stopSharedSession } from '../shared/runtime-session.js';
 import {
   awaitEngineGate,
   parseChoice,
@@ -87,6 +87,7 @@ import { runQuorumEdit } from './quorum-edit.js';
 import { buildIntentAttribution } from './pr-attribution.js';
 import { bindGateCallback, ownsAnsweredGate, unparkGate } from './gate-callback.js';
 import { OVERRIDE_REASON_MAX } from '../shared/gate-answer.js';
+import { intentSessionIdFor } from '../shared/runtime-session-ids.js';
 
 // The capability-registry handler ids (aidlc-capabilities.js RUNTIME_HANDLERS)
 // this module implements. Checked against the registry by a test, so a
@@ -152,7 +153,7 @@ const RETIRED_STATUSES = new Set(['CANCELLED', 'SUCCEEDED']);
 
 // AgentCore requires a session id >= 33 chars; reuse ONE per intent so the
 // checkout stays warm across init-ws + every run-stage (matches scripts/phaseb.sh).
-const sessionIdFor = (intentId) => `aidlc-intent-${intentId}`.padEnd(33, '0');
+const sessionIdFor = intentSessionIdFor;
 
 // One AgentCore /invocations call. Returns the parsed JSON body the command
 // handler returned (init-ws / run-stage). Throws on a non-2xx transport.
@@ -163,7 +164,7 @@ const defaultInvokeRuntime = async (
 ) => {
   const res = await agentcore.send(
     new InvokeAgentRuntimeCommand({
-      ...target,
+      ...sdkTarget(target),
       runtimeSessionId: sessionId,
       contentType: 'application/json',
       accept: 'application/json',
@@ -187,22 +188,14 @@ const defaultInvokeRuntime = async (
   return parsed;
 };
 
-// Free a parked stage's warm microVM compute (D1 release-on-park). Resume
-// re-mounts the persistent session storage, so the parked CLI conversation is
-// not lost. Best-effort: a failed/already-stopped session must not break resume.
-const stopRuntimeSession = async (sessionId, target = { agentRuntimeArn: RUNTIME_ARN() }) => {
-  try {
-    await agentcore.send(
-      new StopRuntimeSessionCommand({
-        runtimeSessionId: sessionId,
-        ...target,
-      }),
-    );
-    return { stopped: true };
-  } catch (e) {
-    return { stopped: false, notFound: e?.name === 'ResourceNotFoundException', error: e.message };
-  }
-};
+// Free a parked stage's warm compute (D1 release-on-park). This is a STOP, not
+// a release: the persistent workspace (session storage on microVMs, the EBS
+// volume on Instances) survives and resume re-attaches it, so the parked CLI
+// conversation is not lost — see the retention policy in
+// shared/runtime-session.js. Best-effort: a failed/already-stopped session must
+// not break resume.
+const stopRuntimeSession = async (sessionId, target = { agentRuntimeArn: RUNTIME_ARN() }) =>
+  stopSharedSession({ client: agentcore, target, sessionId });
 
 const streamToString = async (body) => {
   if (typeof body.transformToString === 'function') return body.transformToString();

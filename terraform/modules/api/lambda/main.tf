@@ -2810,6 +2810,8 @@ resource "aws_iam_role_policy" "intents" {
       {
         # v2 process table: read/write execution state + GSI1 list. Delete /
         # BatchWrite drain the whole EXEC#<id> partition on intent delete.
+        # ConditionCheckItem: gate answers fence run/stage ownership with
+        # ConditionCheck entries inside TransactWriteItems.
         Effect = "Allow"
         Action = [
           "dynamodb:GetItem",
@@ -2820,6 +2822,7 @@ resource "aws_iam_role_policy" "intents" {
           "dynamodb:DeleteItem",
           "dynamodb:BatchWriteItem",
           "dynamodb:TransactWriteItems",
+          "dynamodb:ConditionCheckItem",
         ]
         Resource = [
           var.v2_executions_table_arn,

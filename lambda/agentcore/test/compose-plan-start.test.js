@@ -213,16 +213,21 @@ describe('buildComposePrompt', () => {
     buildComposePrompt({
       mode: 'front',
       persona: 'Run `bun {{HARNESS_DIR}}/tools/aidlc-utility.ts detect --json`.',
-      knowledge: 'See {{HARNESS_DIR}}/tools/data/stage-graph.json.',
+      knowledge:
+        'See {{HARNESS_DIR}}/tools/data/stage-graph.json and invoke {{INVOKE}} engine compile for {{UNKNOWN_BUILD_TOKEN}}.',
       grounding: 'GROUNDING',
       intentPrompt: 'Build the thing',
       ...overrides,
     });
 
-  it('neutralizes the harness token in the upstream persona and knowledge', () => {
+  it('materializes every upstream body without unresolved template tokens', () => {
     const prompt = build();
     expect(prompt).not.toContain('{{HARNESS_DIR}}');
+    expect(prompt).not.toContain('{{INVOKE}}');
+    expect(prompt).not.toMatch(/\{\{[^{}\r\n]+\}\}/);
     expect(prompt).toContain('bun <runtime-managed>/tools/aidlc-utility.ts detect --json');
+    expect(prompt).toContain('<runtime-managed-engine> engine compile');
+    expect(prompt).toContain('<runtime-template:UNKNOWN_BUILD_TOKEN>');
   });
 
   it('overrides the harness procedure after the persona and before the grounding', () => {
@@ -244,6 +249,22 @@ describe('buildComposePrompt', () => {
     const prompt = build({ persona: null, knowledge: null });
     expect(prompt).toContain('You are the AI-DLC composer agent');
     expect(prompt).toContain('Execution environment');
+  });
+
+  it('preserves authoritative grounding and the response contract at the size limit', () => {
+    const prompt = build({
+      knowledge: 'K'.repeat(60 * 1024),
+      grounding: 'AUTHORITATIVE_GROUNDING',
+    });
+    expect(prompt.length).toBeLessThanOrEqual(48 * 1024);
+    expect(prompt).toContain('AUTHORITATIVE_GROUNDING');
+    expect(prompt).toContain('Respond with EXACTLY ONE fenced JSON block');
+  });
+
+  it('fails explicitly when grounding and the response contract cannot fit', () => {
+    expect(() => build({ grounding: 'G'.repeat(49 * 1024) })).toThrow(
+      'compose grounding and response contract exceed the prompt size limit',
+    );
   });
 });
 
@@ -419,6 +440,9 @@ describe('compose-plan-start', () => {
       deps.oneShot.mock.invocationCallOrder[0],
     );
     expect(deps.oneShot.mock.calls[0][0].cwd).toContain('/tmp/compose/i1');
+    expect(deps.oneShot.mock.calls[0][0].prompt).toContain(
+      'Do not search for, install, or run them, and do not read or write files',
+    );
   });
 
   it('inflight mode enforces frozen stages and strict starvation', async () => {

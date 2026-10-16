@@ -31,7 +31,7 @@ import {
   PROPOSAL_CONTRACT,
 } from '../../shared/compose-match.js';
 import { resolveCliSelection } from './discussion-assist-start.js';
-import { neutralizeHarnessDir } from '../stage-materializer.js';
+import { neutralizeTokens } from '../stage-materializer.js';
 import { closeGraphSource } from '../mcp/graph-writer.js';
 
 const logger = new Logger({
@@ -41,6 +41,7 @@ const logger = new Logger({
 const CONTEXT_LIMIT = 48 * 1024;
 const MAX_REPORT_EXCERPT = 24 * 1024;
 const COMPOSER_AGENT_ID = 'aidlc-composer-agent';
+const TEMPLATE_TOKEN = /\{\{([^{}\r\n]+)\}\}/g;
 
 const jobKey = (p) => `${p.intentId}:${p.composeId}`;
 
@@ -139,6 +140,9 @@ const PLATFORM_ENVIRONMENT = [
   '- Unavailable harness tools are never a reason to answer with mode "failed". Use "failed" only when neither a stock scope nor a custom grid can be justified from the intent and the grounding.',
 ].join('\n');
 
+const materializeComposeBody = (text = '') =>
+  neutralizeTokens(String(text)).replace(TEMPLATE_TOKEN, '<runtime-template:$1>');
+
 const buildComposePrompt = ({
   mode,
   persona,
@@ -150,28 +154,33 @@ const buildComposePrompt = ({
   reportExcerpt,
   progressContext,
 }) => {
-  const parts = [];
-  const push = (t) => {
-    if (t && parts.join('\n').length < CONTEXT_LIMIT) parts.push(String(t));
-  };
-  push(
-    neutralizeHarnessDir(persona || '') ||
+  const requiredTail = [
+    PLATFORM_ENVIRONMENT,
+    MODE_TASKS[mode],
+    grounding,
+    PROPOSAL_CONTRACT,
+  ].filter(Boolean);
+  const requiredLength = requiredTail.join('\n\n').length;
+  if (requiredLength > CONTEXT_LIMIT) {
+    throw new Error('compose grounding and response contract exceed the prompt size limit');
+  }
+
+  const optionalParts = [
+    materializeComposeBody(persona || '') ||
       'You are the AI-DLC composer agent: you propose workflow projections; you never route, advance, gate, or write workflow state.',
-  );
-  push(neutralizeHarnessDir(knowledge || ''));
-  push(PLATFORM_ENVIRONMENT);
-  push(MODE_TASKS[mode]);
-  push(`Intent:\n${intentPrompt || '(none provided)'}`);
-  if (instructions) push(`Requester instructions:\n${instructions}`);
-  if (repoSignals)
-    push(
-      `Workspace signals (advisory — runtime detection is authoritative):\n${JSON.stringify(repoSignals, null, 2)}`,
-    );
-  if (reportExcerpt) push(`Report excerpt:\n${String(reportExcerpt).slice(0, MAX_REPORT_EXCERPT)}`);
-  if (progressContext) push(`Live stage progress:\n${progressContext}`);
-  push(grounding);
-  push(PROPOSAL_CONTRACT);
-  return parts.join('\n\n').slice(0, CONTEXT_LIMIT);
+    materializeComposeBody(knowledge || ''),
+    `Intent:\n${intentPrompt || '(none provided)'}`,
+    instructions ? `Requester instructions:\n${instructions}` : '',
+    repoSignals
+      ? `Workspace signals (advisory — runtime detection is authoritative):\n${JSON.stringify(repoSignals, null, 2)}`
+      : '',
+    reportExcerpt ? `Report excerpt:\n${String(reportExcerpt).slice(0, MAX_REPORT_EXCERPT)}` : '',
+    progressContext ? `Live stage progress:\n${progressContext}` : '',
+  ].filter(Boolean);
+  const optionalBudget = CONTEXT_LIMIT - requiredLength - (requiredTail.length ? 2 : 0);
+  const optionalText = optionalParts.join('\n\n').slice(0, Math.max(0, optionalBudget));
+
+  return [optionalText, ...requiredTail].filter(Boolean).join('\n\n');
 };
 
 export const createComposePlanStart = ({

@@ -5,6 +5,7 @@ import {
   completionSections,
   unitPlanIdentity,
   assessExecutionCompletion,
+  unverifiedCompletion,
 } from './unit-completion.js';
 import { openIntentPrs } from './intent-pr.js';
 import { canonicalJson } from './workflow-checkpoint.js';
@@ -95,7 +96,7 @@ export const assertDeliveryComplete = async (meta, records, plan) => {
     );
   const receipt = meta.completionValidation;
   if (
-    (meta.completionPolicyVersion >= 2 || receipt?.version >= 2) &&
+    (meta.completionPolicyVersion >= 1 || receipt?.version >= 1) &&
     (receipt?.runId !== meta.orchestratorRunId ||
       !['complete', 'partial'].includes(receipt?.state) ||
       receipt?.unitPlanIdentity !== unitPlanIdentity(records.unitPlan) ||
@@ -105,10 +106,13 @@ export const assertDeliveryComplete = async (meta, records, plan) => {
       'delivery_completion_changed',
       'The plan or completion decision changed. Review completion diagnostics before delivery.',
     );
-  const completion = await assessExecutionCompletion({
-    records: { ...records, meta },
-    loadPlan: async () => ({ valid: true, plan }),
-  });
+  // No unit diagnostic on a legacy serial execution is not evidence of its
+  // historical workflow definition. Publication still requires verified scope.
+  const completion =
+    (await assessExecutionCompletion({
+      records: { ...records, meta },
+      loadPlan: async () => ({ valid: true, plan }),
+    })) ?? unverifiedCompletion('legacy_workflow_unpinned');
   if (!['complete', 'partial'].includes(completion.state))
     throw fail(
       completion.state === 'unknown' ? 'delivery_unverified' : 'delivery_incomplete',

@@ -34,22 +34,29 @@ they do not undo provider requests or Git operations already in flight.
 
 ## Completion boundaries
 
-New histories capture completion policy 2 in the existing `load-meta` result.
+New histories capture completion policy 1 in the existing `load-meta` result.
 The shared unit-completion evaluator validates the pinned, resolved workflow's
 expected sections, current-plan units, repository integration evidence and scoped
 human omissions. Section fan-in and final success use the same evaluator against
 persisted process state. Missing rows, unfinished work and partial integrations
 cannot pass; missing provenance, read failures and ambiguous legacy omissions
 remain unverified. Serial workflows and sections excluded by approved workflow
-scope/composition remain valid.
+scope/composition remain valid. Pre-deploy `MERGED` rows without an
+`integrationResults` attribute retain their supported integrated meaning, including
+multi-repository retries and rewinds past completed sections. New integrations
+always write the attribute; explicit empty, invalid or incomplete evidence never
+receives this legacy exemption. PR-per-unit integration still requires its
+per-repository PR records. Unpinned historical serial intents without unit work
+keep their success presentation without unit-completion diagnostics.
 
 Required integration writes are not best-effort. A lost response is reconciled
 from persisted state; an unrecorded integration stops the lane before dependent
 work can proceed. Final status and its completion receipt commit together under
 run, status, META revision and unit-plan conditions. Initial publication rechecks
 completion before opening a PR. These checks never rerun models or repair rows.
-Old marker-absent and completion-policy-1 histories retain their saved operation
-sequence and terminal step. Saved historical successes are never rewritten.
+Marker-absent histories (policy 0) retain their saved operation sequence and
+terminal step. The intermediate completion implementation was not released and
+has no separate replay path. Saved historical successes are never rewritten.
 
 A terminal success with unfinished or unverified work is shown honestly in the
 intent detail. Accepted omissions remain partial delivery, not execution defects.

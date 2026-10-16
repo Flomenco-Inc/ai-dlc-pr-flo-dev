@@ -132,6 +132,64 @@ const completeParallelWork = async ({ partial = false } = {}) => {
 };
 
 describe('final delivery with real DynamoDB ownership', () => {
+  it.each(['start', 'retry-delivery'])(
+    'publishes pre-deploy multi-repo MERGED rows through %s without rebuilding units',
+    async (action) => {
+      await completeParallelWork();
+      await store.updateUnitPlanDecisions({
+        executionId: meta.executionId,
+        autonomyMode: 'autonomous',
+      });
+      const before = await store.listUnits(meta.executionId);
+      for (const unit of before) {
+        delete unit.integrationResults;
+        await db.doc.send(new PutCommand({ TableName: tableName, Item: unit }));
+      }
+      let attemptId;
+      if (action === 'retry-delivery') {
+        const p = await preview();
+        const claimed = await store.claimDelivery({
+          meta,
+          delivery: p.delivery,
+          attemptId: 'legacy-retry',
+        });
+        attemptId = claimed.attemptId;
+      } else {
+        meta = await store.updateExecution({ executionId: meta.executionId, status: 'CREATED' });
+      }
+      const invokeRuntime = vi.fn(async () => ({ ok: true }));
+      const result = await __durableHandler(
+        {
+          action,
+          executionId: meta.executionId,
+          intentId: meta.intentId,
+          projectId: meta.projectId,
+          runId: meta.orchestratorRunId,
+          attemptId,
+        },
+        { step: (_name, fn) => fn() },
+        {
+          store,
+          loadPlan,
+          publishDelivery: (args) => publishFinalDelivery({ ...args, operation, loadPlan }),
+          invokeRuntime,
+          broadcast: vi.fn(),
+        },
+      );
+      expect(result).toMatchObject({ ok: true });
+      meta = await store.getExecution(meta.executionId);
+      expect(meta.status).toBe('SUCCEEDED');
+      expect((await row()).status).toBe('succeeded');
+      expect(createCalls()).toHaveLength(2);
+      expect(
+        invokeRuntime.mock.calls.some(
+          ([p]) => p.unitSlug || p.command === 'run-stage-start' || p.command === 'merge-lane',
+        ),
+      ).toBe(false);
+      expect(await store.listUnits(meta.executionId)).toEqual(before);
+    },
+  );
+
   it.each(
     ['initial', 'retry'].flatMap((path) =>
       ['blocked', 'missing-section', 'multi-repo', 'read-failure', 'changed-plan'].map((reason) => [
@@ -653,7 +711,7 @@ describe('final delivery with real DynamoDB ownership', () => {
         },
       );
       expect(result.ok).toBe(true); // Execution completed; publication was withheld separately.
-      expect(capturedMeta).toMatchObject({ completionPolicyVersion: 2, deliveryPolicyVersion: 1 });
+      expect(capturedMeta).toMatchObject({ completionPolicyVersion: 1, deliveryPolicyVersion: 1 });
       expect(capturedMeta.recoveryRuntime).toBeUndefined();
       meta = await store.getExecution(meta.executionId);
       expect(meta.status).toBe('SUCCEEDED');
@@ -708,7 +766,7 @@ describe('final delivery with real DynamoDB ownership', () => {
       expect(result.ok).toBe(true);
       meta = await store.getExecution(meta.executionId);
       expect(meta.status).toBe('SUCCEEDED');
-      expect(meta.completionValidation.version).toBe(2);
+      expect(meta.completionValidation.version).toBe(1);
       expect((await row()).status).toBe('succeeded');
       expect(commands).toContain('record-pr');
       expect(deliveryView(meta, await row()).repositories[0].pr.prUrl).toBeTruthy();

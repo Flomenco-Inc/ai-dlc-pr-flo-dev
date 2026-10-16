@@ -6561,6 +6561,43 @@ describe('WP4 — rewind expands per-unit stage instances', () => {
     return { sub, projectId, intent, pk };
   };
 
+  it.each(['CANCELLED', 'FAILED'])(
+    'shows an unpinned %s abort on the read-only audit API',
+    async (status) => {
+      const { sub, projectId, intent, pk } = await falseSuccess();
+      setStatus(intent.id, {
+        status,
+        methodologyRelease: null,
+        methodologyPins: null,
+        ...(status === 'FAILED' ? { failure: { code: 'section_aborted' } } : {}),
+      });
+      if (status === 'FAILED') {
+        seedGate(intent.id, 'abort-gate', { status: 'answered' });
+        Object.assign(procStore.get(keyOf(pk, 'HUMAN#abort-gate')), {
+          orchestratorRunId: 'finished-run',
+          answer: 'abort',
+        });
+      }
+      const before = structuredClone([...procStore.entries()]);
+      planSpy.loadExecutionPlan.mockClear();
+      const response = await handler({
+        httpMethod: 'GET',
+        path: `/projects/${projectId}/intents/${intent.id}/audit`,
+        pathParameters: { projectId, intentId: intent.id },
+        ...claims(sub),
+      });
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body).completion).toMatchObject({
+        state: 'aborted',
+        reason: 'execution_aborted',
+        integrated: 1,
+        total: 2,
+      });
+      expect(planSpy.loadExecutionPlan).not.toHaveBeenCalled();
+      expect([...procStore.entries()]).toEqual(before);
+    },
+  );
+
   it('adds read-only completion diagnostics to the authorized audit route', async () => {
     const { sub, projectId, intent } = await falseSuccess();
     const request = (user = sub) => ({

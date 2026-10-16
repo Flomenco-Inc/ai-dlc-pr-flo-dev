@@ -74,3 +74,65 @@ test('live client budget refuses writes, scans and unbounded reads', async () =>
   assert.throws(() => client.send(new GetCommand({})), /request limit/);
   assert.equal(calls, 1);
 });
+
+for (const status of ['CANCELLED', 'FAILED']) {
+  test(`audit CLI --status ${status} counts unpinned aborted work and exits zero`, async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'completion-aborted-'));
+    try {
+      const fixture = path.join(dir, 'fixture.json');
+      const output = path.join(dir, 'result.jsonl');
+      await writeFile(
+        fixture,
+        JSON.stringify([
+          {
+            records: {
+              meta: {
+                projectId: 'project',
+                executionId: 'aborted',
+                orchestratorRunId: 'run',
+                status,
+                startedAt: '2026-10-01T00:00:00.000Z',
+                ...(status === 'FAILED' ? { failure: { code: 'section_aborted' } } : {}),
+              },
+              unitPlan: { units: [{ slug: 'unit' }] },
+              units: [{ slug: 'unit', sectionIndex: 1, state: 'PENDING' }],
+              humanTasks:
+                status === 'FAILED'
+                  ? [{ orchestratorRunId: 'run', status: 'answered', answer: 'abort' }]
+                  : [],
+            },
+            planResult: { valid: false },
+          },
+        ]),
+      );
+      const exit = await main([
+        '--fixture',
+        fixture,
+        '--output',
+        output,
+        '--project',
+        'project',
+        '--from',
+        '2026-10-01T00:00:00.000Z',
+        '--to',
+        '2026-10-02T00:00:00.000Z',
+        '--status',
+        status,
+      ]);
+      const [finding, summary] = (await readFile(output, 'utf8'))
+        .trim()
+        .split('\n')
+        .map(JSON.parse);
+      assert.equal(exit, 0);
+      assert.equal(finding.state, 'aborted');
+      assert.equal(finding.integrated, 0);
+      assert.equal(finding.total, 1);
+      assert.equal(summary.metrics.aborted, 1);
+      assert.equal(summary.metrics.unknown, 0);
+      assert.equal(summary.metrics.complete, 0);
+      assert.equal(summary.finished, true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}

@@ -73,6 +73,35 @@ describe('bounded completion diagnostics', () => {
     expect(result.summary.metrics).toMatchObject({ examined: 1, complete: 1, unknown: 0 });
     expect(data).toEqual(before);
   });
+  it.each(['CANCELLED', 'FAILED'])(
+    'counts an unpinned %s abort without treating it as completion or an unknown finding',
+    async (status) => {
+      const { store, data } = setup();
+      data.meta.status = status;
+      delete data.meta.methodologyPins;
+      if (status === 'FAILED') {
+        data.meta.failure = { code: 'section_aborted' };
+        data.humanTasks = [{ orchestratorRunId: 'run', status: 'answered', answer: 'abort' }];
+      }
+      const before = structuredClone(data);
+      const load = vi.fn(async () => {
+        throw new Error('no pin');
+      });
+      const result = await auditCompletion({ store, loadPlan: load, scope: { ...scope, status } });
+      expect(result.findings[0]).toMatchObject({
+        state: 'aborted',
+        reason: 'execution_aborted',
+        integrated: 1,
+        total: 2,
+      });
+      expect(result.summary).toMatchObject({
+        finished: true,
+        metrics: { examined: 1, aborted: 1, unknown: 0, complete: 0, incomplete: 0 },
+      });
+      expect(load).not.toHaveBeenCalled();
+      expect(data).toEqual(before);
+    },
+  );
   it.each(['projectId', 'from', 'to'])('requires explicit %s scope', async (field) => {
     const { store } = setup();
     await expect(

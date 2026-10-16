@@ -65,6 +65,7 @@ const result = (state = 'incomplete') => ({
 });
 beforeEach(() => {
   audit.mockReset();
+  context.detail.intent.status = 'SUCCEEDED';
   context.detail.intent.completedAt = crypto.randomUUID();
 });
 const page = () => (
@@ -92,4 +93,16 @@ it('does not present a cached clean result when a replacement execution audit fa
   view.rerender(page());
   expect(await screen.findByText('Failed to load intent audit')).toBeInTheDocument();
   expect(screen.queryByText('Completion consistency')).not.toBeInTheDocument();
+});
+
+it('shows cancellation as aborted while preserving the unfinished unit evidence', async () => {
+  context.detail.intent.status = 'CANCELLED';
+  const data = result('aborted');
+  data.completion.reason = 'execution_aborted';
+  audit.mockResolvedValue(data);
+  render(page());
+  expect(await screen.findByText(/aborted: 1 of 2 units verified integrated/)).toBeInTheDocument();
+  expect(screen.getByText('execution aborted')).toBeInTheDocument();
+  expect(screen.getByText(/Section 1 · feature: BLOCKED/)).toBeInTheDocument();
+  expect(screen.queryByText(/Unverified:/)).not.toBeInTheDocument();
 });

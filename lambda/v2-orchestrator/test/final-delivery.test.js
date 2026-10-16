@@ -574,6 +574,24 @@ describe('final delivery with real DynamoDB ownership', () => {
     expect(await publish()).toEqual([]);
     expect(createCalls()).toHaveLength(0);
   });
+  it.each(['CANCELLED', 'FAILED'])(
+    'does not publish or offer retry for an aborted %s execution',
+    async (status) => {
+      meta = await store.updateExecution({
+        executionId: meta.executionId,
+        status,
+        methodologyPins: null,
+        failure:
+          status === 'FAILED'
+            ? { code: 'section_aborted', message: 'Execution aborted by its owner.' }
+            : null,
+      });
+      await expect(preview()).rejects.toMatchObject({ code: 'delivery_not_complete' });
+      expect(await publish()).toEqual([]);
+      expect(operation).not.toHaveBeenCalled();
+      expect(await row()).toBeNull();
+    },
+  );
   it('old terminal records remain unknown until read-only assessment; missing sections block it', async () => {
     expect(deliveryView(meta, await row()).status).toBe('unknown');
     expect((await preview()).historical).toBe(true);

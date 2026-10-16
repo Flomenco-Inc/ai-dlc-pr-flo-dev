@@ -70,7 +70,7 @@ additional, optional settings:
 
 `SSO_CONFIG` stores the provider configuration with Secrets Manager ARNs, never OIDC client-secret values. Store each OIDC client secret in Secrets Manager in the deployment account and Region.
 `hybrid` and `sso-only` require `SSO_CONFIG`, and `local` rejects it.
-The workflow validates the provider file with `scripts/sso-config.mjs` and writes it as `prod.sso.tfvars.json`, so both the draft and the final plan use it. Terraform keeps the full provider map sensitive in plan output.
+The workflow validates the provider file with `scripts/sso-config.mjs` and writes it as `prod.sso.tfvars.json`, so the deployment plan uses it. Terraform keeps the full provider map sensitive in plan output.
 
 For SAML, demo secrets must use `metadata.url` or inline `metadata.xml`. The workflow rejects `metadata.file` because a GitHub secret contains no companion XML files. Local installer and standalone deployment provider files continue to support `metadata.file`.
 
@@ -86,30 +86,25 @@ The workflow generates `prod.tfvars` and `prod.s3.tfbackend` in the runner's
 temporary directory. It never runs `bootstrap.sh` and therefore never creates
 or selects a new state bucket.
 
-The job also sets `TF_RECREATE_MISSING_LAMBDA_PACKAGE=false`. GitHub-hosted
-runners start without the Lambda archives referenced by remote Terraform state;
-the Lambda module otherwise treats every missing local archive as a
-timestamp-driven rebuild.
+After preparing the environment, the job runs `scripts/deploy-terraform.sh`
+followed by `scripts/deploy-frontend.sh`. The Terraform script installs the locked
+root dependencies, initializes the selected backend, saves one plan, checks it
+for protected-resource destruction, and applies that plan without an interactive
+prompt. The frontend script uses the resulting Terraform outputs to build and
+publish the frontend.
 
-The workflow uses a draft plan to generate the Lambda module's package plans,
-builds every content-addressed ZIP (including nested managed-environment and
-tool packages), removes the generated `lambda/*/.build` directories, and then
-creates the final saved Terraform plan. Package paths retain their subdirectories.
-Before apply, it checks that the local archives needed by Lambda creates,
-replacements, and code updates are present, readable, and nonempty. A missing or
-unresolved package stops the job before any resources are modified. Unchanged
-functions and configuration-only updates do not require their old local ZIPs.
-The final plan hashes the clean release source and apply reuses the built
-packages. Source changes still produce and deploy new content-addressed archives.
+The Terraform Lambda module owns bundling and ZIP creation through its normal
+resource graph. Missing local archives are recreated on clean runners using the
+module defaults; do not set `TF_RECREATE_MISSING_LAMBDA_PACKAGE=false`. Package
+filenames may remain unknown until apply when an upstream resource is changing.
+The workflow does not prebuild archives or require these filenames to be known
+before apply. This can rebuild local packages on each clean runner.
 
-The pre-apply validator comes from the immutable executing workflow commit
-(`github.workflow_sha`), independently of the release tag or deployment commit.
-Before configuring AWS credentials, the workflow uses checkout's read-only Git
-access to fetch that exact commit and extract the standalone inspector into the
-runner's temporary directory. The deployment checkout stays on the selected
-release, and archive paths are checked relative to its Terraform directory.
-Manual deployments of older releases therefore retain the package and protected
-resource guards even when their bundled inspector predates the package-check mode.
+Current deployment scripts also own Public ECR authentication. For older release
+scripts, the workflow loads only the authentication helper from the immutable
+executing workflow commit (`github.workflow_sha`) and wraps the Terraform script.
+The selected release sources stay intact. The existing script's destruction
+check remains in effect; there is no separate workflow package validator.
 
 The same immutable workflow commit supplies `with-public-ecr-auth.mjs`. After
 the package checks and before invoking the selected release's apply script, it

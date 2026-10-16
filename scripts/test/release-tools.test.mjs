@@ -123,26 +123,24 @@ test('release and main deployments use isolated protected environments and GitHu
     /TF_PROJECT_NAME: \$\{\{ inputs\.terraform_project_name \|\| 'collaborative-ai-dlc' \}\}/,
   );
   assert.match(deployment, /printf 'project_name  = %s\\n'/);
-  assert.match(deployment, /TF_RECREATE_MISSING_LAMBDA_PACKAGE: 'false'/);
+  assert.doesNotMatch(deployment, /TF_RECREATE_MISSING_LAMBDA_PACKAGE/);
   assert.match(deployment, /role-to-assume: \$\{\{ vars\.AWS_ROLE_ARN \}\}/);
   assert.match(deployment, /TF_STATE_BUCKET: \$\{\{ vars\.TF_STATE_BUCKET \}\}/);
   assert.match(deployment, /docker\/setup-qemu-action@[0-9a-f]{40}/);
   assert.match(deployment, /platforms: arm64/);
-  assert.match(deployment, /python3 "\$package_script" build --timestamp 0/);
   assert.match(deployment, /AUTH_DOMAIN: \$\{\{ secrets\.AUTH_DOMAIN \}\}/);
   assert.match(deployment, /AUTH_MODE: \$\{\{ vars\.AUTH_MODE \}\}/);
   assert.match(deployment, /SSO_CONFIG: \$\{\{ secrets\.SSO_CONFIG \}\}/);
   assert.match(deployment, /printf 'auth_domain {10}= %s\\n'/);
   assert.match(deployment, /node scripts\/sso-config\.mjs "\$sso_input" "\$AUTH_MODE"/);
   assert.match(deployment, /\$TF_ENVIRONMENT\.sso\.tfvars\.json/);
-  assert.match(deployment, /AIDLC_SKIP_NPM_CI: '1'/);
   assert.match(deployment, /deploy-terraform\.sh "\$TF_ENVIRONMENT"/);
   assert.match(deployment, /deploy-frontend\.sh "\$TF_ENVIRONMENT"/);
   assert.match(deployment, /case "\$DEPLOY_REF_TYPE" in/);
   assert.match(deployment, /release-tag\)/);
   assert.match(deployment, /commit\)/);
   assert.match(deployment, /git merge-base --is-ancestor "\$deploy_commit" "\$main_commit"/);
-  assert.equal(deployment.match(/--phase plan/g)?.length, 2);
+  assert.doesNotMatch(deployment, /--phase|package\.py|require-lambda-packages/);
   assert.doesNotMatch(deployment, /inputs\.apply|plan-only/);
   assert.doesNotMatch(deployment, /AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY/);
   assert.ok(
@@ -156,13 +154,9 @@ test('release and main deployments use isolated protected environments and GitHu
     'ARM64 emulation must be configured before Terraform builds the AgentCore image',
   );
   assert.ok(
-    deployment.indexOf('- name: Prepare Lambda package plans') <
-      deployment.indexOf('- name: Build Lambda packages') &&
-      deployment.indexOf('- name: Build Lambda packages') <
-        deployment.indexOf('- name: Plan infrastructure') &&
-      deployment.indexOf('- name: Plan infrastructure') <
-        deployment.indexOf('- name: Apply infrastructure'),
-    'Lambda packages must be built before the final saved plan is applied',
+    deployment.indexOf('- name: Deploy infrastructure') <
+      deployment.indexOf('- name: Deploy frontend'),
+    'frontend deployment must follow the infrastructure script',
   );
 });
 

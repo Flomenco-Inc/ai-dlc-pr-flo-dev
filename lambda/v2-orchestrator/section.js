@@ -460,13 +460,14 @@ export const runParallelSection = async (segment, toolkit) => {
     attachments = [],
   } = toolkit;
   const { executionId, intentId, projectId } = ids;
+  const checkedCompletion = completionPolicyVersion >= 1;
   const sk = `s${segment.index}`;
 
   // Consistent: the fan-out approval patched this plan's decisions just before.
   const unitPlan = await ctx.step(`load-unit-plan-${sk}`, () =>
     store.getUnitPlan(executionId, { consistentRead: true }),
   );
-  if (completionPolicyVersion >= 2) toolkit.completionUnitPlan = unitPlan;
+  if (checkedCompletion) toolkit.completionUnitPlan = unitPlan;
   if (!unitPlan || (unitPlan.units ?? []).length === 0) {
     return await fail(
       'unit_plan_missing',
@@ -478,7 +479,6 @@ export const runParallelSection = async (segment, toolkit) => {
     unitPlan.batches?.length ? unitPlan.batches : [unitPlan.units.map((u) => u.slug)]
   ).map((w) => w.filter((slug) => bySlug.has(slug)));
   const laneOrder = waves.flat();
-  const checkedCompletion = completionPolicyVersion >= 1;
   if (checkedCompletion) {
     const problem = skeletonProblem(unitPlan, undefined, segment.stages);
     if (problem) return fail('invalid_walking_skeleton', problem);
@@ -535,10 +535,10 @@ export const runParallelSection = async (segment, toolkit) => {
   const persistedUnits = await ctx.step(`load-unit-states-${sk}`, () =>
     store.listUnits(executionId, { consistentRead: checkedCompletion }),
   );
-  if (completionPolicyVersion >= 2) {
+  if (checkedCompletion) {
     let initial;
     try {
-      initial = await ctx.step(`load-completion-v2-${sk}`, async () => {
+      initial = await ctx.step(`load-completion-v1-${sk}`, async () => {
         const records = await store.getCompletionRecords(executionId);
         if (records.meta?.orchestratorRunId !== runId) return { state: 'retired' };
         return unitCompletion(records, [segment.index]);
@@ -550,7 +550,7 @@ export const runParallelSection = async (segment, toolkit) => {
       );
     }
     if (initial.state === 'retired') return { ok: false, reason: 'retired', intentId };
-    // A historical aggregate label is insufficient to release dependencies.
+    // Validate recorded repository evidence before releasing dependencies.
     // Unfinished lanes may execute; uncertain or contradictory integration may not.
     if (initial.state === 'unknown' || initial.unresolved.some((unit) => unit.state === 'MERGED'))
       return fail('completion_unverified', completionMessage(initial));
@@ -872,7 +872,10 @@ export const runParallelSection = async (segment, toolkit) => {
           sectionIndex: segment.index,
           slug,
           state: 'MERGED',
-          fields: { mergedAt: true },
+          fields: {
+            mergedAt: true,
+            ...(checkedCompletion ? { integrationResults: [] } : {}),
+          },
         });
       });
       return { slug, state: 'MERGED' };
@@ -1565,6 +1568,7 @@ export const runParallelSection = async (segment, toolkit) => {
               state: 'MERGED',
               fields: {
                 mergedAt: true,
+                ...(checkedCompletion ? { integrationResults: [] } : {}),
                 integrationOwner: false,
                 blockedReason: null,
               },
@@ -1695,7 +1699,7 @@ export const runParallelSection = async (segment, toolkit) => {
       let depState = laneState.get(dep);
       if (lanePromises.has(dep)) {
         const settled = await lanePromises.get(dep).catch(() => ({ state: 'FAILED' }));
-        if (completionPolicyVersion >= 2 && settled?.state === 'TERMINAL')
+        if (checkedCompletion && settled?.state === 'TERMINAL')
           return { slug, state: 'TERMINAL', value: settled.value };
         depState = settled?.state;
       }
@@ -2042,7 +2046,7 @@ export const runParallelSection = async (segment, toolkit) => {
                 intentId,
                 executionId,
                 unitSlug: slug,
-                ...(completionPolicyVersion >= 2 ? { sectionIndex: segment.index } : {}),
+                ...(checkedCompletion ? { sectionIndex: segment.index } : {}),
                 repos: cloneBase.repos,
                 unitBranch,
                 intentBranch,
@@ -2124,12 +2128,10 @@ export const runParallelSection = async (segment, toolkit) => {
               slug,
               state: 'MERGED',
               fromStates: ['MERGING', 'RUNNING'],
-              ...(completionPolicyVersion >= 2
-                ? { ifOrchestratorRunId: runId, ifUnitPlan: unitPlan }
-                : {}),
+              ...(checkedCompletion ? { ifOrchestratorRunId: runId, ifUnitPlan: unitPlan } : {}),
               fields: {
                 mergedAt: true,
-                ...(completionPolicyVersion >= 2
+                ...(checkedCompletion
                   ? {
                       integrationResults: (merge.results ?? []).map(({ repo, merged, reason }) => ({
                         repo,
@@ -2140,11 +2142,11 @@ export const runParallelSection = async (segment, toolkit) => {
                   : {}),
               },
             });
-            if (completionPolicyVersion >= 2 && !saved)
+            if (checkedCompletion && !saved)
               throw new Error('Unit integration write was not accepted');
             return true;
           } catch (error) {
-            if (completionPolicyVersion < 2) return true; // frozen legacy behavior
+            if (!checkedCompletion) return true; // frozen legacy behavior
             const records = await store.getCompletionRecords(executionId);
             if (
               records.meta?.orchestratorRunId !== runId ||
@@ -2205,12 +2207,10 @@ export const runParallelSection = async (segment, toolkit) => {
           sectionIndex: segment.index,
           slug,
           state: 'FAILED',
-          ...(completionPolicyVersion >= 2
-            ? { ifOrchestratorRunId: runId, ifUnitPlan: unitPlan }
-            : {}),
+          ...(checkedCompletion ? { ifOrchestratorRunId: runId, ifUnitPlan: unitPlan } : {}),
           fields: {
             failureReason: `${stageId}: ${reason}${detail ? ` (${detail})` : ''}`,
-            ...(completionPolicyVersion >= 2 && integrationResults
+            ...(checkedCompletion && integrationResults
               ? {
                   integrationResults: integrationResults.map(
                     ({ repo, merged, reason: repoReason }) => ({
@@ -2548,10 +2548,10 @@ export const runParallelSection = async (segment, toolkit) => {
       (skeletonCeremonyOff || s !== skeleton) && laneState.get(s) !== 'MERGED' && !skipped.has(s),
   );
   const validateCompletion = async () => {
-    if (completionPolicyVersion >= 2) {
+    if (checkedCompletion) {
       let completion;
       try {
-        completion = await ctx.step(`section-completion-v2-${sk}`, async () => {
+        completion = await ctx.step(`section-completion-v1-${sk}`, async () => {
           const records = await store.getCompletionRecords(executionId);
           if (records.meta?.orchestratorRunId !== runId) return { state: 'retired' };
           if (unitPlanIdentity(records.unitPlan) !== unitPlanIdentity(unitPlan))
@@ -2579,16 +2579,7 @@ export const runParallelSection = async (segment, toolkit) => {
             completionMessage(completion),
           );
     }
-    // Frozen policy-1 histories keep the original operation sequence and decision.
-    const unresolved = laneOrder.filter(
-      (slug) => laneState.get(slug) !== 'MERGED' && !skipped.has(slug),
-    );
-    return checkedCompletion && unresolved.length
-      ? fail(
-          'section_incomplete',
-          `Section ${segment.index} still has unresolved units: ${unresolved.join(', ')}. Review the remaining work before continuing.`,
-        )
-      : null;
+    return null; // Marker-absent histories retain the pre-check operation sequence.
   };
   if (remaining.length === 0) {
     const incomplete = await validateCompletion();

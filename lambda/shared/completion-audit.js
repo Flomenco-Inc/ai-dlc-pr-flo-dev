@@ -1,4 +1,8 @@
-import { assessExecutionCompletion, unverifiedCompletion } from './unit-completion.js';
+import {
+  assessExecutionCompletion,
+  unverifiedCompletion,
+  unitCompletion,
+} from './unit-completion.js';
 
 export const validateCompletionAuditScope = (scope) => {
   const { projectId, status = 'SUCCEEDED', from, to } = scope;
@@ -86,7 +90,10 @@ export const auditCompletion = async ({ store, loadPlan, scope: input, checkpoin
         ) {
           completion = unverifiedCompletion('execution_scope_changed');
         } else {
-          completion = await assessExecutionCompletion({ records, loadPlan });
+          // A legacy execution without unit work has no unit diagnostic. Use
+          // the same owner's no-section result for audit counts.
+          completion =
+            (await assessExecutionCompletion({ records, loadPlan })) ?? unitCompletion(records, []);
           const current = await store.getExecution(candidate.executionId, {
             consistentRead: true,
           });

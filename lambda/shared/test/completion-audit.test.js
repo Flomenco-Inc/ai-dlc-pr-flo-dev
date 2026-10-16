@@ -62,6 +62,17 @@ describe('bounded completion diagnostics', () => {
     });
     expect(data).toEqual(before);
   });
+  it('audits an unpinned serial success without inventing a unit failure', async () => {
+    const { store, data } = setup();
+    delete data.meta.methodologyPins;
+    delete data.unitPlan;
+    data.units = [];
+    const before = structuredClone(data);
+    const result = await auditCompletion({ store, loadPlan, scope });
+    expect(result.findings[0]).toMatchObject({ state: 'complete', total: 0, unresolved: [] });
+    expect(result.summary.metrics).toMatchObject({ examined: 1, complete: 1, unknown: 0 });
+    expect(data).toEqual(before);
+  });
   it.each(['projectId', 'from', 'to'])('requires explicit %s scope', async (field) => {
     const { store } = setup();
     await expect(

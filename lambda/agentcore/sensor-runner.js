@@ -33,6 +33,8 @@ import {
   severityGate,
   validateScriptSpec,
   resultFromExit,
+  resultFromDispatcherExit,
+  dispatcherExitReason,
   buildScriptArgv,
   evalRequiredSections,
   evalUpstreamCoverage,
@@ -202,7 +204,15 @@ const runChild = ({ file, args, timeoutMs, cwd, env, spawnFn = spawn }) =>
 // Read a sensor's stdout JSON `pass` field if present; falls back to the exit
 // code. Upstream per-sensor scripts exit 0 and carry the verdict in stdout
 // `{"pass": bool, ...}`, so the exit code alone under-reports a clean FAIL.
-const resultFromScript = ({ exitCode, stdout }) => {
+//
+// `dispatcherExitCodes` is the contract the pinned catalog authored (see
+// `sensorDeclaresDispatcherExitCodes`). With it the documented non-zero exits
+// stop collapsing into one undifferentiated FAIL with no detail: 127 is the
+// script reporting that its tool or that tool's config could not be used, which
+// its own dispatcher answers with a pass rather than a finding, and any other
+// non-zero exit keeps its verdict but now carries the exit code and a stderr
+// excerpt naming the breakage.
+const resultFromScript = ({ exitCode, stdout, stderr }, { dispatcherExitCodes = false } = {}) => {
   if (exitCode === 0 && typeof stdout === 'string' && stdout.trim()) {
     try {
       const parsed = JSON.parse(stdout.trim().split(/\r?\n/).at(-1));
@@ -215,6 +225,9 @@ const resultFromScript = ({ exitCode, stdout }) => {
     } catch {
       /* not JSON — fall through to exit-code mapping */
     }
+  }
+  if (dispatcherExitCodes && Number.isInteger(exitCode) && exitCode !== 0) {
+    return resultFromDispatcherExit({ exitCode, stderr });
   }
   return { result: resultFromExit(exitCode), detail: null };
 };
@@ -456,6 +469,7 @@ export const createSensorRunner = ({
     let worst = SENSOR_RESULT.PASS;
     let tightest = null;
     let exhausted = false;
+    const dispatcherExitCodes = Boolean(sensor.dispatcherExitCodes);
     for (const rel of matched) {
       const bound = scriptTimeoutBound(spec.timeoutSeconds, readRemainingStageMs());
       if (bound.exhausted) {
@@ -471,7 +485,7 @@ export const createSensorRunner = ({
         env: childEnv,
         spawnFn,
       });
-      const { result, detail } = resultFromScript(run);
+      const { result, detail } = resultFromScript(run, { dispatcherExitCodes });
       fileResults.push({ file: rel, result, timedOut: run.timedOut, detail });
       if (result === SENSOR_RESULT.FAIL) worst = SENSOR_RESULT.FAIL;
       else if (result === SENSOR_RESULT.BLOCKED && worst !== SENSOR_RESULT.FAIL)
@@ -488,10 +502,18 @@ export const createSensorRunner = ({
       }
       if (worst !== SENSOR_RESULT.FAIL) worst = SENSOR_RESULT.BLOCKED;
     }
+    // The reason the gate finding and the activity note read lives at the sensor
+    // level, not on the per-file rows, so the contract's explanation is
+    // summarized here too. Null when no file hit a documented exit, which keeps
+    // every other sweep's detail exactly as it was.
+    const exitReason = dispatcherExitCodes
+      ? dispatcherExitReason(fileResults, matched.length)
+      : null;
     return {
       result: worst,
       detail: {
         files: fileResults,
+        ...(exitReason ? { reason: exitReason } : {}),
         // A budget the stage deadline shortened is reported, so a run cut short
         // does not read as the sensor's own timeout. The narrowest bound any
         // launch got is the one reported; exhaustion without a launch contributes

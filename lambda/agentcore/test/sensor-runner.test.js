@@ -30,6 +30,70 @@ describe('resultFromScript', () => {
   it('falls back to the exit code without JSON', () => {
     expect(resultFromScript({ exitCode: 2, stdout: '' }).result).toBe('INCONCLUSIVE');
   });
+
+  // Without the authored contract nothing moves: an unpinned run and every
+  // catalog that invokes its scripts directly keep the bare mapping.
+  it('maps every non-zero exit to a bare FAIL without the authored contract', () => {
+    expect(resultFromScript({ exitCode: 127, stdout: '', stderr: 'eslint-unavailable' })).toEqual({
+      result: 'FAIL',
+      detail: null,
+    });
+    expect(resultFromScript({ exitCode: 1, stdout: '', stderr: 'eslint-bad-output' })).toEqual({
+      result: 'FAIL',
+      detail: null,
+    });
+  });
+
+  // With it, the exits the release's own dispatcher documents are read the way
+  // it reads them, and the reason reaches the record.
+  it('passes exit 127 with the tool named when the contract is authored', () => {
+    expect(
+      resultFromScript(
+        { exitCode: 127, stdout: '', stderr: 'eslint-unavailable\n' },
+        { dispatcherExitCodes: true },
+      ),
+    ).toMatchObject({
+      result: 'PASS',
+      detail: {
+        toolUnavailable: true,
+        exitCode: 127,
+        reason: 'eslint is not available here, so the check did not run',
+      },
+    });
+  });
+
+  it('passes exit 127 with the missing config named when the contract is authored', () => {
+    expect(
+      resultFromScript(
+        { exitCode: 127, stdout: '', stderr: 'no-eslint-config\n' },
+        { dispatcherExitCodes: true },
+      ).detail.reason,
+    ).toBe('no eslint configuration was found, so the check did not run');
+  });
+
+  it('reports a script error with its exit code and stderr', () => {
+    expect(
+      resultFromScript(
+        { exitCode: 1, stdout: '', stderr: 'eslint-bad-output\n' },
+        { dispatcherExitCodes: true },
+      ),
+    ).toMatchObject({
+      result: 'FAIL',
+      detail: { scriptError: true, exitCode: 1, stderr: 'eslint-bad-output' },
+    });
+  });
+
+  it('still reads a verdict the script printed on exit 0 under the contract', () => {
+    expect(
+      resultFromScript({ exitCode: 0, stdout: '{"pass":false}' }, { dispatcherExitCodes: true }),
+    ).toMatchObject({ result: 'FAIL', detail: { pass: false } });
+  });
+
+  it('leaves a timeout BLOCKED under the contract (no exit code to read)', () => {
+    expect(
+      resultFromScript({ exitCode: null, stdout: '', stderr: '' }, { dispatcherExitCodes: true }),
+    ).toEqual({ result: 'BLOCKED', detail: null });
+  });
 });
 
 // A fake graph-writer returning canned artifact rows by type.
@@ -852,5 +916,134 @@ describe('runStageSensors — the stage budget bounds every child', () => {
     expect(verdict.result).toBe('PASS');
     expect(verdict.detail).not.toHaveProperty('boundedBy');
     expect(verdict.detail).not.toHaveProperty('stageBudgetExhausted');
+  });
+});
+
+// D3 on staging: every file of a pinned `linter` sweep recorded
+// `{result:"FAIL",detail:null}` because each child exited non-zero without a
+// JSON line, and neither the exit code nor stderr was kept. The release's own
+// dispatcher answers 127 with a tool-unavailable PASS, so a pinned sweep reads
+// it that way too, and a real script error keeps its FAIL but now says why.
+describe("runStageSensors — a release script sensor's documented exit codes", () => {
+  let ws;
+  beforeEach(async () => {
+    ws = await mkdtemp(path.join(tmpdir(), 'sensor-exit-'));
+    await mkdir(path.join(ws, 'src'), { recursive: true });
+    await writeFile(path.join(ws, 'src', 'a.ts'), 'export const a = 1;');
+    await writeFile(path.join(ws, 'src', 'b.ts'), 'export const b = 2;');
+  });
+  afterEach(async () => {
+    await rm(ws, { recursive: true, force: true });
+  });
+
+  const exitingSpawn = (exitCode, stderr) => () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    setTimeout(() => {
+      if (stderr) child.stderr.emit('data', Buffer.from(stderr));
+      child.emit('close', exitCode);
+    }, 0);
+    return child;
+  };
+
+  const linter = (extra = {}) => ({
+    sensorId: 'linter',
+    severity: 'advisory',
+    runtime: 'bun',
+    command: '{{INVOKE}} engine sensor-linter',
+    matches: '**/*.{ts,js}',
+    timeoutSeconds: 30,
+    ...extra,
+  });
+
+  const verdictFor = async ({ exitCode, stderr, sensor }) => {
+    const runner = createSensorRunner({
+      graph: null,
+      loadBlockScript: async () => 'console.log("x");',
+      workspaceDir: ws,
+      spawnFn: exitingSpawn(exitCode, stderr),
+    });
+    const [verdict] = await runner.runStageSensors({
+      sensors: [sensor],
+      stageId: 'functional-design',
+    });
+    return verdict;
+  };
+
+  it('passes a tool-unavailable sweep and names the tool on the record', async () => {
+    const verdict = await verdictFor({
+      exitCode: 127,
+      stderr: 'eslint-unavailable\n',
+      sensor: linter({ dispatcherExitCodes: true }),
+    });
+    expect(verdict).toMatchObject({ kind: 'script', result: 'PASS', held: false });
+    expect(verdict.detail.reason).toBe(
+      '2 of 2 files: eslint is not available here, so the check did not run',
+    );
+    for (const file of verdict.detail.files) {
+      expect(file).toMatchObject({
+        result: 'PASS',
+        detail: {
+          toolUnavailable: true,
+          exitCode: 127,
+          reason: 'eslint is not available here, so the check did not run',
+        },
+      });
+    }
+  });
+
+  it('names the missing config when that is what the script reported', async () => {
+    const verdict = await verdictFor({
+      exitCode: 127,
+      stderr: 'no-eslint-config\n',
+      sensor: linter({ dispatcherExitCodes: true }),
+    });
+    expect(verdict.result).toBe('PASS');
+    expect(verdict.detail.reason).toBe(
+      '2 of 2 files: no eslint configuration was found, so the check did not run',
+    );
+  });
+
+  it('records a script error as the FAIL it was, now with the exit code and stderr', async () => {
+    const verdict = await verdictFor({
+      exitCode: 1,
+      stderr: 'eslint-bad-output\nat parse (file.ts:1:1)\n',
+      sensor: linter({ dispatcherExitCodes: true }),
+    });
+    expect(verdict).toMatchObject({ result: 'FAIL', held: false });
+    expect(verdict.detail.reason).toBe(
+      '2 of 2 files: the sensor script exited 1 without a verdict',
+    );
+    expect(verdict.detail.files[0].detail).toMatchObject({
+      scriptError: true,
+      exitCode: 1,
+      stderr: 'eslint-bad-output\nat parse (file.ts:1:1)',
+    });
+  });
+
+  it('a blocking script error holds the stage', async () => {
+    const verdict = await verdictFor({
+      exitCode: 1,
+      stderr: 'eslint-bad-output\n',
+      sensor: linter({ severity: 'blocking', dispatcherExitCodes: true }),
+    });
+    expect(verdict).toMatchObject({ result: 'FAIL', held: true });
+  });
+
+  // The D3 record, kept as the behaviour an unpinned run and every pre-dispatcher
+  // catalog still get: one FAIL per file with nothing on it.
+  it('keeps the bare FAIL with no detail when the catalog authors no contract', async () => {
+    const verdict = await verdictFor({
+      exitCode: 127,
+      stderr: 'eslint-unavailable\n',
+      sensor: linter(),
+    });
+    expect(verdict).toMatchObject({ kind: 'script', result: 'FAIL' });
+    expect(verdict.detail).not.toHaveProperty('reason');
+    for (const file of verdict.detail.files) {
+      expect(file).toMatchObject({ result: 'FAIL', detail: null });
+    }
   });
 });

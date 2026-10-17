@@ -2,12 +2,15 @@ import { describe, it, expect } from 'vitest';
 import {
   SENSOR_RESULT,
   recordSensorsCoverRunRecords,
+  sensorDeclaresDispatcherExitCodes,
   sensorKind,
   severityGate,
   sensorPathFlag,
   scriptTimeoutBound,
   validateScriptSpec,
   resultFromExit,
+  resultFromDispatcherExit,
+  dispatcherExitReason,
   buildScriptArgv,
   evalRequiredSections,
   evalUpstreamCoverage,
@@ -451,5 +454,147 @@ describe('parseBoltDag', () => {
     const r = parseBoltDag(body);
     expect(r).toMatchObject({ ok: false, reason: 'malformed' });
     expect(r.detail).toContain('unknown kind "microservice"');
+  });
+});
+
+// The exit-code contract a pinned catalog authors by routing its sensors through
+// its own engine dispatcher. Read off the authored invocation, never a version
+// string, so a fork that keeps the route keeps the semantics.
+describe('sensorDeclaresDispatcherExitCodes', () => {
+  it('reads the dispatcher route a 2.8.2+ catalog authors', () => {
+    expect(sensorDeclaresDispatcherExitCodes({ command: '{{INVOKE}} engine sensor-linter' })).toBe(
+      true,
+    );
+    expect(
+      sensorDeclaresDispatcherExitCodes({ command: '{{INVOKE}} engine sensor-type-check' }),
+    ).toBe(true);
+  });
+  it('is false for the direct script invocation every earlier catalog authors', () => {
+    expect(
+      sensorDeclaresDispatcherExitCodes({
+        command: 'bun {{HARNESS_DIR}}/tools/aidlc-sensor-linter.ts',
+      }),
+    ).toBe(false);
+  });
+  it('is false for a sensor with no command at all', () => {
+    expect(sensorDeclaresDispatcherExitCodes({})).toBe(false);
+    expect(sensorDeclaresDispatcherExitCodes(null)).toBe(false);
+  });
+  it('is false for an engine command that is not a sensor route', () => {
+    expect(
+      sensorDeclaresDispatcherExitCodes({ command: '{{INVOKE}} engine state unit start' }),
+    ).toBe(false);
+  });
+});
+
+// Upstream's dispatcher truth table (core/tools/aidlc-sensor.ts, 2.11.0
+// 6a378b53c0): branch b answers exit 127 with a PASS noted tool-unavailable, so
+// an environment without the tool is not a finding. The reason has to name the
+// tool or config, which only the script's own stderr marker does. Every other
+// non-zero exit keeps the verdict the bare mapping gave it and only gains the
+// exit code and stderr the record was dropping.
+describe('resultFromDispatcherExit', () => {
+  it('passes exit 127 and names the unavailable tool', () => {
+    expect(resultFromDispatcherExit({ exitCode: 127, stderr: 'eslint-unavailable\n' })).toEqual({
+      result: SENSOR_RESULT.PASS,
+      detail: {
+        toolUnavailable: true,
+        exitCode: 127,
+        reason: 'eslint is not available here, so the check did not run',
+      },
+    });
+  });
+  it('passes exit 127 and names the missing config', () => {
+    expect(resultFromDispatcherExit({ exitCode: 127, stderr: 'no-eslint-config\n' })).toEqual({
+      result: SENSOR_RESULT.PASS,
+      detail: {
+        toolUnavailable: true,
+        exitCode: 127,
+        reason: 'no eslint configuration was found, so the check did not run',
+      },
+    });
+  });
+  it('reads the type-check sensor marker with the same rule', () => {
+    expect(
+      resultFromDispatcherExit({ exitCode: 127, stderr: 'tsc-unavailable' }).detail.reason,
+    ).toBe('tsc is not available here, so the check did not run');
+  });
+  it('quotes an unrecognised 127 marker rather than dropping it', () => {
+    expect(
+      resultFromDispatcherExit({ exitCode: 127, stderr: 'something else entirely' }).detail.reason,
+    ).toBe(
+      'the sensor reported its tool unavailable ("something else entirely"), so the check did not run',
+    );
+  });
+  it('still passes 127 when the script wrote no stderr', () => {
+    expect(resultFromDispatcherExit({ exitCode: 127, stderr: '' })).toMatchObject({
+      result: SENSOR_RESULT.PASS,
+      detail: { reason: 'the sensor reported its tool unavailable, so the check did not run' },
+    });
+  });
+  it('reports a script error as the FAIL it already was, plus the exit code and stderr', () => {
+    expect(resultFromDispatcherExit({ exitCode: 1, stderr: 'eslint-bad-output\n' })).toEqual({
+      result: SENSOR_RESULT.FAIL,
+      detail: {
+        scriptError: true,
+        exitCode: 1,
+        reason: 'the sensor script exited 1 without a verdict',
+        stderr: 'eslint-bad-output',
+      },
+    });
+  });
+  it('keeps the config-parse-error exit the linter reserves for a broken config', () => {
+    expect(
+      resultFromDispatcherExit({
+        exitCode: 2,
+        stderr: 'config-parse-error: SyntaxError: Unexpected token',
+      }),
+    ).toMatchObject({
+      result: SENSOR_RESULT.INCONCLUSIVE,
+      detail: { exitCode: 2, stderr: 'config-parse-error: SyntaxError: Unexpected token' },
+    });
+  });
+  it('bounds the stderr it keeps so a stack trace per file cannot grow the row', () => {
+    const detail = resultFromDispatcherExit({ exitCode: 1, stderr: 'x'.repeat(5000) }).detail;
+    expect(detail.stderr).toHaveLength(401);
+    expect(detail.stderr.endsWith('\u2026')).toBe(true);
+  });
+  it('omits stderr entirely when the script wrote none', () => {
+    expect(resultFromDispatcherExit({ exitCode: 1, stderr: '   ' }).detail).not.toHaveProperty(
+      'stderr',
+    );
+  });
+});
+
+// The gate finding and the activity note read the SENSOR-level reason, so the
+// per-file reasons are summarized there — the staging run showed 43 files with
+// no reason anywhere on the record.
+describe('dispatcherExitReason', () => {
+  const row = (detail) => ({ file: 'a.ts', detail });
+
+  it('names the one reason a whole sweep hit', () => {
+    const reason = dispatcherExitReason(
+      [
+        row({ toolUnavailable: true, reason: 'eslint is not available here' }),
+        row({ toolUnavailable: true, reason: 'eslint is not available here' }),
+      ],
+      2,
+    );
+    expect(reason).toBe('2 of 2 files: eslint is not available here');
+  });
+  it('counts only the files the contract explained', () => {
+    const reason = dispatcherExitReason(
+      [row({ pass: true }), row({ scriptError: true, reason: 'exited 1' })],
+      2,
+    );
+    expect(reason).toBe('1 of 2 files: exited 1');
+  });
+  it('counts the reasons past the first few instead of listing them all', () => {
+    const rows = ['a', 'b', 'c', 'd'].map((r) => row({ scriptError: true, reason: r }));
+    expect(dispatcherExitReason(rows, 4)).toBe('4 of 4 files: a; b; c (+1 more)');
+  });
+  it('is null when nothing hit a documented exit', () => {
+    expect(dispatcherExitReason([row({ pass: true })], 1)).toBeNull();
+    expect(dispatcherExitReason([], 0)).toBeNull();
   });
 });

@@ -86,6 +86,123 @@ const recordSensorsCoverRunRecords = (sensorsById = {}) =>
     String(sensorsById?.[sensorId]?.matches ?? '').includes(RUN_RECORD_COVERAGE_MARKER),
   );
 
+// A catalog that routes a sensor through its OWN engine sensor dispatcher
+// (`{{INVOKE}} engine sensor-<id>`) authors that dispatcher's documented
+// exit-code contract for the per-sensor script behind it: exit 0 carries the
+// verdict in the stdout JSON, exit 127 is the script reporting that the tool it
+// wraps — or that tool's configuration — could not be used, and any other
+// non-zero exit is a script error that produced no verdict at all. We spawn
+// that script directly, so we stand in for the dispatcher and owe the same
+// reading of its exits. A catalog that authors a DIRECT script invocation
+// (`bun {{HARNESS_DIR}}/tools/aidlc-sensor-<id>.ts`) declares no dispatcher and
+// no reclassification, so its scripts keep the bare exit-code mapping below —
+// which is every catalog that shipped before the dispatcher route. Reading the
+// authored command keeps the switch version-agnostic: it never reads a version
+// string, exactly like the path flag read off `input_schema`.
+const DISPATCHER_SENSOR_COMMAND_RE = /\{\{INVOKE\}\}\s+engine\s+sensor-/;
+const sensorDeclaresDispatcherExitCodes = (sensor) =>
+  DISPATCHER_SENSOR_COMMAND_RE.test(String(sensor?.command ?? ''));
+
+// The exit code a per-sensor script uses to report that its tool or that tool's
+// configuration is unavailable. The dispatcher answers it with a PASS carrying a
+// tool-unavailable note, so an environment without the tool does not read as a
+// finding — the check simply did not run.
+const SCRIPT_EXIT_TOOL_UNAVAILABLE = 127;
+
+// How much of a failing script's stderr is kept on the record: enough to name
+// the breakage, bounded so a script that writes a stack trace per file cannot
+// grow the sensor row without limit.
+const STDERR_EXCERPT_LIMIT = 400;
+
+// How many DISTINCT reasons the sensor-level summary names before it counts the
+// rest. One sweep can span repositories whose tooling fails differently.
+const MAX_SUMMARIZED_REASONS = 3;
+
+const stderrExcerpt = (stderr) => {
+  const text = String(stderr ?? '').trim();
+  if (text.length <= STDERR_EXCERPT_LIMIT) return text;
+  return `${text.slice(0, STDERR_EXCERPT_LIMIT)}…`;
+};
+
+// The first line a per-sensor script writes to stderr before exiting is its own
+// marker (`eslint-unavailable`, `no-eslint-config`, `tsc-unavailable`, …), and
+// it is the ONLY place the missing tool or configuration is named — the
+// dispatcher's own note is the bare string `tool-unavailable`. Reading the
+// marker keeps the reason specific without the runtime knowing any sensor's
+// tool, and an unrecognised marker is still quoted rather than dropped.
+const firstStderrLine = (stderr) =>
+  String(stderr ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line !== '') ?? '';
+
+const MISSING_CONFIG_MARKER_RE = /^no-([\w.-]+)-config$/;
+const UNAVAILABLE_TOOL_MARKER_RE = /^([\w.-]+)-unavailable$/;
+
+const toolUnavailableReason = (stderr) => {
+  const marker = firstStderrLine(stderr);
+  const missingConfig = MISSING_CONFIG_MARKER_RE.exec(marker);
+  if (missingConfig) {
+    return `no ${missingConfig[1]} configuration was found, so the check did not run`;
+  }
+  const unavailableTool = UNAVAILABLE_TOOL_MARKER_RE.exec(marker);
+  if (unavailableTool) {
+    return `${unavailableTool[1]} is not available here, so the check did not run`;
+  }
+  return marker
+    ? `the sensor reported its tool unavailable ("${marker}"), so the check did not run`
+    : 'the sensor reported its tool unavailable, so the check did not run';
+};
+
+// Map ONE non-zero child exit to a verdict under the authored contract. Exit 0
+// is not routed here — the script printed a verdict and that verdict decides —
+// and neither is a timeout or a spawn failure, which produce no exit code.
+//
+// Only the tool-unavailable exit changes a verdict, because only that exit was
+// being read as a finding when the script was reporting it had not run. Every
+// other non-zero exit keeps the verdict the bare mapping already gave it and
+// gains only the detail that was missing: the exit code and a bounded stderr
+// excerpt. So a script error stays the FAIL it was, and the one exit the bare
+// mapping already calls inconclusive stays inconclusive.
+const resultFromDispatcherExit = ({ exitCode, stderr } = {}) => {
+  if (exitCode === SCRIPT_EXIT_TOOL_UNAVAILABLE) {
+    return {
+      result: SENSOR_RESULT.PASS,
+      detail: { toolUnavailable: true, exitCode, reason: toolUnavailableReason(stderr) },
+    };
+  }
+  const excerpt = stderrExcerpt(stderr);
+  return {
+    result: resultFromExit(exitCode),
+    detail: {
+      scriptError: true,
+      exitCode,
+      reason: `the sensor script exited ${exitCode} without a verdict`,
+      ...(excerpt ? { stderr: excerpt } : {}),
+    },
+  };
+};
+
+// The gate finding and the activity note read the SENSOR-level `detail.reason`,
+// not the per-file rows, so a sweep that only reached tool-unavailable passes —
+// or script errors that produced no verdict — has to say so there as well. That
+// is the path a human sees; without it the verdict carries no reason at all.
+const dispatcherExitReason = (fileResults = [], total = 0) => {
+  const reasons = [];
+  let affected = 0;
+  for (const row of fileResults) {
+    const detail = row?.detail;
+    if (!detail?.reason) continue;
+    if (detail.toolUnavailable !== true && detail.scriptError !== true) continue;
+    affected += 1;
+    if (!reasons.includes(detail.reason)) reasons.push(detail.reason);
+  }
+  if (reasons.length === 0) return null;
+  const shown = reasons.slice(0, MAX_SUMMARIZED_REASONS);
+  const rest = reasons.length - shown.length;
+  return `${affected} of ${total} files: ${shown.join('; ')}${rest > 0 ? ` (+${rest} more)` : ''}`;
+};
+
 // The run-record naming convention: `<artifact>-timestamp[.md]`.
 const TIMESTAMP_MARKER_RE = /-timestamp(?:\.md)?$/;
 
@@ -520,12 +637,16 @@ export {
   FILE_PATH_FLAG,
   OUTPUT_PATH_FLAG,
   recordSensorsCoverRunRecords,
+  sensorDeclaresDispatcherExitCodes,
+  SCRIPT_EXIT_TOOL_UNAVAILABLE,
   sensorKind,
   sensorPathFlag,
   scriptTimeoutBound,
   severityGate,
   validateScriptSpec,
   resultFromExit,
+  resultFromDispatcherExit,
+  dispatcherExitReason,
   buildScriptArgv,
   evalRequiredSections,
   evalUpstreamCoverage,
@@ -542,12 +663,16 @@ export default {
   FILE_PATH_FLAG,
   OUTPUT_PATH_FLAG,
   recordSensorsCoverRunRecords,
+  sensorDeclaresDispatcherExitCodes,
+  SCRIPT_EXIT_TOOL_UNAVAILABLE,
   sensorKind,
   sensorPathFlag,
   scriptTimeoutBound,
   severityGate,
   validateScriptSpec,
   resultFromExit,
+  resultFromDispatcherExit,
+  dispatcherExitReason,
   buildScriptArgv,
   evalRequiredSections,
   evalUpstreamCoverage,

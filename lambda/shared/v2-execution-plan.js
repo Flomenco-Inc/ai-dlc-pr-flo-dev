@@ -36,6 +36,7 @@ import { stageSkipBlockReason } from './stage-skip.js';
 import {
   FILE_PATH_FLAG,
   recordSensorsCoverRunRecords,
+  sensorDeclaresDispatcherExitCodes,
   sensorKind,
   sensorPathFlag,
 } from './v2-sensor-contract.js';
@@ -265,6 +266,15 @@ const resolveSensors = (
         // has no gate plane and runs every sensor in its one pass, so a SYSTEM
         // seed or a user block that authors the field must not change its plan.
         ...(policyEnabled && sensor.fireOn ? { fireOn: sensor.fireOn } : {}),
+        // The exit-code contract this catalog authors for the script behind the
+        // sensor, read from the invocation it declares. Emitted ONLY when the
+        // catalog routes the sensor through its own engine dispatcher AND the
+        // run is release-pinned, so an unpinned run — which has no release
+        // dispatcher to stand in for — and every catalog that invokes its
+        // scripts directly keep a byte-identical plan.
+        ...(policyEnabled && sensorDeclaresDispatcherExitCodes(sensor)
+          ? { dispatcherExitCodes: true }
+          : {}),
         // Whether this catalog's record sensors cover run records. Emitted only
         // when they claim that coverage, so a catalog that does not keeps a
         // byte-identical plan and keeps the heading floor.

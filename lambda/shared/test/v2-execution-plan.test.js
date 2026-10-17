@@ -390,6 +390,44 @@ describe('buildExecutionPlan — plan shape', () => {
     });
   });
 
+  // The exit-code contract a catalog authors by routing its sensors through its
+  // own engine dispatcher. It rides the plan so the runtime reads the authored
+  // invocation instead of re-deriving it, and an unpinned run — which has no
+  // release dispatcher to stand in for — keeps a byte-identical plan.
+  describe('dispatcher exit-code contract', () => {
+    const planFor = ({ command, policyEnabled }) =>
+      buildExecutionPlan({
+        workflow: workflow([placement('a')]),
+        scope: 'feature',
+        library: baseLibrary({
+          ...(policyEnabled ? { fromRelease: true } : {}),
+          stagesById: { a: stage('a', { sensors: ['linter'] }) },
+          sensorsById: { linter: { command, runtime: 'bun', matches: '**/*.{ts,js}' } },
+        }),
+      }).plan.stages[0].sensors[0];
+
+    it('rides the plan for a release that routes the sensor through its dispatcher', () => {
+      expect(
+        planFor({ command: '{{INVOKE}} engine sensor-linter', policyEnabled: true }),
+      ).toMatchObject({ dispatcherExitCodes: true });
+    });
+
+    it('is absent for the direct invocation every earlier release authors', () => {
+      expect(
+        planFor({
+          command: 'bun {{HARNESS_DIR}}/tools/aidlc-sensor-linter.ts',
+          policyEnabled: true,
+        }),
+      ).not.toHaveProperty('dispatcherExitCodes');
+    });
+
+    it('is absent without a release policy, whatever the command says', () => {
+      expect(
+        planFor({ command: '{{INVOKE}} engine sensor-linter', policyEnabled: false }),
+      ).not.toHaveProperty('dispatcherExitCodes');
+    });
+  });
+
   // A document sensor declares `output_path`, so it must not be spawned with
   // the code sensors' `--file-path`. The flag is resolved on the plan, and only
   // when the authored contract moves it — a catalog that authors none, and a

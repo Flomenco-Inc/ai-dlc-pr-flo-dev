@@ -556,6 +556,7 @@ module "api" {
   source = "./modules/api"
 
   aws_sdk_ua_app_id                        = local.aws_sdk_ua_app_id
+  credential_broker_role_arn               = module.lambda.credential_broker_role_arn
   project_name                             = var.project_name
   environment                              = var.environment
   powertools_service_name                  = local.powertools_service_name

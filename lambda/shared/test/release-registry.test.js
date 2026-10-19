@@ -2250,9 +2250,9 @@ describe('a 2.9.0 whose developer persona carries the engine command', () => {
 // those files really carry. Publication, registration, promotion and every
 // offered scope's pinned plan all run against that closure.
 //
-// The two halves of the support claim are asserted together, because either one
-// alone would be a misleading result: it PROMOTES as selectable with nothing
-// unhonoured, and it REFUSES to be certified.
+// It promotes with nothing unhonoured, and it promotes the whole way an
+// administrator may take it: `selectable`, then `certified`, then the `stable`
+// channel.
 describe('a deployment admitting the real AI-DLC 2.11.0', () => {
   const PROFILE = 'v2.11.0';
   const SHA = '6a378b53c0a4fe0641ed7d8de8dfff94264d5b6a';
@@ -2344,20 +2344,38 @@ describe('a deployment admitting the real AI-DLC 2.11.0', () => {
     expect(Object.keys(resolved.library.scopesById)).toHaveLength(11);
   });
 
-  // The single most important assertion of this change: promotable and usable
-  // must not come to mean certified. The engine families above are ANSWERED,
-  // not reproduced, so the profile declares `selectable` as its ceiling.
-  it('refuses to be certified, naming the withheld claim', async () => {
-    await expect(promote('certified')).rejects.toMatchObject({
-      code: 'release_certification_withheld',
-      details: { maxSupportState: 'selectable' },
+  // 2.11 is in the same answered-not-reproduced situation as 2.8.2 and 2.9.0,
+  // which stay certifiable: whether the published handled/approximated/refused
+  // table justifies the claim is the administrator's decision, not the
+  // registry's, so `certified` and the `stable` channel it unlocks must both be
+  // reachable.
+  it('promotes to certified, like 2.9.0', async () => {
+    const certified = await promote('certified');
+
+    expect(certified.supportState).toBe('certified');
+    expect(certified.certifiedBy).toBe('admin-1');
+    expect(certified.certifiedAt).toEqual(expect.any(String));
+  });
+
+  it('may be pointed at by the stable channel once certified', async () => {
+    const certified = await promote('certified');
+    await updateRelease({
+      ...registryArgs(),
+      s3,
+      bucket: BUCKET,
+      releaseId,
+      expectedRevision: certified.revision,
+      patch: { visible: true },
+      actor: 'admin-1',
     });
 
-    expect(AIDLC_COMPATIBILITY_PROFILES[PROFILE].maxSupportState).toBe('selectable');
-    // Every other release keeps its own ceiling, which is no ceiling at all.
-    for (const [id, profile] of Object.entries(AIDLC_COMPATIBILITY_PROFILES)) {
-      if (id !== PROFILE) expect(profile.maxSupportState ?? null).toBeNull();
-    }
+    const stable = await setChannel({
+      ...registryArgs(),
+      channel: 'stable',
+      releaseId,
+      expectedRevision: null,
+    });
+    expect(stable.releaseId).toBe(releaseId);
   });
 
   it('still refuses an intermediate release nobody onboarded', async () => {
@@ -2405,13 +2423,12 @@ describe('a deployment admitting the real AI-DLC 2.11.0', () => {
         runnable: false,
       });
       // The fork borrows the 2.11 PARSING dialect and nothing else: not the
-      // trust tier, not the support state, not the certification ceiling.
+      // trust tier, not the support state.
       expect(forkProfile).toMatchObject({
         baseProfileId: PROFILE,
         frontmatterDialect: AIDLC_COMPATIBILITY_PROFILES[PROFILE].frontmatterDialect,
         trustTier: 'T0',
       });
-      expect(forkProfile.maxSupportState ?? null).toBeNull();
       expect(release.unhonouredValues).toEqual([]);
 
       const promoted = await updateRelease({

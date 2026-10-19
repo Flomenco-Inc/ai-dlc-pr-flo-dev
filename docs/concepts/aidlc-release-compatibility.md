@@ -198,12 +198,11 @@ not a version allowlist, and the report's Boolean is not treated as durable
 authorization by itself: the release-promotion guard stores the authored
 fidelity gaps and reevaluates them against the handlers in the running build.
 
-A profile may additionally declare a support **ceiling**. 2.11.0 declares
-`selectable`: it is promotable and usable, and `certified` is refused with
-`release_certification_withheld`. The eleven engine commands below are answered,
-not reproduced, and a release that answers behaviour it does not reproduce is
-not a certified reproduction of its source. No other profile declares a ceiling,
-so none of their promotions changed.
+2.11.0 promotes exactly as 2.8.2 and 2.9.0 do: an admin may make it
+`selectable`, and `certified` — and so eligible for the `stable` channel — if
+they decide to. The engine commands below are answered, not reproduced, which is
+the same situation 2.8.2 and 2.9.0 are already in; whether that is a claim worth
+making is the administrator's call, taken with the table below in hand.
 
 ### AI-DLC 2.11.0: handled, approximated, refused
 
@@ -358,8 +357,7 @@ fork as follows. Every step is explicit; none happens on its own.
 3. In the admin AI-DLC releases tab, register the published release. Check its
    unhonoured values: a release with any cannot be promoted, and the list says
    which behavior this build is missing.
-4. Set its support state to `selectable` (or `certified`, where the profile
-   declares no lower ceiling — 2.11.0 declares `selectable`), then make it
+4. Set its support state to `selectable` (or `certified`), then make it
    visible. Each step re-checks the release against this build.
 5. Optionally point a channel at it. `stable` makes it the default for new
    intents; it requires `certified` unless the release is the platform baseline.

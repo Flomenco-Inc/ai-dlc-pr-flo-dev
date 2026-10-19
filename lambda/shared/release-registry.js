@@ -919,21 +919,6 @@ const updateRelease = async ({
     next.notes = patch.notes;
   }
 
-  // A release whose profile declares a support ceiling refuses the claim above
-  // it. The only such ceiling today is 2.11's `selectable`: it is promotable and
-  // usable, and it is not a certified reproduction of the engine families its
-  // prompts invoke. Refusing here rather than in the analyzer means an admin
-  // cannot make the claim by mistake, and a release with no declared ceiling is
-  // unaffected.
-  const ceiling = profileFor(current.profileId)?.maxSupportState ?? null;
-  if (patch.supportState === 'certified' && ceiling === 'selectable') {
-    throw new ReleaseRegistryError(
-      'release_certification_withheld',
-      `release-registry: ${current.releaseId} is supported as selectable and cannot be certified — engine behaviour it invokes is answered but not reproduced`,
-      { details: { releaseId: current.releaseId, maxSupportState: ceiling } },
-    );
-  }
-
   const supportStatePromotion =
     patch.supportState !== undefined && SELECTABLE_SUPPORT_STATES.includes(next.supportState);
   const visibilityPromotion =

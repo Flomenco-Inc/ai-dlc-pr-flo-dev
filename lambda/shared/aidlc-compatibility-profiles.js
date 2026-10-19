@@ -71,11 +71,13 @@ const AIDLC_COMPATIBILITY_PROFILES = Object.freeze({
     trustTier: 'T1',
     currentPlatformBaseline: false,
   }),
-  // 2.11.0 is promotable as `selectable` and never as `certified`: the engine
-  // families it invokes that this runtime refuses stay `unsupported` in the
-  // fidelity report, so `readyForCertification` is false by construction. What
-  // it supports, approximates and refuses is published in
-  // docs/concepts/aidlc-release-compatibility.md. No intermediate release
+  // 2.11.0 promotes exactly like 2.8.2 and 2.9.0: an admin may make it
+  // `selectable`, and `certified` if they decide to. It invokes engine commands
+  // this runtime answers without reproducing — the same answered-not-reproduced
+  // situation those two releases are already in — and what it supports,
+  // approximates and refuses is published in
+  // docs/concepts/aidlc-release-compatibility.md, which is the table the
+  // administrator holds when they make that call. No intermediate release
   // (2.10.0) is admitted — an unknown profile stays `release_profile_unknown`.
   'v2.11.0': Object.freeze({
     id: 'v2.11.0',
@@ -89,17 +91,6 @@ const AIDLC_COMPATIBILITY_PROFILES = Object.freeze({
     frontmatterDialect: 'invoke-template-v1',
     trustTier: 'T1',
     currentPlatformBaseline: false,
-    // The declared support CEILING. 2.11 invokes eleven engine commands this
-    // runtime refuses — the parked-worktree verbs, the mid-run settings write,
-    // the protected checkpoint receipts, the construction-scheduling writes,
-    // the project-type transaction and the approved-bundle restore. Each has a
-    // named answer in the dialect annex, which is what makes the release
-    // honestly RUNNABLE; none is a reproduction, which is what makes it
-    // honestly NOT certified. Stating the ceiling as data means the registry
-    // refuses the claim instead of an admin having to know not to make it, and
-    // it says nothing about any other release: a profile without this key
-    // promotes exactly as it does today.
-    maxSupportState: 'selectable',
   }),
 });
 

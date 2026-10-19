@@ -145,7 +145,7 @@ import {
   createAttachmentCleanupService,
   pendingAttachmentDeletions,
   validateAttachmentDescriptor,
-} from '../shared/intent-attachments.js';
+} from './attachments.js';
 import {
   GATE_CHOICES,
   LOOP_BACK_OPTION,

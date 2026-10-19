@@ -34,6 +34,7 @@ import {
   PutCommand,
   QueryCommand,
   TransactWriteCommand,
+  UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import {
   AIDLC_RELEASE_IMPORTER_REVISION,
@@ -404,17 +405,21 @@ const listReleases = async ({ ddb, tableName, visibleOnly = false, s3 = null, bu
   await mapWithConcurrency(staleOrder, RELEASE_LIST_EVIDENCE_CONCURRENCY, async (index) => {
     if (remaining <= 0 || Date.now() >= deadline) return;
     const item = sortedItems[index];
+    // The turn is claimed BEFORE the read: a read that never returns (a stalled
+    // S3 request, a Lambda killed at its timeout) still moves the row behind the
+    // others, and a concurrent listing stops picking the same row.
+    await recordFidelityEvidenceAttempt({ ddb, tableName, item });
     const fidelityGaps = await fidelityGapsForRecord({
       release: item,
       s3,
       bucket,
       requireCurrentEvidence: true,
     }).catch(() => null);
+    // A failure caches nothing: the row is answered as unverified (no gaps, no
+    // verdict), which the admin view shows as such, and stays stale in storage.
     if (fidelityGaps) {
       remaining -= 1;
       await cacheFidelityEvidence({ ddb, tableName, item, fidelityGaps });
-    } else {
-      await recordFidelityEvidenceAttempt({ ddb, tableName, item });
     }
     recomputed.set(index, {
       ...projected[index],
@@ -759,7 +764,8 @@ const fidelityGapsForRecord = async ({ release, s3, bucket, requireCurrentEviden
  * Every write failure is swallowed: this runs inside `GET /aidlc-releases`, which
  * must keep answering with the evidence it just computed whether or not the cache
  * could be filled. A record whose closure can never be verified never reaches
- * this function; `recordFidelityEvidenceAttempt` is what moves it aside.
+ * this function; the attempt marker `recordFidelityEvidenceAttempt` wrote before
+ * the read is what moves it aside. A successful verification drops that marker.
  */
 const cacheFidelityEvidence = async ({ ddb, tableName, item, fidelityGaps }) => {
   if (typeof item.revision !== 'number') return;
@@ -795,8 +801,8 @@ const lastFidelityEvidenceAttempt = (release) =>
     : '';
 
 /**
- * Records that a row's closure could not be verified, so the next listing starts
- * behind it rather than on it.
+ * Records that the listing is about to try a row's closure, so the next listing
+ * starts behind it rather than on it, whether this attempt fails or never returns.
  *
  * This writes no evidence: `fidelityGaps` and `fidelityEvidenceRevision` are left
  * exactly as they were, so a failed verification is never stored as a verdict and
@@ -808,12 +814,16 @@ const lastFidelityEvidenceAttempt = (release) =>
 const recordFidelityEvidenceAttempt = async ({ ddb, tableName, item }) => {
   if (typeof item.revision !== 'number') return;
   try {
+    // An update of the one field, never a re-put of the listing's snapshot, so
+    // the marker cannot overwrite evidence another listing has just cached.
     await ddb.send(
-      new PutCommand({
+      new UpdateCommand({
         TableName: tableName,
-        Item: { ...item, [FIDELITY_EVIDENCE_ATTEMPT_FIELD]: nowIso() },
+        Key: { pk: item.pk, sk: item.sk },
+        UpdateExpression: 'SET #attempt = :now',
         ConditionExpression: 'revision = :expected',
-        ExpressionAttributeValues: { ':expected': item.revision },
+        ExpressionAttributeNames: { '#attempt': FIDELITY_EVIDENCE_ATTEMPT_FIELD },
+        ExpressionAttributeValues: { ':expected': item.revision, ':now': nowIso() },
       }),
     );
   } catch (error) {

@@ -16,6 +16,7 @@ import {
   PutCommand,
   QueryCommand,
   TransactWriteCommand,
+  UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { customProfile, filesFromCompatibilityFixture } from '../aidlc-compatibility.js';
 import {
@@ -180,6 +181,15 @@ const installFakes = () => {
     const key = keyOf(input.Item.pk, input.Item.sk);
     if (!conditionHolds(input, rows.get(key))) throw conditionalCheckFailed();
     rows.set(key, { ...input.Item });
+    return {};
+  });
+  // The listing's attempt marker is the only UpdateCommand: one SET of one field.
+  ddbMock.on(UpdateCommand).callsFake((input) => {
+    const key = keyOf(input.Key.pk, input.Key.sk);
+    const existing = rows.get(key);
+    if (!conditionHolds(input, existing)) throw conditionalCheckFailed();
+    const field = input.ExpressionAttributeNames['#attempt'];
+    rows.set(key, { ...existing, [field]: input.ExpressionAttributeValues[':now'] });
     return {};
   });
   ddbMock.on(QueryCommand).callsFake((input) => {
@@ -2566,7 +2576,11 @@ describe('admin listing of a record registered before protocol evidence existed'
     const listed = releases.find((release) => release.releaseId === CANDIDATE_RELEASE_ID);
     expect(listed.unhonouredValues).toEqual([]);
     expect(listed.fidelityGaps).not.toContainEqual(UNPRODUCIBLE_GAP);
-    expect(rows.get(key)).toEqual(stale);
+    // No evidence was stored: the row is what it was, plus the attempt marker the
+    // listing claimed its turn with before reading the closure.
+    const { fidelityEvidenceAttemptedAt, ...unchanged } = rows.get(key);
+    expect(typeof fidelityEvidenceAttemptedAt).toBe('string');
+    expect(unchanged).toEqual(stale);
   });
 });
 
@@ -2734,5 +2748,57 @@ describe('admin listing with a stale row whose closure cannot be verified', () =
     await list();
 
     expect(migrated().length).toBe(RELEASE_LIST_EVIDENCE_BUDGET);
+  });
+
+  // A read that never returns (a stalled request, a Lambda killed at its
+  // timeout) records nothing after it. The turn is therefore claimed before the
+  // read, so the next listing starts on another row.
+  it('claims a row before reading it, so a read that never returns does not hold the next listing', async () => {
+    const catalogOf = (profileId) => bundles.get(profileId).manifest.catalog.key;
+    const firstReads = [];
+    let reads = [];
+    s3Mock.on(GetObjectCommand).callsFake((input) => {
+      const profileId = PAGE_PROFILES.find((candidate) => catalogOf(candidate) === input.Key);
+      if (profileId) reads.push(profileId);
+      if (profileId === BROKEN_PROFILE) return new Promise(() => {});
+      if (!objects.has(input.Key)) throw noSuchKey();
+      return { Body: { transformToString: async () => objects.get(input.Key) } };
+    });
+
+    for (let call = 0; call < 3; call += 1) {
+      reads = [];
+      void list();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      firstReads.push(reads[0]);
+    }
+
+    expect(firstReads[0]).toBe(BROKEN_PROFILE);
+    expect(firstReads.slice(1)).not.toContain(BROKEN_PROFILE);
+  });
+
+  // Two admins listing at once: one listing caches evidence for a row while the
+  // other fails to read the same row. The attempt marker is a one-field update,
+  // so the failure cannot overwrite the evidence the first listing stored.
+  it('never lets a failed attempt overwrite evidence a concurrent listing cached', async () => {
+    const catalogKey = bundles.get(BROKEN_PROFILE).manifest.catalog.key;
+    let catalogReads = 0;
+    s3Mock.on(GetObjectCommand).callsFake(async (input) => {
+      if (input.Key === catalogKey) {
+        catalogReads += 1;
+        if (catalogReads === 2) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          throw noSuchKey();
+        }
+      }
+      if (!objects.has(input.Key)) throw noSuchKey();
+      return { Body: { transformToString: async () => objects.get(input.Key) } };
+    });
+
+    await Promise.all([list(), list()]);
+
+    expect(catalogReads).toBe(2);
+    expect(rows.get(rowKeyOf(BROKEN_PROFILE)).fidelityEvidenceRevision).toBe(
+      FIDELITY_EVIDENCE_REVISION,
+    );
   });
 });

@@ -20,9 +20,10 @@
 // zero-padded upstream version so a lexicographic index scan is also a version
 // ordering. Every mutation is a compare-and-swap on an integer `revision`, so
 // two concurrent admins cannot silently clobber one another's decision. The one
-// deliberate exception is the fidelity-evidence cache (`cacheFidelityEvidence`):
-// it is still CAS-guarded on `revision`, but it does NOT bump it, because what it
-// writes is derived from an immutable closure rather than decided by anyone.
+// deliberate exceptions are the fidelity-evidence writes the admin listing makes
+// (`cacheFidelityEvidence` and `recordFidelityEvidenceAttempt`): both are still
+// CAS-guarded on `revision`, but neither bumps it, because what they write is
+// derived from an immutable closure rather than decided by anyone.
 //
 // Clients are injected (shared/ is a leaf foundation, see .dependency-cruiser.cjs).
 
@@ -366,35 +367,51 @@ const listReleases = async ({ ddb, tableName, visibleOnly = false, s3 = null, bu
   // verified at all. A row past either is reported as it is stored, already
   // marked `fidelityEvidenceStale` by `releaseToApi`, and is left untouched so a
   // later call recomputes it. Charging a failure would be the end of the
-  // backlog's convergence: the page order is deterministic, so the same
-  // unverifiable row would spend the budget on every call.
+  // backlog's convergence: the same unverifiable row would spend the budget on
+  // every call.
+  //
+  // Neither bound is enough on its own, because the page order is deterministic:
+  // a row whose read fails only after spending the whole wall clock would be
+  // attempted first on every call and leave every row behind it unattempted for
+  // good. So stale rows are attempted least-recently-ATTEMPTED first rather than
+  // in page order, and a failed attempt is recorded on the row. The rotation is
+  // therefore persisted state, not per-call state: it survives a cold start, and
+  // two concurrent listings converge on it rather than racing on one row. The
+  // answer itself stays in page order.
   const deadline = Date.now() + RELEASE_LIST_EVIDENCE_BUDGET_MS;
   let remaining = RELEASE_LIST_EVIDENCE_BUDGET;
-  return mapWithConcurrency(
-    projected,
-    RELEASE_LIST_EVIDENCE_CONCURRENCY,
-    async (release, index) => {
-      const item = sortedItems[index];
-      if (hasCurrentFidelityEvidence(item)) return release;
-      if (remaining <= 0 || Date.now() >= deadline) return release;
-      const fidelityGaps = await fidelityGapsForRecord({
-        release: item,
-        s3,
-        bucket,
-        requireCurrentEvidence: true,
-      }).catch(() => null);
-      if (fidelityGaps) {
-        remaining -= 1;
-        await cacheFidelityEvidence({ ddb, tableName, item, fidelityGaps });
-      }
-      return {
-        ...release,
-        fidelityGaps,
-        unhonouredValues: fidelityGaps ? unhonouredValues({ fidelityGaps }) : null,
-        fidelityEvidenceStale: false,
-      };
-    },
-  );
+  const staleOrder = [...sortedItems.keys()]
+    .filter((index) => !hasCurrentFidelityEvidence(sortedItems[index]))
+    .toSorted(
+      (left, right) =>
+        lastFidelityEvidenceAttempt(sortedItems[left]).localeCompare(
+          lastFidelityEvidenceAttempt(sortedItems[right]),
+        ) || left - right,
+    );
+  const recomputed = new Map();
+  await mapWithConcurrency(staleOrder, RELEASE_LIST_EVIDENCE_CONCURRENCY, async (index) => {
+    if (remaining <= 0 || Date.now() >= deadline) return;
+    const item = sortedItems[index];
+    const fidelityGaps = await fidelityGapsForRecord({
+      release: item,
+      s3,
+      bucket,
+      requireCurrentEvidence: true,
+    }).catch(() => null);
+    if (fidelityGaps) {
+      remaining -= 1;
+      await cacheFidelityEvidence({ ddb, tableName, item, fidelityGaps });
+    } else {
+      await recordFidelityEvidenceAttempt({ ddb, tableName, item });
+    }
+    recomputed.set(index, {
+      ...projected[index],
+      fidelityGaps,
+      unhonouredValues: fidelityGaps ? unhonouredValues({ fidelityGaps }) : null,
+      fidelityEvidenceStale: false,
+    });
+  });
+  return projected.map((release, index) => recomputed.get(index) ?? release);
 };
 
 const assertRegistryStorage = (s3, bucket) => {
@@ -729,21 +746,65 @@ const fidelityGapsForRecord = async ({ release, s3, bucket, requireCurrentEviden
  * Every write failure is swallowed: this runs inside `GET /aidlc-releases`, which
  * must keep answering with the evidence it just computed whether or not the cache
  * could be filled. A record whose closure can never be verified never reaches
- * this function, so it simply stays uncached and is re-attempted each listing.
+ * this function; `recordFidelityEvidenceAttempt` is what moves it aside.
  */
 const cacheFidelityEvidence = async ({ ddb, tableName, item, fidelityGaps }) => {
   if (typeof item.revision !== 'number') return;
+  const verified = { ...item, fidelityGaps, fidelityEvidenceRevision: FIDELITY_EVIDENCE_REVISION };
+  delete verified[FIDELITY_EVIDENCE_ATTEMPT_FIELD];
   try {
     await ddb.send(
       new PutCommand({
         TableName: tableName,
-        Item: { ...item, fidelityGaps, fidelityEvidenceRevision: FIDELITY_EVIDENCE_REVISION },
+        Item: verified,
         ConditionExpression: 'revision = :expected',
         ExpressionAttributeValues: { ':expected': item.revision },
       }),
     );
   } catch (error) {
     logger.info('release fidelity evidence cache write failed; leaving the row stale', {
+      releaseId: item.releaseId,
+      revision: item.revision,
+      error: error?.name ?? 'Error',
+    });
+  }
+};
+
+// When the admin listing last TRIED to re-verify a row's closure and could not.
+// It is not evidence and says nothing about the release: it is only what orders
+// the backlog, so a row that cannot be read moves to the back of it instead of
+// being retried first on every call.
+const FIDELITY_EVIDENCE_ATTEMPT_FIELD = 'fidelityEvidenceAttemptedAt';
+
+const lastFidelityEvidenceAttempt = (release) =>
+  typeof release[FIDELITY_EVIDENCE_ATTEMPT_FIELD] === 'string'
+    ? release[FIDELITY_EVIDENCE_ATTEMPT_FIELD]
+    : '';
+
+/**
+ * Records that a row's closure could not be verified, so the next listing starts
+ * behind it rather than on it.
+ *
+ * This writes no evidence: `fidelityGaps` and `fidelityEvidenceRevision` are left
+ * exactly as they were, so a failed verification is never stored as a verdict and
+ * every reader keeps treating the row as stale. Like `cacheFidelityEvidence` it is
+ * CAS-guarded on `revision` without bumping it or touching the audit trail, and
+ * every failure is swallowed — the listing must still answer. A row whose marker
+ * cannot be written is simply re-attempted, which is the behaviour this replaces.
+ */
+const recordFidelityEvidenceAttempt = async ({ ddb, tableName, item }) => {
+  if (typeof item.revision !== 'number') return;
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: tableName,
+        Item: { ...item, [FIDELITY_EVIDENCE_ATTEMPT_FIELD]: nowIso() },
+        ConditionExpression: 'revision = :expected',
+        ExpressionAttributeValues: { ':expected': item.revision },
+      }),
+    );
+  } catch (error) {
+    logger.info('release fidelity evidence attempt write failed; row keeps its place', {
       releaseId: item.releaseId,
       revision: item.revision,
       error: error?.name ?? 'Error',

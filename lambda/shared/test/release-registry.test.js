@@ -2629,6 +2629,49 @@ describe('admin listing with a stale row whose closure cannot be verified', () =
     );
   });
 
+  // The failure in front of the page can also be SLOW: a read that spends the
+  // whole wall-clock budget before failing. Nothing behind it is then even
+  // attempted, so a listing that restarts at the same first stale row on every
+  // call would park every later row at its stored evidence for good — one call's
+  // bounds would become the permanent end of the backlog.
+  it('gives a later stale row its turn when the first row fails on the full clock', async () => {
+    breakClosure(BROKEN_PROFILE);
+    const brokenCatalogKey = bundles.get(BROKEN_PROFILE).manifest.catalog.key;
+    let clock = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    s3Mock.on(GetObjectCommand).callsFake((input) => {
+      if (!objects.has(input.Key)) {
+        if (input.Key === brokenCatalogKey) clock += RELEASE_LIST_EVIDENCE_BUDGET_MS;
+        throw noSuchKey();
+      }
+      return { Body: { transformToString: async () => objects.get(input.Key) } };
+    });
+
+    // Each listing is its own request, so each one starts with a full budget.
+    let listed = [];
+    for (let call = 0; call < 3; call += 1) {
+      clock = 0;
+      listed = await list();
+    }
+
+    // A healthy row behind the failure has current evidence by now.
+    const healthy = migrated();
+    expect(healthy.length).toBeGreaterThan(0);
+    for (const profileId of healthy) {
+      expect(rows.get(rowKeyOf(profileId)).fidelityGaps).not.toContainEqual(UNPRODUCIBLE_GAP);
+      const release = listed.find(
+        (candidate) => candidate.releaseId === AIDLC_COMPATIBILITY_PROFILES[profileId].releaseId,
+      );
+      expect(release.fidelityEvidenceStale).toBe(false);
+      expect(release.fidelityGaps).not.toContainEqual(UNPRODUCIBLE_GAP);
+    }
+
+    // The row that could not be read is never recorded as verified.
+    expect(healthy).not.toContain(BROKEN_PROFILE);
+    expect(rows.get(rowKeyOf(BROKEN_PROFILE))).not.toHaveProperty('fidelityEvidenceRevision');
+    expect(rows.get(rowKeyOf(BROKEN_PROFILE)).fidelityGaps).toContainEqual(UNPRODUCIBLE_GAP);
+  });
+
   it('spends the budget, not the clock, when every closure can be verified', async () => {
     const step = RELEASE_LIST_EVIDENCE_BUDGET_MS;
     let clock = 0;

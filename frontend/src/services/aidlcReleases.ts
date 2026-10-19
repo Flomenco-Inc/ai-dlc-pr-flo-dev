@@ -28,7 +28,7 @@ export const SELECTABLE_SUPPORT_STATES: readonly ReleaseSupportState[] = [
 // Two projections share this shape: platform admins get the full record, while
 // a non-admin GET /aidlc-releases returns only the selection fields (releaseId,
 // upstreamVersion, upstreamChannel, profileId, supportState, trustTier,
-// visible, runnable, certifiedAt). Everything else is therefore optional —
+// visible, runnable, certifiedAt, constructionAutonomy). Everything else is therefore optional —
 // selection UIs (NewIntentPage) must not rely on the admin-only fields.
 export interface AidlcRelease {
   releaseId: string;
@@ -54,6 +54,9 @@ export interface AidlcRelease {
   // starts import-only and becomes runnable only when an admin promotes it
   // through the same fidelity guard as an official release.
   runnable: boolean;
+  // Whether the release authors the construction autonomy protocol, so an
+  // intent pinned to it may be created with an autonomous grant.
+  constructionAutonomy?: boolean;
   notes?: string | null;
   registeredAt?: string | null;
   registeredBy?: string | null;

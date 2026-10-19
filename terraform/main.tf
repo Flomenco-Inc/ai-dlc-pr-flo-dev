@@ -66,6 +66,13 @@ locals {
   dns_suffix              = data.aws_partition.current.dns_suffix
   powertools_service_name = "collaborative-aidlc"
 
+  # Use the existing application release version as the SDK application ID.
+  # Powertools appends ~43 chars to AWS_SDK_UA_APP_ID at import unless the value
+  # already contains "/PTEnv/", which would exceed the SDK's 50-char limit and
+  # log a warning on every SDK call. Remove the suffix once Powertools leaves room.
+  # See https://github.com/aws-powertools/powertools-lambda-typescript/issues/5815
+  aws_sdk_ua_app_id = "Collaborative_AI-DLC-${jsondecode(file("${path.module}/../package.json")).version}/PTEnv/"
+
   # Bedrock inference may live outside the deployment region (regional API keys
   # or model access). The runtime CLIs and the model picker share this value.
   bedrock_region = coalesce(var.bedrock_region, var.aws_region)
@@ -295,15 +302,17 @@ module "waf" {
     aws.us_east_1 = aws.us_east_1
   }
 
-  enabled      = var.enable_waf
-  project_name = var.project_name
-  environment  = var.environment
+  enabled                  = var.enable_waf
+  project_name             = var.project_name
+  environment              = var.environment
+  cloudfront_origin_secret = module.frontend.cloudfront_origin_secret
 }
 
 # Auth (Cognito)
 module "auth" {
   source = "./modules/auth"
 
+  aws_sdk_ua_app_id       = local.aws_sdk_ua_app_id
   project_name            = var.project_name
   environment             = var.environment
   powertools_service_name = local.powertools_service_name
@@ -462,6 +471,7 @@ module "neptune" {
 module "lambda" {
   source = "./modules/api/lambda"
 
+  aws_sdk_ua_app_id           = local.aws_sdk_ua_app_id
   project_name                = var.project_name
   environment                 = var.environment
   powertools_service_name     = local.powertools_service_name
@@ -545,9 +555,7 @@ module "lambda" {
 module "api" {
   source = "./modules/api"
 
-
-  v2_executions_table_name = module.agentcore.v2_executions_table_name
-
+  aws_sdk_ua_app_id                        = local.aws_sdk_ua_app_id
   project_name                             = var.project_name
   environment                              = var.environment
   powertools_service_name                  = local.powertools_service_name
@@ -612,14 +620,13 @@ module "api" {
   agentcore_runtime_arn                    = module.agentcore.runtime_arn
   bedrock_region                           = local.bedrock_region
   agent_credential_grant_secret_param_name = aws_ssm_parameter.agent_credential_grant_secret.name
+  v2_executions_table_name                 = module.agentcore.v2_executions_table_name
   environment_registry_table_name          = module.dynamodb.environment_registry_table_name
   runtime_compatibility_version            = module.agentcore.runtime_compatibility_version
   private_subnet_ids                       = module.networking.private_subnet_ids
   lambda_security_group_ids                = [module.lambda.lambda_security_group_id]
   neptune_endpoint                         = module.neptune.cluster_endpoint
   cors_allowed_origins                     = local.cors_allowed_origins
-  cloudfront_origin_secret                 = module.frontend.cloudfront_origin_secret
-  enable_cloudfront_origin_policy          = false
   # Pass a non-deprecated attribute (the account's CloudWatch role ARN, not the
   # deprecated `.id`). The value itself is unused — the api module interpolates it
   # into the stage description to create an implicit dependency so the stage waits
@@ -631,6 +638,7 @@ module "api" {
 module "realtime" {
   source = "./modules/realtime"
 
+  aws_sdk_ua_app_id       = local.aws_sdk_ua_app_id
   project_name            = var.project_name
   environment             = var.environment
   powertools_service_name = local.powertools_service_name
@@ -653,6 +661,7 @@ module "realtime" {
 module "yjs_server" {
   source = "./modules/realtime/yjs-server"
 
+  aws_sdk_ua_app_id             = local.aws_sdk_ua_app_id
   project_name                  = var.project_name
   environment                   = var.environment
   powertools_service_name       = local.powertools_service_name
@@ -683,12 +692,14 @@ module "yjs_server" {
 module "agentcore" {
   source = "./modules/compute/agentcore"
 
+  aws_sdk_ua_app_id           = local.aws_sdk_ua_app_id
   project_name                = var.project_name
   environment                 = var.environment
   powertools_service_name     = local.powertools_service_name
   powertools_log_level        = var.powertools_log_level
   aws_region                  = var.aws_region
   docker_build_args           = var.docker_build_args
+  build_amd64_image           = var.enable_instances_compute
   neptune_endpoint            = module.neptune.cluster_endpoint
   neptune_cluster_resource_id = module.neptune.cluster_resource_id
   artifacts_bucket_name       = module.s3.artifacts_bucket_name
@@ -726,6 +737,7 @@ module "agentcore" {
 module "managed_environments" {
   source = "./modules/compute/managed-environments"
 
+  aws_sdk_ua_app_id             = local.aws_sdk_ua_app_id
   project_name                  = var.project_name
   environment                   = var.environment
   powertools_service_name       = local.powertools_service_name
@@ -753,6 +765,13 @@ module "managed_environments" {
   lambda_vpc_scope              = var.lambda_vpc_scope
   lambda_vpc_subnet_ids         = module.networking.private_subnet_ids
   lambda_vpc_security_group_ids = [module.networking.default_security_group_id]
+
+  instances_compute_enabled              = var.enable_instances_compute
+  core_image_uri_amd64                   = var.enable_instances_compute ? module.agentcore.ecr_repository_url : ""
+  core_image_digest_amd64                = module.agentcore.image_digest_amd64
+  instances_allowed_instance_types       = var.instances_allowed_instance_types
+  instances_allowed_instance_types_arm64 = var.instances_allowed_instance_types_arm64
+  instances_workspace_gib                = var.instances_workspace_gib
 
   tags = {
     Environment = var.environment

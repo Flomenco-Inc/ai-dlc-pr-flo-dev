@@ -104,6 +104,7 @@ module "connection_lambda" {
   vpc_security_group_ids = local.all_lambdas_in_vpc ? var.vpc_security_group_ids : null
 
   environment_variables = {
+    AWS_SDK_UA_APP_ID       = var.aws_sdk_ua_app_id
     POWERTOOLS_SERVICE_NAME = var.powertools_service_name
     POWERTOOLS_LOG_LEVEL    = var.powertools_log_level
     CONNECTIONS_TABLE       = var.connections_table_name
@@ -141,6 +142,7 @@ module "message_lambda" {
   vpc_security_group_ids = local.all_lambdas_in_vpc ? var.vpc_security_group_ids : null
 
   environment_variables = {
+    AWS_SDK_UA_APP_ID       = var.aws_sdk_ua_app_id
     POWERTOOLS_SERVICE_NAME = var.powertools_service_name
     POWERTOOLS_LOG_LEVEL    = var.powertools_log_level
     CONNECTIONS_TABLE       = var.connections_table_name
@@ -176,6 +178,7 @@ module "authorizer_lambda" {
   vpc_security_group_ids = local.all_lambdas_in_vpc ? var.vpc_security_group_ids : null
 
   environment_variables = {
+    AWS_SDK_UA_APP_ID       = var.aws_sdk_ua_app_id
     POWERTOOLS_SERVICE_NAME = var.powertools_service_name
     POWERTOOLS_LOG_LEVEL    = var.powertools_log_level
     COGNITO_USER_POOL_ID    = var.cognito_user_pool_id

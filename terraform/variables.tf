@@ -130,7 +130,7 @@ variable "docker_build_args" {
 # ---------------------------------------------------------------------------
 
 variable "enable_waf" {
-  description = "Create AWS WAF web ACLs for CloudFront and the regional API Gateway/Cognito resources"
+  description = "Create AWS WAF web ACLs for CloudFront, API Gateway, and Cognito; require the CloudFront origin secret on REST API requests"
   type        = bool
   default     = false
 }
@@ -282,5 +282,34 @@ variable "auth_certificate_arn" {
   validation {
     condition     = var.auth_certificate_arn == "" || can(regex("^arn:aws[a-z-]*:acm:us-east-1:[0-9]{12}:certificate/", var.auth_certificate_arn))
     error_message = "auth_certificate_arn must be an ACM certificate ARN in us-east-1 — Cognito custom domains only accept certificates from that region."
+  }
+}
+
+variable "enable_instances_compute" {
+  description = "Enable the AgentCore Instances compute type for managed environments (x86_64 support, EC2 managed instances in this account via capacity providers)"
+  type        = bool
+  default     = false
+}
+
+variable "instances_allowed_instance_types" {
+  description = "x86_64 EC2 instance types allowed on the platform-managed capacity providers (burstable t-family is not supported)"
+  type        = list(string)
+  default     = ["m6i.large"] # burstable (t-family) is not supported by AgentCore Instances
+}
+
+variable "instances_allowed_instance_types_arm64" {
+  description = "arm64 (Graviton) EC2 instance types allowed on the platform-managed capacity providers. An instance family is built for one architecture only, so arm64 Instances environments need their own list."
+  type        = list(string)
+  default     = ["m7g.large"]
+}
+
+variable "instances_workspace_gib" {
+  description = "Size in GiB of the persistent EBS workspace volume attached to every AgentCore Instances session (replaces the fixed 1 GiB session storage of microVMs). Changing it produces a new capacity provider; existing runtimes keep theirs."
+  type        = number
+  default     = 50
+
+  validation {
+    condition     = var.instances_workspace_gib > 0 && floor(var.instances_workspace_gib) == var.instances_workspace_gib
+    error_message = "instances_workspace_gib must be a positive whole number of GiB."
   }
 }

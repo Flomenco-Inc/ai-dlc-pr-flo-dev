@@ -7,6 +7,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { LambdaClient, SendDurableExecutionCallbackSuccessCommand } from '@aws-sdk/client-lambda';
 import { createProcessStore } from '../../shared/v2-process-store.js';
 
@@ -46,8 +47,10 @@ import { handler } from '../index.js';
 
 const ddb = mockClient(DynamoDBDocumentClient);
 const lambda = mockClient(LambdaClient);
+// A real (mocked) client: newer lib-dynamodb reads the wrapped client's
+// middleware stack, which a bare `{ config, send }` stand-in does not have.
 const store = createProcessStore({
-  ddb: DynamoDBDocumentClient.from({ config: {}, send: () => {} }),
+  ddb: DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'us-east-1' })),
 });
 
 describe('answer/bind interleaving', () => {

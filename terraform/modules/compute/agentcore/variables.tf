@@ -1,3 +1,8 @@
+variable "aws_sdk_ua_app_id" {
+  description = "Application identifier appended by AWS SDKs to the User-Agent header"
+  type        = string
+}
+
 variable "project_name" {
   description = "Project name for resource naming"
   type        = string
@@ -176,4 +181,10 @@ variable "tags" {
   description = "Tags to apply to resources"
   type        = map(string)
   default     = {}
+}
+
+variable "build_amd64_image" {
+  description = "Also build an amd64 variant of the core image (required for x86_64 managed environments on the Instances compute type)"
+  type        = bool
+  default     = false
 }

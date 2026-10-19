@@ -50,6 +50,7 @@ module "agents_lambda" {
   vpc_security_group_ids = var.lambda_security_group_ids
 
   environment_variables = {
+    AWS_SDK_UA_APP_ID                   = var.aws_sdk_ua_app_id
     POWERTOOLS_SERVICE_NAME             = var.powertools_service_name
     POWERTOOLS_LOG_LEVEL                = var.powertools_log_level
     POWERTOOLS_LOGGER_LOG_EVENT         = tostring(var.powertools_log_event)

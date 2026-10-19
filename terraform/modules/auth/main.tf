@@ -74,6 +74,7 @@ module "sso_token_lambda" {
   attach_network_policy  = local.all_lambdas_in_vpc
 
   environment_variables = {
+    AWS_SDK_UA_APP_ID       = var.aws_sdk_ua_app_id
     POWERTOOLS_SERVICE_NAME = var.powertools_service_name
     POWERTOOLS_LOG_LEVEL    = var.powertools_log_level
     SSO_ROLE_CONFIG         = jsonencode(local.role_config)

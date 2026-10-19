@@ -638,6 +638,89 @@ const createIntent = async (
   return res;
 };
 
+describe('POST /projects/{id}/intents/{intentId}/attachments/upload', () => {
+  const documentTypes = [
+    ['pdf', 'application/pdf'],
+    ['docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+    ['xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+  ];
+  const documents = (sizes) =>
+    sizes.map((size, index) => {
+      const [extension, mimeType] = documentTypes[index % documentTypes.length];
+      return { filename: `reference-${index}.${extension}`, mimeType, size };
+    });
+  const upload = (sub, projectId, intentId, attachments) =>
+    handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intentId}/attachments/upload`,
+      pathParameters: { projectId, intentId },
+      body: JSON.stringify({ attachments }),
+      ...claims(sub),
+    });
+
+  it('accepts 50 documents totaling exactly 25 MiB and counts pending uploads against the cap', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { id: intentId } = JSON.parse((await createIntent(sub, projectId)).body);
+    const descriptors = documents(Array(50).fill(512 * 1024));
+    const result = await upload(sub, projectId, intentId, descriptors);
+    expect(result.statusCode).toBe(200);
+    const { uploads } = JSON.parse(result.body);
+    expect(uploads).toHaveLength(50);
+    for (const [index, descriptor] of descriptors.entries()) {
+      expect(uploads[index]).toMatchObject({
+        ...descriptor,
+        fields: { 'Content-Type': descriptor.mimeType },
+      });
+    }
+    const meta = procStore.get(keyOf(`EXEC#${intentId}`, 'META'));
+    expect(meta.pendingAttachmentUploads).toHaveLength(50);
+
+    const overflow = await upload(sub, projectId, intentId, documents([1]));
+    expect(overflow.statusCode).toBe(400);
+    expect(JSON.parse(overflow.body).error).toBe('Maximum 50 attachments per intent');
+  });
+
+  it.each([
+    {
+      name: '51 new files',
+      committed: [],
+      pending: [],
+      incoming: Array(51).fill(1),
+      error: 'Maximum 50 attachments per intent',
+    },
+    {
+      name: 'six 5 MiB documents',
+      committed: [],
+      pending: [],
+      incoming: Array(6).fill(5 * 1024 * 1024),
+      error: 'Attachments cannot exceed 25 MB in total',
+    },
+    {
+      name: 'one byte over the total including committed and pending files',
+      committed: Array(4).fill(5 * 1024 * 1024),
+      pending: [5 * 1024 * 1024],
+      incoming: [1],
+      error: 'Attachments cannot exceed 25 MB in total',
+    },
+  ])('rejects $name', async ({ committed, pending, incoming, error }) => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const { id: intentId } = JSON.parse((await createIntent(sub, projectId)).body);
+    const meta = procStore.get(keyOf(`EXEC#${intentId}`, 'META'));
+    meta.attachments = documents(committed);
+    meta.pendingAttachmentUploads = documents(pending).map((document) => ({
+      ...document,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
+
+    const result = await upload(sub, projectId, intentId, documents(incoming));
+    expect(result.statusCode).toBe(400);
+    expect(JSON.parse(result.body).error).toBe(error);
+    expect(meta.pendingAttachmentUploads).toHaveLength(pending.length);
+  });
+});
+
 describe('S3 attachment ingestion', () => {
   it('retries a conflicting attachment revision, deleting the losing copied version', async () => {
     const intentId = `intent-${randomUUID()}`;
@@ -742,6 +825,68 @@ describe('POST /projects/{id}/intents', () => {
     expect(intent.constructionAutonomyMode).toBeNull();
     // WP6: PR strategy snapshotted (project default = intent-pr).
     expect(intent.prStrategy).toBe('intent-pr');
+  });
+
+  it.each([
+    ['a number', 7],
+    ['an unknown string', 'yolo'],
+    ['the upstream unset literal', 'unset'],
+    ['a boolean', true],
+    ['an object', { mode: 'autonomous' }],
+  ])(
+    '400s a malformed constructionGateAutonomy (%s) instead of ignoring it',
+    async (_label, value) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+
+      const res = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        scope: 'feature',
+        constructionGateAutonomy: value,
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).code).toBe('construction_autonomy_mode_invalid');
+    },
+  );
+
+  it('400s an autonomy grant on an unpinned intent, whose methodology authors none', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+      constructionGateAutonomy: 'autonomous',
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).code).toBe('construction_autonomy_unavailable');
+  });
+
+  it.each([
+    ['absent', {}],
+    ['explicitly null', { constructionGateAutonomy: null }],
+    ['explicitly gated', { constructionGateAutonomy: 'gated' }],
+  ])('leaves the intent gated when the field is %s', async (_label, over) => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: 'feature',
+      ...over,
+    });
+
+    expect(res.statusCode).toBe(201);
+    const created = JSON.parse(res.body);
+    expect(created.constructionGateAutonomy).toBeNull();
+    const meta = procStore.get(keyOf(`EXEC#${created.executionId}`, 'META'));
+    expect(meta).not.toHaveProperty('constructionGateAutonomy');
+    expect(meta).not.toHaveProperty('constructionGateAutonomyGrant');
   });
 
   it('snapshots the resolved tools from a published managed environment', async () => {
@@ -4387,6 +4532,10 @@ describe('POST /gates/{humanTaskId}/answer', () => {
     for (const body of [
       { answer: { decision: 'approve' } },
       { status: 'approved', answer: { ok: 1 } },
+      // The autonomy escalation is a real gate choice, so it must be REJECTED on a
+      // gate that never offered it rather than parsing as null and slipping past
+      // this check.
+      { answer: { decision: 'grant-autonomy' } },
     ]) {
       const invalid = await answerGate(sub, projectId, intent.id, humanTaskId, body);
       expect(invalid.statusCode).toBe(400);
@@ -4399,6 +4548,40 @@ describe('POST /gates/{humanTaskId}/answer', () => {
       answer: { decision: 'request-changes', feedback: 'fix it' },
     });
     expect(accepted.statusCode).toBe(200);
+  });
+
+  it('records grant-autonomy only with status "approved"', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    const humanTaskId = 'h-grant-autonomy';
+    const humanKey = keyOf(`EXEC#${intent.id}`, `HUMAN#${humanTaskId}`);
+    seedGate(intent.id, humanTaskId);
+    procStore.set(humanKey, {
+      ...procStore.get(humanKey),
+      kind: 'validation',
+      options: ['approve', 'request-changes', 'grant-autonomy'],
+    });
+    const grant = { decision: 'grant-autonomy' };
+
+    // The engine applies the grant on the parsed decision, so a rejected or
+    // plain-answered row would carry a grant its status says was not given.
+    for (const status of ['rejected', 'answered']) {
+      const invalid = await answerGate(sub, projectId, intent.id, humanTaskId, {
+        status,
+        answer: grant,
+      });
+      expect(invalid.statusCode).toBe(400);
+      expect(JSON.parse(invalid.body).code).toBe('grant_autonomy_status_invalid');
+      expect(procStore.get(humanKey).status).toBe('pending');
+    }
+
+    const accepted = await answerGate(sub, projectId, intent.id, humanTaskId, {
+      status: 'approved',
+      answer: grant,
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(procStore.get(humanKey).answer).toEqual(grant);
   });
 
   // The reason, the outcome and its explanation are only on the gate row; the stage
@@ -6064,6 +6247,50 @@ describe('POST /rewind', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).stages).toEqual(['design', 'implement']);
+  });
+
+  it('relaunches a cancelled autonomous intent gated: cancel withdraws the grant', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedPlan();
+    const intent = JSON.parse((await createIntent(sub, projectId)).body);
+    seedStageRow(intent.id, 'design');
+    seedStageRow(intent.id, 'implement', 'WAITING_FOR_HUMAN');
+    const grant = {
+      source: 'create',
+      grantedAt: '2026-01-01T00:00:00.000Z',
+      grantedBy: sub,
+      grantedByName: `${sub}@x`,
+    };
+    setStatus(intent.id, {
+      status: 'WAITING',
+      constructionGateAutonomy: 'autonomous',
+      constructionGateAutonomyGrant: grant,
+    });
+
+    const cancelled = await handler({
+      httpMethod: 'POST',
+      path: `/projects/${projectId}/intents/${intent.id}/cancel`,
+      pathParameters: { projectId, intentId: intent.id },
+      ...claims(sub),
+    });
+    expect(cancelled.statusCode).toBe(200);
+    expect(JSON.parse(cancelled.body).constructionGateAutonomy).toBeNull();
+    const meta = procStore.get(keyOf(`EXEC#${intent.id}`, 'META'));
+    expect(meta.constructionGateAutonomy).toBeNull();
+    // The original grant stays on record, with who withdrew it, when, and how.
+    expect(meta.constructionGateAutonomyGrant).toEqual({
+      ...grant,
+      revokedAt: expect.any(String),
+      revokedBy: sub,
+      revokedByName: `${sub}@x`,
+      revokedSource: 'cancel',
+    });
+
+    const res = await rewind(sub, projectId, intent.id, { fromStageId: 'implement' });
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).intent.constructionGateAutonomy).toBeNull();
+    expect(procStore.get(keyOf(`EXEC#${intent.id}`, 'META')).constructionGateAutonomy).toBeNull();
   });
 
   it('accepts a guidance-less rewind as a plain retry (no steering row)', async () => {
@@ -8583,6 +8810,104 @@ describe('AI-DLC per-intent release selection', () => {
     expect(res.statusCode).toBe(201);
     expect(metaFor(JSON.parse(res.body).id).methodologyRelease).toEqual(pinB);
   });
+
+  it('stores an explicit gated choice on a release-pinned intent as no grant', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0');
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_B,
+      methodologyReleaseId: pinB.releaseId,
+      constructionGateAutonomy: 'gated',
+    });
+
+    expect(res.statusCode).toBe(201);
+    const intent = JSON.parse(res.body);
+    expect(intent.constructionGateAutonomy).toBeNull();
+    expect(metaFor(intent.id)).not.toHaveProperty('constructionGateAutonomy');
+    expect(metaFor(intent.id)).not.toHaveProperty('constructionGateAutonomyGrant');
+  });
+
+  it('400s an autonomy grant on a pinned release that ships no construction protocol', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    procStore.delete(keyOf('WF#default#aidlc-v2', 'V#4#SCOPEREF#feature'));
+    seedRegistryRecord(bundleA, 'current-stable');
+    const before = structuredClone([...procStore]);
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      methodologyReleaseId: pinA.releaseId,
+      constructionGateAutonomy: 'autonomous',
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).code).toBe('construction_autonomy_unavailable');
+    // Refused before the execution exists.
+    expect([...procStore]).toEqual(before);
+  });
+
+  it('freezes an autonomous construction autonomy grant onto a release-pinned intent', async () => {
+    const sub = `u-${randomUUID()}`;
+    const projectId = await seedV2Project(sub);
+    seedDeploymentWorkflowAtV1();
+    seedRegistryRecord(bundleB, 'v2.9.0');
+
+    const res = await createIntent(sub, projectId, {
+      title: 'I',
+      prompt: 'Build X',
+      scope: SCOPE_ONLY_IN_B,
+      methodologyReleaseId: pinB.releaseId,
+      constructionGateAutonomy: 'autonomous',
+    });
+
+    expect(res.statusCode).toBe(201);
+    const intent = JSON.parse(res.body);
+    expect(intent.constructionGateAutonomy).toBe('autonomous');
+    // The grant is frozen on META with durable attribution — who gave it, when,
+    // and through which door — so an audit never depends on the timeline event.
+    const meta = metaFor(intent.id);
+    expect(meta.constructionGateAutonomy).toBe('autonomous');
+    expect(meta.constructionGateAutonomyGrant).toMatchObject({
+      source: 'create',
+      grantedBy: sub,
+      grantedByName: `${sub}@x`,
+      grantedAt: expect.any(String),
+    });
+    expect(meta.startedBy).toBe(sub);
+    expect(meta.startedAt).toEqual(expect.any(String));
+  });
+
+  it.each([
+    ['the stable channel', () => seedStableChannel(pinB.releaseId), SCOPE_ONLY_IN_B, undefined],
+    ['the deployment ref', () => {}, 'feature', shaB],
+  ])(
+    'freezes an autonomous grant onto an intent pinned through %s with no release selected',
+    async (_label, seedSelection, scope, deploymentSha) => {
+      const sub = `u-${randomUUID()}`;
+      const projectId = await seedV2Project(sub);
+      seedDeploymentWorkflowAtV1(deploymentSha ? 'feature' : undefined, deploymentSha);
+      seedRegistryRecord(bundleB, 'v2.9.0');
+      seedSelection();
+
+      const res = await createIntent(sub, projectId, {
+        title: 'I',
+        prompt: 'Build X',
+        scope,
+        constructionGateAutonomy: 'autonomous',
+      });
+
+      expect(res.statusCode).toBe(201);
+      const meta = metaFor(JSON.parse(res.body).id);
+      expect(meta.methodologyRelease).toEqual(pinB);
+      expect(meta.constructionGateAutonomy).toBe('autonomous');
+    },
+  );
 
   it('auto-pins when the release CAN reproduce the plan, and persists no SYSTEM pins', async () => {
     const sub = `u-${randomUUID()}`;

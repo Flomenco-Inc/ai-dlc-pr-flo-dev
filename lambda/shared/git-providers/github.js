@@ -509,6 +509,45 @@ const replyToReviewComment = async (ctx, repoId, prNumber, { commentId, body }) 
   };
 };
 
+const REVIEW_EVENTS = new Set(['COMMENT', 'REQUEST_CHANGES', 'APPROVE']);
+
+const submitPullRequestReview = async (ctx, repoId, prNumber, { event, body, comments = [] }) => {
+  if (!REVIEW_EVENTS.has(event)) {
+    throw new ProviderError(400, 'Review event must be COMMENT, REQUEST_CHANGES, or APPROVE');
+  }
+  const { owner, repo } = splitOwnerRepo(repoId);
+  const payload = {
+    event,
+    body: withPrReviewMarker(body),
+  };
+  if (comments.length > 0) {
+    payload.comments = comments.map((comment) => ({
+      path: comment.path,
+      line: comment.line,
+      side: comment.side || 'RIGHT',
+      body: withPrReviewMarker(comment.body),
+    }));
+  }
+  const res = await ghFetch(ctx, `${API_BASE}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new ProviderError(
+      res.status || 400,
+      data?.message || 'Failed to submit pull request review',
+    );
+  }
+  return {
+    id: data.id,
+    event: data.state,
+    body: data.body,
+    url: data.html_url || null,
+  };
+};
+
 // ---------------------------------------------------------------------------
 // PR creation + construction-task-branch helpers (used by the v2 orchestrator)
 // and PR-state / server-side merge.
@@ -988,6 +1027,7 @@ export {
   listPRComments,
   addPRComment,
   replyToReviewComment,
+  submitPullRequestReview,
   getUnmergedConstructionTaskBranches,
   cleanupConstructionTaskBranches,
   findPullRequest,
@@ -1028,6 +1068,7 @@ export default {
   listPRComments,
   addPRComment,
   replyToReviewComment,
+  submitPullRequestReview,
   getUnmergedConstructionTaskBranches,
   cleanupConstructionTaskBranches,
   findPullRequest,

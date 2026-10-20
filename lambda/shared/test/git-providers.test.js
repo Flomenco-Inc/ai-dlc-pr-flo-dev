@@ -111,6 +111,56 @@ describe('github provider — repo browse + PR + comments', () => {
     });
   });
 
+  it('submits one pull request review with stamped comments', async () => {
+    const fetchImpl = makeFetch([
+      [
+        '/pulls/7/reviews',
+        {
+          json: {
+            id: 5,
+            state: 'CHANGES_REQUESTED',
+            body: 'Needs a null check.\n\n<!-- aidlc-pr-review -->',
+            html_url: 'https://github.com/o/r/pull/7#pullrequestreview-5',
+          },
+        },
+      ],
+    ]);
+    const review = await gh.submitPullRequestReview({ token: 't', fetchImpl }, 'o/r', 7, {
+      event: 'REQUEST_CHANGES',
+      body: 'Needs a null check.',
+      comments: [{ path: 'src/a.js', line: 10, side: 'RIGHT', body: 'Check null.' }],
+    });
+    expect(review).toEqual({
+      id: 5,
+      event: 'CHANGES_REQUESTED',
+      body: 'Needs a null check.\n\n<!-- aidlc-pr-review -->',
+      url: 'https://github.com/o/r/pull/7#pullrequestreview-5',
+    });
+    expect(JSON.parse(fetchImpl.calls[0].options.body)).toEqual({
+      event: 'REQUEST_CHANGES',
+      body: 'Needs a null check.\n\n<!-- aidlc-pr-review -->',
+      comments: [
+        {
+          path: 'src/a.js',
+          line: 10,
+          side: 'RIGHT',
+          body: 'Check null.\n\n<!-- aidlc-pr-review -->',
+        },
+      ],
+    });
+  });
+
+  it('rejects an unknown review event before calling GitHub', async () => {
+    const fetchImpl = makeFetch([]);
+    await expect(
+      gh.submitPullRequestReview({ token: 't', fetchImpl }, 'o/r', 7, {
+        event: 'MAYBE',
+        body: 'no',
+      }),
+    ).rejects.toThrow(/COMMENT, REQUEST_CHANGES, or APPROVE/);
+    expect(fetchImpl.calls).toHaveLength(0);
+  });
+
   it('maps repos to the unified DTO', async () => {
     const fetchImpl = makeFetch([
       [

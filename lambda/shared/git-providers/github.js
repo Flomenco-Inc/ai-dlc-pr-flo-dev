@@ -7,6 +7,7 @@
 
 import { Logger } from '@aws-lambda-powertools/logger';
 import { ProviderError } from './errors.js';
+import { withPrReviewMarker } from '../pr-review-marker.js';
 
 const logger = new Logger({ persistentKeys: { component: 'git-provider', module: 'github' } });
 
@@ -479,6 +480,32 @@ const addPRComment = async (ctx, repoId, prNumber, { body, path, line, side }) =
     user: { login: result.user?.login, avatarUrl: result.user?.avatar_url },
     url: result.html_url || null,
     createdAt: result.created_at,
+  };
+};
+
+const replyToReviewComment = async (ctx, repoId, prNumber, { commentId, body }) => {
+  const { owner, repo } = splitOwnerRepo(repoId);
+  const res = await ghFetch(
+    ctx,
+    `${API_BASE}/repos/${owner}/${repo}/pulls/${prNumber}/comments/${commentId}/replies`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: withPrReviewMarker(body) }),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new ProviderError(
+      res.status || 400,
+      data?.message || 'Failed to reply to review comment',
+    );
+  }
+  return {
+    id: data.id,
+    body: data.body,
+    url: data.html_url || null,
+    createdAt: data.created_at,
   };
 };
 
@@ -960,6 +987,7 @@ export {
   closeIssue,
   listPRComments,
   addPRComment,
+  replyToReviewComment,
   getUnmergedConstructionTaskBranches,
   cleanupConstructionTaskBranches,
   findPullRequest,
@@ -999,6 +1027,7 @@ export default {
   closeIssue,
   listPRComments,
   addPRComment,
+  replyToReviewComment,
   getUnmergedConstructionTaskBranches,
   cleanupConstructionTaskBranches,
   findPullRequest,

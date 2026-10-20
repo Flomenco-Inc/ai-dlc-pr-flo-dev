@@ -79,6 +79,38 @@ describe('clone URL + host plumbing', () => {
 describe('github provider — repo browse + PR + comments', () => {
   const gh = getProvider('github');
 
+  it('replies in a review thread and stamps the marker', async () => {
+    const fetchImpl = makeFetch([
+      [
+        '/comments/42/replies',
+        {
+          json: {
+            id: 99,
+            body: 'Fixed in the latest commit.\n\n<!-- aidlc-pr-review -->',
+            html_url: 'https://github.com/o/r/pull/7#discussion_r99',
+            created_at: '2026-10-16T00:00:00Z',
+          },
+        },
+      ],
+    ]);
+    const reply = await gh.replyToReviewComment({ token: 't', fetchImpl }, 'o/r', 7, {
+      commentId: 42,
+      body: 'Fixed in the latest commit.',
+    });
+    expect(reply).toEqual({
+      id: 99,
+      body: 'Fixed in the latest commit.\n\n<!-- aidlc-pr-review -->',
+      url: 'https://github.com/o/r/pull/7#discussion_r99',
+      createdAt: '2026-10-16T00:00:00Z',
+    });
+    const call = fetchImpl.calls[0];
+    expect(call.url).toBe('https://api.github.com/repos/o/r/pulls/7/comments/42/replies');
+    expect(call.options.method).toBe('POST');
+    expect(JSON.parse(call.options.body)).toEqual({
+      body: 'Fixed in the latest commit.\n\n<!-- aidlc-pr-review -->',
+    });
+  });
+
   it('maps repos to the unified DTO', async () => {
     const fetchImpl = makeFetch([
       [

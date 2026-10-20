@@ -548,6 +548,26 @@ const submitPullRequestReview = async (ctx, repoId, prNumber, { event, body, com
   };
 };
 
+const setReviewThreadResolved = async (ctx, repoId, threadId, resolved) => {
+  splitOwnerRepo(repoId);
+  const operation = resolved ? 'resolveReviewThread' : 'unresolveReviewThread';
+  const mutation = `mutation($id:ID!){${operation}(input:{threadId:$id}){thread{id isResolved}}}`;
+  const res = await ghFetch(ctx, `${API_BASE}/graphql`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: mutation, variables: { id: threadId } }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.errors?.length) {
+    throw new ProviderError(
+      res.status || 400,
+      data?.errors?.[0]?.message || 'Failed to update review thread',
+    );
+  }
+  const thread = data?.data?.[operation]?.thread;
+  return { threadId: thread?.id || threadId, resolved: Boolean(thread?.isResolved) };
+};
+
 // ---------------------------------------------------------------------------
 // PR creation + construction-task-branch helpers (used by the v2 orchestrator)
 // and PR-state / server-side merge.
@@ -1028,6 +1048,7 @@ export {
   addPRComment,
   replyToReviewComment,
   submitPullRequestReview,
+  setReviewThreadResolved,
   getUnmergedConstructionTaskBranches,
   cleanupConstructionTaskBranches,
   findPullRequest,
@@ -1069,6 +1090,7 @@ export default {
   addPRComment,
   replyToReviewComment,
   submitPullRequestReview,
+  setReviewThreadResolved,
   getUnmergedConstructionTaskBranches,
   cleanupConstructionTaskBranches,
   findPullRequest,

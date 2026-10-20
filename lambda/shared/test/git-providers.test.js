@@ -161,6 +161,42 @@ describe('github provider — repo browse + PR + comments', () => {
     expect(fetchImpl.calls).toHaveLength(0);
   });
 
+  it('resolves and unresolves a review thread', async () => {
+    const fetchImpl = makeFetch([
+      [
+        '/graphql',
+        (url, options) => {
+          const query = JSON.parse(options.body).query;
+          return {
+            json: {
+              data: query.includes('resolveReviewThread')
+                ? { resolveReviewThread: { thread: { id: 'PRRT_1', isResolved: true } } }
+                : { unresolveReviewThread: { thread: { id: 'PRRT_1', isResolved: false } } },
+            },
+          };
+        },
+      ],
+    ]);
+    await expect(
+      gh.setReviewThreadResolved({ token: 't', fetchImpl }, 'o/r', 'PRRT_1', true),
+    ).resolves.toEqual({ threadId: 'PRRT_1', resolved: true });
+    await expect(
+      gh.setReviewThreadResolved({ token: 't', fetchImpl }, 'o/r', 'PRRT_1', false),
+    ).resolves.toEqual({ threadId: 'PRRT_1', resolved: false });
+    const first = JSON.parse(fetchImpl.calls[0].options.body);
+    expect(first.query).toContain('resolveReviewThread');
+    expect(first.variables).toEqual({ id: 'PRRT_1' });
+  });
+
+  it('surfaces a GraphQL thread error', async () => {
+    const fetchImpl = makeFetch([
+      ['/graphql', { json: { errors: [{ message: 'Thread not found' }] } }],
+    ]);
+    await expect(
+      gh.setReviewThreadResolved({ token: 't', fetchImpl }, 'o/r', 'PRRT_missing', true),
+    ).rejects.toThrow(/Thread not found/);
+  });
+
   it('maps repos to the unified DTO', async () => {
     const fetchImpl = makeFetch([
       [

@@ -7,6 +7,7 @@
 
 import { Logger } from '@aws-lambda-powertools/logger';
 import { ProviderError } from './errors.js';
+import { withPrReviewMarker } from '../pr-review-marker.js';
 
 const logger = new Logger({ persistentKeys: { component: 'git-provider', module: 'github' } });
 
@@ -480,6 +481,91 @@ const addPRComment = async (ctx, repoId, prNumber, { body, path, line, side }) =
     url: result.html_url || null,
     createdAt: result.created_at,
   };
+};
+
+const replyToReviewComment = async (ctx, repoId, prNumber, { commentId, body }) => {
+  const { owner, repo } = splitOwnerRepo(repoId);
+  const res = await ghFetch(
+    ctx,
+    `${API_BASE}/repos/${owner}/${repo}/pulls/${prNumber}/comments/${commentId}/replies`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: withPrReviewMarker(body) }),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new ProviderError(
+      res.status || 400,
+      data?.message || 'Failed to reply to review comment',
+    );
+  }
+  return {
+    id: data.id,
+    body: data.body,
+    url: data.html_url || null,
+    createdAt: data.created_at,
+  };
+};
+
+const REVIEW_EVENTS = new Set(['COMMENT', 'REQUEST_CHANGES', 'APPROVE']);
+
+const submitPullRequestReview = async (ctx, repoId, prNumber, { event, body, comments = [] }) => {
+  if (!REVIEW_EVENTS.has(event)) {
+    throw new ProviderError(400, 'Review event must be COMMENT, REQUEST_CHANGES, or APPROVE');
+  }
+  const { owner, repo } = splitOwnerRepo(repoId);
+  const payload = {
+    event,
+    body: withPrReviewMarker(body),
+  };
+  if (comments.length > 0) {
+    payload.comments = comments.map((comment) => ({
+      path: comment.path,
+      line: comment.line,
+      side: comment.side || 'RIGHT',
+      body: withPrReviewMarker(comment.body),
+    }));
+  }
+  const res = await ghFetch(ctx, `${API_BASE}/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new ProviderError(
+      res.status || 400,
+      data?.message || 'Failed to submit pull request review',
+    );
+  }
+  return {
+    id: data.id,
+    event: data.state,
+    body: data.body,
+    url: data.html_url || null,
+  };
+};
+
+const setReviewThreadResolved = async (ctx, repoId, threadId, resolved) => {
+  splitOwnerRepo(repoId);
+  const operation = resolved ? 'resolveReviewThread' : 'unresolveReviewThread';
+  const mutation = `mutation($id:ID!){${operation}(input:{threadId:$id}){thread{id isResolved}}}`;
+  const res = await ghFetch(ctx, `${API_BASE}/graphql`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: mutation, variables: { id: threadId } }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.errors?.length) {
+    throw new ProviderError(
+      res.status || 400,
+      data?.errors?.[0]?.message || 'Failed to update review thread',
+    );
+  }
+  const thread = data?.data?.[operation]?.thread;
+  return { threadId: thread?.id || threadId, resolved: Boolean(thread?.isResolved) };
 };
 
 // ---------------------------------------------------------------------------
@@ -960,6 +1046,9 @@ export {
   closeIssue,
   listPRComments,
   addPRComment,
+  replyToReviewComment,
+  submitPullRequestReview,
+  setReviewThreadResolved,
   getUnmergedConstructionTaskBranches,
   cleanupConstructionTaskBranches,
   findPullRequest,
@@ -999,6 +1088,9 @@ export default {
   closeIssue,
   listPRComments,
   addPRComment,
+  replyToReviewComment,
+  submitPullRequestReview,
+  setReviewThreadResolved,
   getUnmergedConstructionTaskBranches,
   cleanupConstructionTaskBranches,
   findPullRequest,

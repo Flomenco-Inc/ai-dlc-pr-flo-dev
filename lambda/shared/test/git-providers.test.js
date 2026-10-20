@@ -79,6 +79,124 @@ describe('clone URL + host plumbing', () => {
 describe('github provider — repo browse + PR + comments', () => {
   const gh = getProvider('github');
 
+  it('replies in a review thread and stamps the marker', async () => {
+    const fetchImpl = makeFetch([
+      [
+        '/comments/42/replies',
+        {
+          json: {
+            id: 99,
+            body: 'Fixed in the latest commit.\n\n<!-- aidlc-pr-review -->',
+            html_url: 'https://github.com/o/r/pull/7#discussion_r99',
+            created_at: '2026-10-16T00:00:00Z',
+          },
+        },
+      ],
+    ]);
+    const reply = await gh.replyToReviewComment({ token: 't', fetchImpl }, 'o/r', 7, {
+      commentId: 42,
+      body: 'Fixed in the latest commit.',
+    });
+    expect(reply).toEqual({
+      id: 99,
+      body: 'Fixed in the latest commit.\n\n<!-- aidlc-pr-review -->',
+      url: 'https://github.com/o/r/pull/7#discussion_r99',
+      createdAt: '2026-10-16T00:00:00Z',
+    });
+    const call = fetchImpl.calls[0];
+    expect(call.url).toBe('https://api.github.com/repos/o/r/pulls/7/comments/42/replies');
+    expect(call.options.method).toBe('POST');
+    expect(JSON.parse(call.options.body)).toEqual({
+      body: 'Fixed in the latest commit.\n\n<!-- aidlc-pr-review -->',
+    });
+  });
+
+  it('submits one pull request review with stamped comments', async () => {
+    const fetchImpl = makeFetch([
+      [
+        '/pulls/7/reviews',
+        {
+          json: {
+            id: 5,
+            state: 'CHANGES_REQUESTED',
+            body: 'Needs a null check.\n\n<!-- aidlc-pr-review -->',
+            html_url: 'https://github.com/o/r/pull/7#pullrequestreview-5',
+          },
+        },
+      ],
+    ]);
+    const review = await gh.submitPullRequestReview({ token: 't', fetchImpl }, 'o/r', 7, {
+      event: 'REQUEST_CHANGES',
+      body: 'Needs a null check.',
+      comments: [{ path: 'src/a.js', line: 10, side: 'RIGHT', body: 'Check null.' }],
+    });
+    expect(review).toEqual({
+      id: 5,
+      event: 'CHANGES_REQUESTED',
+      body: 'Needs a null check.\n\n<!-- aidlc-pr-review -->',
+      url: 'https://github.com/o/r/pull/7#pullrequestreview-5',
+    });
+    expect(JSON.parse(fetchImpl.calls[0].options.body)).toEqual({
+      event: 'REQUEST_CHANGES',
+      body: 'Needs a null check.\n\n<!-- aidlc-pr-review -->',
+      comments: [
+        {
+          path: 'src/a.js',
+          line: 10,
+          side: 'RIGHT',
+          body: 'Check null.\n\n<!-- aidlc-pr-review -->',
+        },
+      ],
+    });
+  });
+
+  it('rejects an unknown review event before calling GitHub', async () => {
+    const fetchImpl = makeFetch([]);
+    await expect(
+      gh.submitPullRequestReview({ token: 't', fetchImpl }, 'o/r', 7, {
+        event: 'MAYBE',
+        body: 'no',
+      }),
+    ).rejects.toThrow(/COMMENT, REQUEST_CHANGES, or APPROVE/);
+    expect(fetchImpl.calls).toHaveLength(0);
+  });
+
+  it('resolves and unresolves a review thread', async () => {
+    const fetchImpl = makeFetch([
+      [
+        '/graphql',
+        (url, options) => {
+          const query = JSON.parse(options.body).query;
+          return {
+            json: {
+              data: query.includes('resolveReviewThread')
+                ? { resolveReviewThread: { thread: { id: 'PRRT_1', isResolved: true } } }
+                : { unresolveReviewThread: { thread: { id: 'PRRT_1', isResolved: false } } },
+            },
+          };
+        },
+      ],
+    ]);
+    await expect(
+      gh.setReviewThreadResolved({ token: 't', fetchImpl }, 'o/r', 'PRRT_1', true),
+    ).resolves.toEqual({ threadId: 'PRRT_1', resolved: true });
+    await expect(
+      gh.setReviewThreadResolved({ token: 't', fetchImpl }, 'o/r', 'PRRT_1', false),
+    ).resolves.toEqual({ threadId: 'PRRT_1', resolved: false });
+    const first = JSON.parse(fetchImpl.calls[0].options.body);
+    expect(first.query).toContain('resolveReviewThread');
+    expect(first.variables).toEqual({ id: 'PRRT_1' });
+  });
+
+  it('surfaces a GraphQL thread error', async () => {
+    const fetchImpl = makeFetch([
+      ['/graphql', { json: { errors: [{ message: 'Thread not found' }] } }],
+    ]);
+    await expect(
+      gh.setReviewThreadResolved({ token: 't', fetchImpl }, 'o/r', 'PRRT_missing', true),
+    ).rejects.toThrow(/Thread not found/);
+  });
+
   it('maps repos to the unified DTO', async () => {
     const fetchImpl = makeFetch([
       [

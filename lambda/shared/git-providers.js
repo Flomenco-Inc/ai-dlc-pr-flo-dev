@@ -26,6 +26,9 @@
 //   isCommitAncestor(ctx, repoId, ancestorSha, descendantRef) -> boolean
 //   listPRComments(ctx, repoId, prRef)  -> paginated GitComment[]
 //   addPRComment(ctx, repoId, prRef, {body, path?, line?, side?}) -> GitComment
+//   replyToReviewComment(ctx, repoId, prRef, { commentId, body }) -> GitComment
+//   submitPullRequestReview(ctx, repoId, prRef, { event, body, comments? }) -> { id, event, body, url }
+//   setReviewThreadResolved(ctx, repoId, threadId, resolved) -> { threadId, resolved }
 // where ctx = { token, fetchImpl?, onRefresh? }.
 
 import github from './git-providers/github.js';

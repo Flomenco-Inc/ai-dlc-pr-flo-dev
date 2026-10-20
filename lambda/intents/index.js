@@ -1494,6 +1494,8 @@ const loadClassificationBlocks = async (meta, types) => {
     s3,
     bucket: ARTIFACTS_BUCKET(),
     methodologyRelease: meta.methodologyRelease,
+    ddb,
+    tableName: BLOCKS_TABLE(),
   });
   const overlay = meta.methodologyPins ?? {};
   return Object.fromEntries(
@@ -3679,6 +3681,8 @@ export const handler = async (event, context) => {
               s3,
               bucket: ARTIFACTS_BUCKET(),
               methodologyRelease: meta.methodologyRelease,
+              ddb,
+              tableName: BLOCKS_TABLE(),
             })
               .then((closure) =>
                 resolveMethodologyLibrary({
@@ -5771,6 +5775,8 @@ export const handler = async (event, context) => {
               s3,
               bucket: ARTIFACTS_BUCKET(),
               methodologyRelease: candidatePin,
+              ddb,
+              tableName: BLOCKS_TABLE(),
             });
             const candidateMethodologyPins = await snapshotUserMethodologyPins(
               planCheck.methodologyPins,

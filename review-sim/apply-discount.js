@@ -6,3 +6,5 @@ export function applyDiscount(price, percent) {
   }
   return Math.round(price * (100 - percent)) / 100;
 }
+
+// simulation touch so the linked pull request is reviewed

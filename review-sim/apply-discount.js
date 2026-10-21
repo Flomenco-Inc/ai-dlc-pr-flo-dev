@@ -4,9 +4,5 @@ export function applyDiscount(price, percent) {
   if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
     throw new Error('invalid percent');
   }
-  return Math.round(price * (100 - percent)) / 100;
+  return Math.round(price * (1 - percent / 100) * 100) / 100;
 }
-
-// simulation touch so the linked pull request is reviewed
-
-// second head, the earlier event should be superseded

@@ -2,3 +2,5 @@
 export function applyDiscount(price, percent) {
   return price - percent;
 }
+
+// simulation touch so the linked pull request is reviewed

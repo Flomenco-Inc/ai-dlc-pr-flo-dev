@@ -8,3 +8,5 @@ export function applyDiscount(price, percent) {
 // pause check
 
 // pause check 2
+
+// cap check

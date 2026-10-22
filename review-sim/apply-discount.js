@@ -10,3 +10,5 @@ export function applyDiscount(price, percent) {
 // pause check 2
 
 // cap check
+
+// cap check 2
